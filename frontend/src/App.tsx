@@ -11,6 +11,7 @@ import CircleCheck from "lucide-react/dist/esm/icons/circle-check.js";
 import Radio from "lucide-react/dist/esm/icons/radio.js";
 import Cloud from "lucide-react/dist/esm/icons/cloud.js";
 import { AppShell } from "@/components/AppShell";
+import { NetworkLogDialog } from "@/components/NetworkLogDialog";
 import { WarpPanel } from "@/components/WarpPanel";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import type { LoginMethod, Status, TurnStateView } from "@/types";
@@ -101,19 +102,14 @@ function tokenCopy(view?: TurnStateView | null, fetchError?: string | null) {
   };
 }
 
-function formatLogs(status: Status) {
-  if (!status.logs.length) return "等待流量…";
-  return status.logs
-    .map((entry) => `${entry.ts}  ${entry.method.padEnd(6)} ${entry.status} ${entry.ms}ms  ${entry.path}`)
-    .join("\n");
-}
-
 export default function App() {
   const fwd = useCodexStateKit();
   const [codexHome, setCodexHome] = useState("");
   const [outboundProxy, setOutboundProxy] = useState("");
   const [upstreamProxy, setUpstreamProxy] = useState("");
   const [loginMethod, setLoginMethod] = useState<LoginMethod>("browser");
+  const [networkLogsOpen, setNetworkLogsOpen] = useState(false);
+  const networkLogTriggerRef = useRef<HTMLButtonElement>(null);
   const hydrated = useRef(false);
 
   useEffect(() => {
@@ -428,14 +424,21 @@ export default function App() {
           </label>
         </div>
 
-        <section className="panel panel--traffic">
-          <header>
-            <div className="section-heading"><span className="section-icon"><Activity size={19} /></span><div><h2>请求动态</h2><p>最近经过本机代理的请求</p></div></div>
-            <span className="log-count">{fwd.status.logs.length} 条记录</span>
-          </header>
-          {fwd.status.logs.length ? <pre className="log-view" aria-label="请求日志">{formatLogs(fwd.status)}</pre> : <div className="log-empty"><span className="log-empty__icon"><Activity size={22} strokeWidth={1.5} /></span><div><strong>等待第一条请求</strong><p>Codex 发起请求后，记录会自动出现在这里。</p></div><span className="listening-label"><i /> {fwd.status.proxyOk ? "正在监听" : "监听未启动"}</span></div>}
-        </section>
-        <footer className="page-footer"><span><Shield size={13} /> 本地运行 · 配置尽在掌握</span><span>CODEX STATE KIT</span></footer>
+        <footer className="page-footer">
+          <div className="page-footer__tools">
+            <span><Shield size={13} /> 本地运行 · 配置尽在掌握</span>
+            <button ref={networkLogTriggerRef} className="footer-tool" type="button" onClick={() => setNetworkLogsOpen(true)}>
+              <Activity size={13} />网络日志<span className="footer-tool__count">{fwd.status.logs.length}</span>
+            </button>
+          </div>
+          <span>CODEX STATE KIT</span>
+        </footer>
+        <NetworkLogDialog
+          open={networkLogsOpen}
+          status={fwd.status}
+          triggerRef={networkLogTriggerRef}
+          onClose={() => setNetworkLogsOpen(false)}
+        />
       </div>
     </AppShell>
   );

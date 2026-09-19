@@ -44,6 +44,7 @@
 - **ChatGPT 登录**：默认使用浏览器回调，也支持授权码登录。
 - **Token 获取代理**：默认内置 WARP，无需安装额外客户端；支持手动代理。
 - **上游转发代理**：业务请求可单独设置 HTTP / HTTPS / SOCKS 代理，保存后对新请求生效。
+- **网络路由日志**：页脚入口按请求展示 Token 获取与业务请求的代理线路、目标、TCP peer、模型、Turn-State 动作、状态和响应头耗时。
 - **版本更新**：正式版启动时及每 6 小时检查 GitHub 最新正式版，支持应用内下载签名更新包、确认后安装重启，也可跳转发布页；标题栏支持手动检查。
 - **Turn-State 管理**：后台获取、缓存并复用，展示状态与最近请求。
 - **目录切换**：修改 Codex 工作目录后自动保存、恢复旧路由并加载新目录。
@@ -64,6 +65,7 @@ Turn-State 获取 ── 内置 WARP / 手动代理 ── Codex 上游
 | [配置与自动接入](docs/config.md) | 工作目录、文件位置、路由恢复 |
 | [ChatGPT 登录](docs/browser-login.md) | 回调与授权码登录 |
 | [出站代理与 WARP](docs/warp.md) | 自动连接、手动代理、运行限制 |
+| [网络路由日志](docs/network-logs.md) | Token 与业务线路、请求字段和数据边界 |
 | [常见问题](docs/troubleshooting.md) | 登录、网络、接入与恢复排查 |
 | [Turn-State 机制](docs/turn-state-notes.md) | 当前缓存、替换规则和效果边界 |
 | [维护与验收](docs/turn-state-sop.md) | 验证步骤和问题报告 |

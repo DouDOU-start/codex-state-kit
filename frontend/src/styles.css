@@ -166,21 +166,57 @@ svg { flex-shrink: 0; }
 .banner button { flex-shrink: 0; padding: 5px; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; font-size: 10px; }
 .banner--ok { color: var(--green); border: 1px solid #d6e6db; background: var(--green-soft); }
 .banner--error { color: var(--red); border: 1px solid #efd6d3; background: var(--red-soft); }
-.panel--traffic > header { margin-bottom: 16px; }
-.log-count { padding: 5px 8px; border: 1px solid #e5eaf0; border-radius: 6px; color: var(--muted); background: #f6f8fa; font-size: 10px; }
-.log-view { margin: 0; min-height: 100px; max-height: 220px; overflow: auto; padding: 15px; border: 1px solid #e2e9f0; border-radius: 10px; background: #f2f5f9; color: #566c84; font: 11px/1.9 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
-.log-empty { display: flex; align-items: center; gap: 14px; min-height: 64px; padding: 12px 16px; border: 1px dashed #dce4ec; border-radius: 10px; background: #f8fafc; }
-.log-empty__icon { display: grid; place-items: center; width: 39px; height: 39px; border: 1px solid #e4eaf1; border-radius: 50%; color: #8ba4c0; background: #fff; }
-.log-empty strong { font-size: 11px; font-weight: 550; color: var(--text-soft); }
-.log-empty p { margin: 5px 0 0; color: var(--muted); font-size: 10px; line-height: 1.7; }
-.listening-label { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: var(--muted); font-size: 9px; white-space: nowrap; }
-.page-footer { display: flex; justify-content: space-between; gap: 12px; padding: 0 3px; color: var(--muted); font-size: 9px; }
+.page-footer { display: flex; min-height: 28px; align-items: center; justify-content: space-between; gap: 12px; margin-top: auto; padding: 0 3px; color: var(--muted); font-size: 9px; }
 .page-footer span { display: inline-flex; align-items: center; gap: 5px; }
+.page-footer__tools { display: flex; align-items: center; gap: 12px; }
+.footer-tool { display: inline-flex; min-height: 26px; align-items: center; gap: 5px; padding: 0 7px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font: inherit; cursor: pointer; }
+.footer-tool:hover { color: var(--accent-strong); background: var(--accent-soft); }
+.footer-tool:focus-visible { outline: 3px solid #89acd4; outline-offset: 2px; }
+.footer-tool__count { min-width: 17px; height: 17px; justify-content: center; padding: 0 4px; border: 1px solid #dde5ed; border-radius: 5px; color: var(--text-soft); background: #f4f7fa; font: 8px/1 ui-monospace, monospace; }
 .repo-link { display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; color: var(--text-soft); background: var(--surface); font-size: 10px; text-decoration: none; }
 .repo-link:hover { color: var(--accent-strong); border-color: var(--line-strong); background: var(--accent-soft); }
 .repo-link:focus-visible { outline: 3px solid #89acd4; outline-offset: 3px; }
 .repo-error { margin: 12px 20px 0; }
 .page-footer > span:last-child { color: #96a3af; font-size: 8px; letter-spacing: .12em; }
+.network-log-dialog { width: min(920px, calc(100vw - 36px)); height: min(610px, calc(100vh - 48px)); max-width: none; max-height: none; padding: 0; overflow: hidden; border: 1px solid #dce4ec; border-radius: 8px; color: var(--text); background: var(--surface); box-shadow: 0 24px 72px #24384d40; }
+.network-log-dialog::backdrop { background: #1d2c3c66; backdrop-filter: blur(2px); }
+.network-log-dialog__surface { display: flex; height: 100%; min-height: 0; flex-direction: column; }
+.network-log-dialog__header { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 18px; padding: 17px 18px; border-bottom: 1px solid var(--line); }
+.network-log-dialog__title { display: flex; min-width: 0; align-items: center; gap: 11px; }
+.network-log-dialog__mark { display: grid; width: 34px; height: 34px; flex: 0 0 34px; place-items: center; border: 1px solid #cfdeec; border-radius: 7px; color: var(--accent-strong); background: #edf4fb; }
+.network-log-dialog__title h2 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: 0; }
+.network-log-dialog__title p { margin: 3px 0 0; color: var(--muted); font-size: 10px; }
+.network-log-dialog__actions { display: flex; align-items: center; gap: 7px; }
+.network-log-copy { min-height: 31px; padding: 0 10px; font-size: 10px; }
+.network-log-close { display: grid; width: 31px; height: 31px; place-items: center; border: 1px solid #dfe6ed; border-radius: 7px; color: var(--muted); background: #f7f9fb; cursor: pointer; }
+.network-log-close:hover { color: var(--text); border-color: #cbd7e2; background: #eef3f7; }
+.network-log-close:focus-visible { outline: 3px solid #89acd4; outline-offset: 2px; }
+.network-route-overview { flex: 0 0 auto; padding: 11px 18px; border-bottom: 1px solid var(--line); background: #f7f9fb; }
+.network-log-preview-note { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; color: #8b5b16; font-size: 10px; font-weight: 600; }
+.network-route-line { display: grid; grid-template-columns: 88px minmax(0, 1fr); align-items: start; gap: 12px; padding: 5px 0; }
+.network-route-line__label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-soft); font-size: 10px; font-weight: 600; white-space: nowrap; }
+.network-route-line__path { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 4px; color: #53697f; font: 9px/1.7 "Cascadia Code", Consolas, monospace; }
+.network-route-line__node { display: inline-flex; min-width: 0; align-items: center; gap: 4px; }
+.network-route-line__node > span:last-child { overflow-wrap: anywhere; }
+.network-route-line__arrow { color: #9aabba; }
+.network-log-table-wrap { min-height: 0; flex: 1 1 auto; overflow: auto; background: #fff; }
+.network-log-table { width: 100%; min-width: 820px; border-collapse: collapse; table-layout: fixed; font-size: 10px; }
+.network-log-table th { position: sticky; top: 0; z-index: 1; padding: 9px 10px; border-bottom: 1px solid #dfe6ed; color: #6b7d8f; background: #f5f7fa; font-size: 9px; font-weight: 650; text-align: left; }
+.network-log-table th:nth-child(1) { width: 126px; }
+.network-log-table th:nth-child(2) { width: 205px; }
+.network-log-table th:nth-child(3) { width: 250px; }
+.network-log-table th:nth-child(4) { width: 145px; }
+.network-log-table th:nth-child(5) { width: 78px; }
+.network-log-table td { padding: 10px; border-bottom: 1px solid #edf1f5; color: var(--text-soft); vertical-align: top; overflow-wrap: anywhere; }
+.network-log-table tbody tr:hover { background: #f9fbfd; }
+.network-log-table strong, .network-log-table td > span:not(.network-log-status) { display: block; color: #354a5f; font-weight: 550; }
+.network-log-table small { display: block; margin-top: 4px; color: var(--muted); font: 8px/1.55 "Cascadia Code", Consolas, monospace; }
+.network-log-table__time { color: #6b7d8f !important; font: 9px/1.55 "Cascadia Code", Consolas, monospace; }
+.network-log-status { display: inline-flex; min-width: 34px; height: 21px; align-items: center; justify-content: center; border: 1px solid #cae4d3; border-radius: 5px; color: var(--green); background: var(--green-soft); font: 9px/1 "Cascadia Code", Consolas, monospace; }
+.network-log-status--error { border-color: #efd6d3; color: var(--red); background: var(--red-soft); }
+.network-log-dialog__empty { display: grid; min-height: 250px; place-content: center; justify-items: center; gap: 7px; color: #8ca0b4; text-align: center; }
+.network-log-dialog__empty strong { color: var(--text-soft); font-size: 12px; font-weight: 600; }
+.network-log-dialog__empty p { margin: 0; color: var(--muted); font-size: 10px; }
 .boot-screen { display: flex; width: 100%; height: 100%; align-items: center; justify-content: center; gap: 10px; color: var(--muted); font-size: 12px; }
 .boot-screen__error { width: min(430px, calc(100% - 48px)); padding: 28px; border: 1px solid #efd6d3; border-radius: 16px; background: var(--surface); box-shadow: var(--shadow); text-align: center; }
 .boot-screen__error strong { color: var(--text); font-size: 16px; }
@@ -189,8 +225,8 @@ svg { flex-shrink: 0; }
 .spinner--blue { color: var(--accent); }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 900px) { .dash-page { width: calc(100% - 40px); padding-top: 16px; gap: 12px; } .panel { padding: 15px; } .dash-grid { gap: 14px; } .token-card { padding: 15px; } .token-card__badge { display: none; } }
-@media (max-width: 740px) { .dash-grid { grid-template-columns: 1fr; } .connection-section + .connection-section { padding-left: 0; padding-top: 20px; border-left: 0; border-top: 1px solid var(--line); } .field.connection-directory { align-items: stretch; flex-direction: column; gap: 8px; } .page-heading { align-items: flex-start; flex-direction: column; gap: 10px; } .page-actions { justify-content: flex-start; } .titlebar { padding-left: 16px; } .dash-page { width: calc(100% - 32px); } .page-footer > span:last-child { display: none; } }
-@media (max-width: 440px) { .logo__word { font-size: 12px; } .window-controls button { width: 31px; } .token-card { padding: 17px; } .token-card__icon { display: none; } .listening-label { display: none; } .log-empty { padding: 13px; } }
+@media (max-width: 740px) { .dash-grid { grid-template-columns: 1fr; } .connection-section + .connection-section { padding-left: 0; padding-top: 20px; border-left: 0; border-top: 1px solid var(--line); } .field.connection-directory { align-items: stretch; flex-direction: column; gap: 8px; } .page-heading { align-items: flex-start; flex-direction: column; gap: 10px; } .page-actions { justify-content: flex-start; } .titlebar { padding-left: 16px; } .dash-page { width: calc(100% - 32px); } .page-footer > span:last-child { display: none; } .network-log-dialog { width: calc(100vw - 20px); height: calc(100vh - 24px); } .network-route-line { grid-template-columns: 1fr; gap: 4px; } }
+@media (max-width: 440px) { .logo__word { font-size: 12px; } .window-controls button { width: 31px; } .token-card { padding: 17px; } .token-card__icon { display: none; } .network-log-dialog__header { align-items: flex-start; padding: 13px; } .network-log-dialog__title p { display: none; } .network-route-overview { padding: 9px 13px; } }
 .token-models { display: flex; flex-direction: column; gap: 8px; width: 100%; padding-top: 10px; border-top: 1px solid #e4ecf4; }
 .token-model-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .token-model { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 6px; font: 10px/1.6 "Cascadia Code", Consolas, monospace; background: #f0f4f8; color: var(--text-soft); }

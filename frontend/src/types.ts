@@ -1,9 +1,25 @@
 export interface LogEntry {
+  id: number;
   ts: string;
   method: string;
   path: string;
   status: number;
   ms: number;
+  flow: string;
+  transport: string;
+  targetOrigin: string;
+  finalOrigin?: string | null;
+  routeKind: string;
+  proxyEndpoint?: string | null;
+  peerAddr?: string | null;
+  httpVersion?: string | null;
+  model?: string | null;
+  contentEncoding: string;
+  bodyBytes: number;
+  turnStateAction: string;
+  turnStateLen?: number | null;
+  returnedTurnStateLen?: number | null;
+  errorKind?: string | null;
 }
 
 export interface TokenLenCount {

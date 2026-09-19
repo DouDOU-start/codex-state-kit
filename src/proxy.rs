@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, Version};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -18,7 +18,7 @@ use url::Url;
 use crate::attach::{self, is_attached};
 use crate::fetch;
 use crate::login::{self, has_chatgpt_login};
-use crate::logs::{self, LogEntry};
+use crate::logs::{self, LogEntry, NetworkLogDetails};
 use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch};
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
 use crate::warp::{WarpRuntime, WarpStatus};
@@ -249,26 +249,42 @@ impl App {
                 anyhow::bail!("{message}");
             }
         };
-        let token = match fetch::fetch_turn_state(&client, &settings, &creds, model).await {
-            Ok(token) => token,
-            Err(err) => {
-                let message = format!("{err:#}");
-                eprintln!("[{}] turn-state fetch failed: {message}", model);
-                *self.fetch_error.lock().await = Some(message.clone());
-                anyhow::bail!("{message}");
-            }
-        };
+        let started = Instant::now();
+        let mut details = NetworkLogDetails::default();
+        let token =
+            match fetch::fetch_turn_state_with_log(&client, &settings, &creds, model, &mut details)
+                .await
+            {
+                Ok(token) => token,
+                Err(err) => {
+                    self.record_fetch(started, details).await;
+                    let message = format!("{err:#}");
+                    eprintln!("[{}] turn-state fetch failed: {message}", model);
+                    *self.fetch_error.lock().await = Some(message.clone());
+                    anyhow::bail!("{message}");
+                }
+            };
         if turn_state::TurnState::from_token(&token, "fetch").is_none() {
+            details.turn_state_action = "rejected_invalid".into();
+            self.record_fetch(started, details).await;
             let message = format!("[{}] 上游 token 无法解析", model);
             *self.fetch_error.lock().await = Some(message.clone());
             anyhow::bail!("{message}");
         }
         if turn_state::is_degraded_token(&token) {
-            let message = format!("[{}] 采到 312 token（{}字节），已丢弃，等待重试", model, token.len());
+            details.turn_state_action = "rejected_degraded".into();
+            self.record_fetch(started, details).await;
+            let message = format!(
+                "[{}] 采到 312 token（{}字节），已丢弃，等待重试",
+                model,
+                token.len()
+            );
             eprintln!("⚠ {message}");
             *self.fetch_error.lock().await = Some(message.clone());
             anyhow::bail!("{message}");
         }
+        details.turn_state_action = "captured".into();
+        self.record_fetch(started, details).await;
         self.turn_state.lock().await.capture(model, &token, "fetch");
         *self.fetch_error.lock().await = None;
         *self.fetch_ok_at.lock().await =
@@ -357,17 +373,28 @@ impl App {
                 };
                 let m = model.clone();
                 handles.spawn(async move {
-                    fetch::fetch_turn_state(&client, &s, &creds, &m).await
+                    let started = Instant::now();
+                    let mut details = NetworkLogDetails::default();
+                    let result =
+                        fetch::fetch_turn_state_with_log(&client, &s, &creds, &m, &mut details)
+                            .await;
+                    (started, result, details)
                 });
             }
 
             // 收集所有返回的 token
             let mut all_tokens: Vec<String> = Vec::new();
             while let Some(result) = handles.join_next().await {
-                if let Ok(Ok(token)) = result {
-                    if turn_state::TurnState::from_token(&token, "fetch").is_some() {
-                        all_tokens.push(token);
+                if let Ok((started, result, mut details)) = result {
+                    if let Ok(token) = result {
+                        if turn_state::TurnState::from_token(&token, "fetch").is_some() {
+                            details.turn_state_action = "received".into();
+                            all_tokens.push(token);
+                        } else {
+                            details.turn_state_action = "rejected_invalid".into();
+                        }
                     }
+                    self.record_fetch(started, details).await;
                 }
             }
 
@@ -439,10 +466,23 @@ impl App {
         self.degrade_notify.notify_one();
     }
 
-    async fn record(&self, method: &str, path: &str, status: u16, started: Instant) {
-        let entry = LogEntry::new(method, path, status, started);
+    async fn record(
+        &self,
+        method: &str,
+        path: &str,
+        status: u16,
+        started: Instant,
+        details: NetworkLogDetails,
+    ) {
+        let entry = LogEntry::new(method, path, status, started, details);
         let mut logs = self.logs.lock().await;
         logs::push(&mut logs, entry);
+    }
+
+    async fn record_fetch(&self, started: Instant, details: NetworkLogDetails) {
+        let status = details.response_status.unwrap_or(502);
+        self.record("POST", "/responses", status, started, details)
+            .await;
     }
 }
 
@@ -790,19 +830,23 @@ fn is_websocket(req: &Request<Body>) -> bool {
 async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
     let started = Instant::now();
     let method = req.method().clone();
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| req.uri().path().to_string());
-    match forward_http(&app, req).await {
+    let path = logs::safe_text(req.uri().path(), 256);
+    let mut details = NetworkLogDetails::default();
+    match forward_http_with_log(&app, req, &mut details).await {
         Ok(resp) => {
-            app.record(method.as_str(), &path, resp.status().as_u16(), started)
-                .await;
+            app.record(
+                method.as_str(),
+                &path,
+                resp.status().as_u16(),
+                started,
+                details,
+            )
+            .await;
             resp
         }
         Err(err) => {
-            app.record(method.as_str(), &path, 502, started).await;
+            app.record(method.as_str(), &path, 502, started, details)
+                .await;
             (StatusCode::BAD_GATEWAY, err.to_string()).into_response()
         }
     }
@@ -823,15 +867,28 @@ fn upstream_http_client(proxy: &str) -> Result<reqwest::Client> {
         .map_err(|_| anyhow::anyhow!("无法创建上游转发客户端"))
 }
 
+#[cfg(test)]
 async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
-    let (upstream, home, http) = {
+    let mut details = NetworkLogDetails::default();
+    forward_http_with_log(app, req, &mut details).await
+}
+
+async fn forward_http_with_log(
+    app: &App,
+    req: Request<Body>,
+    details: &mut NetworkLogDetails,
+) -> Result<Response> {
+    let (upstream, home, upstream_proxy, http) = {
         let settings = app.settings.lock().await;
         (
             settings.upstream.clone(),
             settings.codex_home.clone(),
+            settings.upstream_proxy.clone(),
             app.http.lock().await.clone(),
         )
     };
+    let effective_proxy = fetch::outbound_proxy_for_client(&upstream_proxy);
+    *details = logs::network_details(&upstream, &effective_proxy);
     let (mut parts, body) = req.into_parts();
     let target = join_upstream(&upstream, &parts.uri)?;
     let path = parts.uri.path();
@@ -840,25 +897,45 @@ async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
     let bytes = axum::body::to_bytes(body, 32 * 1024 * 1024)
         .await
         .context("read body")?;
+    details.body_bytes = bytes.len();
 
     let should_stamp = turn_state::should_stamp_http(parts.method.as_str(), path);
     let content_encoding = parts
         .headers
         .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("none");
+        .and_then(|v| v.to_str().ok());
+    details.content_encoding = logs::safe_content_encoding(content_encoding);
+    details.transport = if parts
+        .headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+    {
+        "http_sse".into()
+    } else {
+        "http".into()
+    };
     debug_log(&format!(
         "[proxy] {} {} body={}bytes encoding={} should_stamp={}",
-        parts.method, path, bytes.len(), content_encoding, should_stamp
+        parts.method,
+        path,
+        bytes.len(),
+        details.content_encoding,
+        should_stamp
     ));
 
     let mut injected_token: Option<String> = None;
     if should_stamp {
         let request_model = turn_state::extract_model_from_body(&bytes);
+        details.model = request_model
+            .as_deref()
+            .map(|model| logs::safe_text(model, 80))
+            .filter(|model| !model.is_empty());
         if request_model.is_none() {
             debug_log(&format!(
-                "[proxy] 未能解析 model，body 前 300 字节: {:?}",
-                String::from_utf8_lossy(&bytes[..bytes.len().min(300)])
+                "[proxy] 未能解析 model，body={}bytes encoding={}",
+                bytes.len(),
+                details.content_encoding
             ));
         }
 
@@ -883,6 +960,8 @@ async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
             };
             if let Some(token) = token {
                 turn_state::apply_http_header(&mut parts.headers, &token);
+                details.turn_state_action = "replaced".into();
+                details.turn_state_len = Some(token.len());
                 eprintln!(
                     "[stamp] 替换 turn_state → token len={} model={:?} 到 {} {}",
                     token.len(),
@@ -892,17 +971,32 @@ async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
                 );
                 injected_token = Some(token);
             } else {
+                details.turn_state_action = if request_model.is_some() {
+                    "preserved_no_ticket".into()
+                } else {
+                    "preserved_unknown_model".into()
+                };
+                details.turn_state_len = parts
+                    .headers
+                    .get(turn_state::HEADER_NAME)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::len);
                 eprintln!(
                     "[stamp] 无可用 token（model={:?}），保留客户端原值 {} {}",
                     request_model, parts.method, path
                 );
             }
         } else {
+            details.turn_state_action = "initial_request".into();
             eprintln!(
                 "[stamp] 首次请求，不注入 turn_state（等服务端下发） {} {} model={:?}",
                 parts.method, path, request_model
             );
         }
+    } else {
+        details.turn_state_action = "not_applicable".into();
     }
     login::apply_kit_auth_headers(&mut parts.headers, Path::new(&home));
     let mut builder = http
@@ -917,11 +1011,31 @@ async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
         }
         builder = builder.header(name, value);
     }
-    let upstream_resp = builder.send().await.context("upstream http")?;
+    let upstream_resp = match builder.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            details.error_kind = Some(logs::request_error_kind(&error));
+            return Err(error).context("upstream http");
+        }
+    };
     let resp_status_u16 = upstream_resp.status().as_u16();
+    details.peer_addr = upstream_resp.remote_addr().map(|addr| addr.to_string());
+    details.final_origin = Some(logs::endpoint_origin(upstream_resp.url().as_str()));
+    details.http_version = Some(
+        match upstream_resp.version() {
+            Version::HTTP_09 => "HTTP/0.9",
+            Version::HTTP_10 => "HTTP/1.0",
+            Version::HTTP_11 => "HTTP/1.1",
+            Version::HTTP_2 => "HTTP/2",
+            Version::HTTP_3 => "HTTP/3",
+            _ => "HTTP/unknown",
+        }
+        .into(),
+    );
 
     // 记录上游响应详情，方便排查 token 失效
     let upstream_turn_state = turn_state::header_token(upstream_resp.headers());
+    details.returned_turn_state_len = upstream_turn_state.as_ref().map(|token| token.len());
     let injected_len = injected_token.as_ref().map(|t| t.len());
     let upstream_ts_len = upstream_turn_state.as_ref().map(|t| t.len());
     let same_token = match (&injected_token, &upstream_turn_state) {

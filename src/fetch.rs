@@ -1,10 +1,11 @@
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::login::ChatGptCredentials;
-use crate::settings::Settings;
+use crate::logs::{self, NetworkLogDetails};
+use crate::settings::{OutboundMode, Settings};
 use crate::turn_state::{self, HEADER_NAME};
 
 fn responses_url(upstream: &str) -> String {
@@ -132,32 +133,68 @@ pub fn probe_body(model: &str) -> serde_json::Value {
     })
 }
 
-pub(crate) async fn fetch_turn_state(
+pub(crate) async fn fetch_turn_state_with_log(
     client: &reqwest::Client,
     settings: &Settings,
     creds: &ChatGptCredentials,
     model: &str,
+    details: &mut NetworkLogDetails,
 ) -> Result<String> {
     let url = responses_url(&settings.upstream);
-    let response = client
+    let effective_proxy = outbound_proxy_for_client(&settings.outbound_proxy);
+    *details = logs::token_network_details(
+        &settings.upstream,
+        &effective_proxy,
+        settings.outbound_mode == OutboundMode::Warp,
+        model,
+    );
+    let probe = probe_body(model);
+    details.body_bytes = serde_json::to_vec(&probe)
+        .map(|body| body.len())
+        .unwrap_or(0);
+    let request_started = Instant::now();
+    let response = match client
         .post(&url)
         .header("Authorization", format!("Bearer {}", creds.access_token))
         .header("ChatGPT-Account-ID", &creds.account_id)
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
         .header("OpenAI-Beta", "responses=experimental")
-        .json(&probe_body(model))
+        .json(&probe)
         .send()
         .await
-        .map_err(|err| {
+    {
+        Ok(response) => response,
+        Err(err) => {
+            details.response_header_ms = Some(request_started.elapsed().as_millis());
+            details.error_kind = Some(logs::request_error_kind(&err));
             let hint = proxy_auth_hint(&settings.outbound_proxy)
                 .unwrap_or_else(|| "出站代理连不上，或上游拒绝了这次探测请求".into());
-            anyhow::anyhow!("{hint}: {err}")
-        })?;
+            return Err(anyhow::anyhow!("{hint}: {err}"));
+        }
+    };
+    details.response_header_ms = Some(request_started.elapsed().as_millis());
+    details.response_status = Some(response.status().as_u16());
+    details.peer_addr = response.remote_addr().map(|addr| addr.to_string());
+    details.final_origin = Some(logs::endpoint_origin(response.url().as_str()));
+    details.http_version = Some(
+        match response.version() {
+            reqwest::Version::HTTP_09 => "HTTP/0.9",
+            reqwest::Version::HTTP_10 => "HTTP/1.0",
+            reqwest::Version::HTTP_11 => "HTTP/1.1",
+            reqwest::Version::HTTP_2 => "HTTP/2",
+            reqwest::Version::HTTP_3 => "HTTP/3",
+            _ => "HTTP/unknown",
+        }
+        .into(),
+    );
     if let Some(token) = turn_state::header_token(response.headers()) {
+        details.turn_state_action = "received".into();
+        details.returned_turn_state_len = Some(token.len());
         let _ = response.bytes().await;
         return Ok(token);
     }
+    details.turn_state_action = "missing".into();
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     let excerpt: String = body.chars().take(180).collect();
@@ -264,13 +301,26 @@ mod tests {
     async fn extracts_turn_state_header() {
         let upstream = serve(true).await;
         let settings = Settings {
-            upstream,
+            upstream: upstream.clone(),
             ..Settings::default()
         };
-        let token = fetch_turn_state(&http_client("").unwrap(), &settings, &creds(), "gpt-6-astra")
-            .await
-            .unwrap();
+        let mut details = NetworkLogDetails::default();
+        let token = fetch_turn_state_with_log(
+            &http_client("").unwrap(),
+            &settings,
+            &creds(),
+            "gpt-6-astra",
+            &mut details,
+        )
+        .await
+        .unwrap();
         assert_eq!(token, "gAAAAAfetched-token");
+        assert_eq!(details.response_status, Some(200));
+        assert!(details.response_header_ms.is_some());
+        assert_eq!(details.turn_state_action, "received");
+        assert_eq!(details.returned_turn_state_len, Some(token.len()));
+        assert_eq!(details.peer_addr.as_deref(), upstream.strip_prefix("http://"));
+        assert_eq!(details.final_origin.as_deref(), Some(upstream.as_str()));
     }
 
     #[tokio::test]
@@ -280,9 +330,19 @@ mod tests {
             upstream,
             ..Settings::default()
         };
-        let err = fetch_turn_state(&http_client("").unwrap(), &settings, &creds(), "gpt-6-astra")
-            .await
-            .unwrap_err();
+        let mut details = NetworkLogDetails::default();
+        let err = fetch_turn_state_with_log(
+            &http_client("").unwrap(),
+            &settings,
+            &creds(),
+            "gpt-6-astra",
+            &mut details,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("未返回"));
+        assert_eq!(details.response_status, Some(200));
+        assert_eq!(details.turn_state_action, "missing");
+        assert_eq!(details.returned_turn_state_len, None);
     }
 }

@@ -87,7 +87,7 @@ async fn upstream_proxy_hot_update_and_failures() {
         let (first, first_headers, finish_first, first_task) = streaming_proxy().await;
         let settings = Settings {
             upstream: "http://upstream.invalid".into(),
-            upstream_proxy: first,
+            upstream_proxy: first.clone(),
             outbound_proxy: "http://127.0.0.1:9".into(),
             codex_home: crate::settings::home_dir().display().to_string(),
             ..Settings::default()
@@ -107,16 +107,32 @@ async fn upstream_proxy_hot_update_and_failures() {
             .capture("test-model", &token, "test"));
         let token_before = TurnStateStore::load().peek_for_model("test-model");
         let warp_before = app.warp.status().phase;
-        let response = forward_http(
+        let mut route_details = NetworkLogDetails::default();
+        let response = forward_http_with_log(
             &app,
             Request::builder()
                 .uri("/events?a=1")
                 .header("proxy-authorization", "must-not-leak")
                 .body(Body::empty())
                 .unwrap(),
+            &mut route_details,
         )
         .await
         .unwrap();
+        assert_eq!(route_details.route_kind, logs::ROUTE_EXPLICIT_PROXY);
+        assert_eq!(
+            route_details.proxy_endpoint.as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(route_details.target_origin, "http://upstream.invalid:80");
+        assert_eq!(
+            route_details.final_origin.as_deref(),
+            Some("http://upstream.invalid:80")
+        );
+        assert_eq!(
+            route_details.peer_addr.as_deref(),
+            first.strip_prefix("http://")
+        );
         let headers = first_headers.await.unwrap().to_lowercase();
         assert!(headers.starts_with("get http://upstream.invalid/events?a=1 http/1.1"));
         assert!(!headers.contains("proxy-authorization"));
@@ -200,12 +216,20 @@ async fn upstream_proxy_hot_update_and_failures() {
         let response = proxy_http(
             app.clone(),
             Request::builder()
-                .uri("/check")
+                .uri("/check?token=must-not-enter-log")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let failed_log = app.logs.lock().await.back().cloned().unwrap();
+        assert_eq!(failed_log.route_kind, logs::ROUTE_EXPLICIT_PROXY);
+        assert_eq!(failed_log.path, "/check");
+        assert_eq!(failed_log.error_kind.as_deref(), Some("connect"));
+        let serialized = serde_json::to_string(&failed_log).unwrap();
+        assert!(!serialized.contains("user"));
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("must-not-enter-log"));
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
