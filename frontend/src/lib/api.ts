@@ -8,6 +8,7 @@ import type {
   LoginStatus,
   SettingsPatch,
   Status,
+  TurnStateView,
 } from "@/types";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
@@ -17,17 +18,21 @@ export async function openGithubRepo(): Promise<void> {
   await invoke<void>("open_github_repo");
 }
 
-const emptyTurnState = () => ({
+const emptyTurnState = (): TurnStateView => ({
   status: "empty",
   ageSecs: null,
   len: null,
   source: null,
   capturedAt: null,
+  models: [],
+  boundTokenLen: 292,
 });
 
 const defaultStatus = (): Status => ({
   stateMissPolicy: "preserve",
-  configuredModels: [],
+  configuredModels: ["gpt-6-astra", "gpt-5.6-sol"],
+  availableModels: ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-luna"],
+  manualCollectionModels: [],
   currentAccountId: "mock-account-b",
   currentAccountEmail: "mock@example.com",
   accountTraffic: { concurrentRequests: 2, rpm: 18 },
@@ -142,6 +147,7 @@ const defaultLogin = (): LoginStatus => ({
 
 let mockStatus = defaultStatus();
 let mockLogin = defaultLogin();
+let mockManualGeneration = 0;
 let mockConfig: CodexConfigView = {
   codexHome: mockStatus.codexHome,
   modelProvider: null,
@@ -156,7 +162,17 @@ function cloneStatus(): Status {
     ...mockStatus,
     warp: { ...mockStatus.warp },
     accountTraffic: { ...mockStatus.accountTraffic },
-    turnState: { ...mockStatus.turnState },
+    configuredModels: [...mockStatus.configuredModels],
+    availableModels: [...mockStatus.availableModels],
+    manualCollectionModels: [...mockStatus.manualCollectionModels],
+    turnState: {
+      ...mockStatus.turnState,
+      models: mockStatus.turnState.models?.map((model) => ({
+        ...model,
+        distribution: model.distribution?.map((item) => ({ ...item })),
+        poolTokens: model.poolTokens?.map((item) => ({ ...item })),
+      })),
+    },
     logs: mockStatus.logs.map((entry) => ({ ...entry })),
   };
 }
@@ -174,7 +190,10 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
     await stopWarp();
   }
   if (tokenRouteChanged) {
+    mockManualGeneration += 1;
     mockStatus.turnState = emptyTurnState();
+    mockStatus.manualCollectionModels = [];
+    mockStatus.fetchError = null;
   }
   mockStatus = {
     ...mockStatus,
@@ -227,6 +246,78 @@ export async function refreshTurnState(): Promise<Status> {
         }
       : emptyTurnState(),
   };
+  return cloneStatus();
+}
+
+export async function startManualCollection(model: string): Promise<Status> {
+  if (isTauri) {
+    return invoke<Status>("start_manual_collection", { model });
+  }
+  const existing = mockStatus.turnState.models?.find((entry) => entry.model === model);
+  if (existing?.status !== "active" && !mockStatus.manualCollectionModels.includes(model)) {
+    if (mockStatus.manualCollectionModels.length > 0) {
+      throw new Error(`${mockStatus.manualCollectionModels[0]} 正在手动采集，请先停止当前任务`);
+    }
+    const generation = ++mockManualGeneration;
+    mockStatus.manualCollectionModels = [...mockStatus.manualCollectionModels, model];
+    if (!existing) {
+      mockStatus.turnState.models = [
+        ...(mockStatus.turnState.models ?? []),
+        { model, status: "empty", distribution: [], poolTokens: [], boundOverride: null },
+      ];
+      mockStatus.turnState.status = "empty";
+    }
+    window.setTimeout(() => {
+      if (
+        generation !== mockManualGeneration
+        || !mockStatus.manualCollectionModels.includes(model)
+      ) return;
+      const models = (mockStatus.turnState.models ?? []).map((entry) =>
+        entry.model === model
+          ? {
+              ...entry,
+              status: "active",
+              ageSecs: 0,
+              len: 292,
+              capturedAt: new Date().toISOString(),
+              poolTokens: [{ len: 292, ageSecs: 0, isBound: true, isValid: true }],
+            }
+          : entry,
+      );
+      mockStatus = {
+        ...mockStatus,
+        manualCollectionModels: mockStatus.manualCollectionModels.filter(
+          (entry) => entry !== model,
+        ),
+        fetchError: null,
+        fetchOkAt: new Date().toISOString(),
+        turnState: {
+          ...mockStatus.turnState,
+          status: models.every((entry) => entry.status === "active") ? "active" : "partial",
+          ageSecs: 0,
+          len: 292,
+          source: "fetch",
+          capturedAt: new Date().toISOString(),
+          models,
+        },
+      };
+    }, 900);
+  }
+  return cloneStatus();
+}
+
+export async function stopManualCollection(model: string): Promise<Status> {
+  if (isTauri) {
+    return invoke<Status>("stop_manual_collection", { model });
+  }
+  mockManualGeneration += 1;
+  mockStatus.manualCollectionModels = mockStatus.manualCollectionModels.filter(
+    (entry) => entry !== model,
+  );
+  mockStatus.turnState.models = mockStatus.turnState.models?.filter(
+    (entry) => entry.model !== model || entry.status !== "empty",
+  );
+  if (!mockStatus.turnState.models?.length) mockStatus.turnState = emptyTurnState();
   return cloneStatus();
 }
 

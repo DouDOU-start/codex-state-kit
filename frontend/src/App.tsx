@@ -10,6 +10,8 @@ import Terminal from "lucide-react/dist/esm/icons/terminal.js";
 import CircleCheck from "lucide-react/dist/esm/icons/circle-check.js";
 import Radio from "lucide-react/dist/esm/icons/radio.js";
 import Cloud from "lucide-react/dist/esm/icons/cloud.js";
+import Play from "lucide-react/dist/esm/icons/play.js";
+import Square from "lucide-react/dist/esm/icons/square.js";
 import { AppShell } from "@/components/AppShell";
 import { NetworkLogDialog } from "@/components/NetworkLogDialog";
 import { WarpPanel } from "@/components/WarpPanel";
@@ -94,8 +96,19 @@ const STATE_POLICY_OPTIONS: Array<{
   },
 ];
 
-function tokenCopy(view?: TurnStateView | null, fetchError?: string | null) {
+function tokenCopy(
+  view?: TurnStateView | null,
+  fetchError?: string | null,
+  manualModels: string[] = [],
+) {
   const bound = view?.boundTokenLen ?? 292;
+  if (manualModels.length > 0) {
+    return {
+      title: `正在手动采集 ${bound} Token…`,
+      body: fetchError || manualModels[0],
+      loading: true,
+    };
+  }
   if (fetchError && (!view || (view.status !== "active" && view.status !== "idle"))) {
     return {
       title: `正在获取 ${bound} Token…`,
@@ -147,6 +160,7 @@ export default function App() {
   const [outboundProxy, setOutboundProxy] = useState("");
   const [upstreamProxy, setUpstreamProxy] = useState("");
   const [loginMethod, setLoginMethod] = useState<LoginMethod>("browser");
+  const [manualModel, setManualModel] = useState("");
   const [networkLogsOpen, setNetworkLogsOpen] = useState(false);
   const networkLogTriggerRef = useRef<HTMLButtonElement>(null);
   const hydrated = useRef(false);
@@ -158,6 +172,18 @@ export default function App() {
     setOutboundProxy(fwd.status.outboundProxy ?? "");
     setUpstreamProxy(fwd.status.upstreamProxy ?? "");
   }, [fwd.status]);
+
+  useEffect(() => {
+    const models = fwd.status?.availableModels ?? [];
+    const active = fwd.status?.manualCollectionModels[0];
+    if (!models.length) {
+      setManualModel("");
+    } else if (active && models.includes(active) && manualModel !== active) {
+      setManualModel(active);
+    } else if (!models.includes(manualModel)) {
+      setManualModel(models[0]);
+    }
+  }, [fwd.status?.availableModels, fwd.status?.manualCollectionModels, manualModel]);
 
 
   if (!fwd.status) {
@@ -183,19 +209,31 @@ export default function App() {
     );
   }
 
-  const loggedIn = Boolean(fwd.login?.loggedIn);
-  const loginLabel = fwd.login?.email || fwd.login?.accountId || "ChatGPT";
+  const loggedIn = Boolean(fwd.status.currentAccountId);
+  const loginLabel = fwd.status.currentAccountEmail
+    || fwd.status.currentAccountId
+    || fwd.login?.email
+    || fwd.login?.accountId
+    || "ChatGPT";
+  const manualCollectionModels = fwd.status.manualCollectionModels;
   const turn = fwd.status.turnState;
   const token = tokenChip(turn);
   const degrade = degradeChip(fwd.status);
   const copy = tokenCopy(
     turn,
     fwd.status.fetchError ?? (fwd.status.outboundMode === "warp" ? fwd.status.warp.error : null),
+    manualCollectionModels,
   );
   const age = formatAge(turn?.ageSecs);
   const sourceLabel =
     turn?.source === "fetch" ? "StateKit 获取" : turn?.source === "ws" ? "WebSocket" : turn?.source === "http" ? "HTTP" : null;
   const meta = [age, turn?.len ? `${turn.len} 字节` : null, sourceLabel].filter(Boolean).join(" · ");
+  const manualCollecting = Boolean(
+    manualModel && manualCollectionModels.includes(manualModel),
+  );
+  const manualReady = Boolean(
+    manualModel && turn?.models?.some((model) => model.model === manualModel && model.status === "active"),
+  );
 
   const copyCode = async () => {
     if (!fwd.device?.userCode) return;
@@ -256,12 +294,63 @@ export default function App() {
             </span>
             <div>
               <span className="token-card__eyebrow">TOKEN 状态</span>
-              <strong>{copy.title}</strong>
+              <strong aria-live="polite">{copy.title}</strong>
               {copy.body ? <small>{copy.body}</small> : null}
               {meta ? <p className="token-card__meta">{meta}</p> : null}
             </div>
           </div>
           <span className="token-card__badge"><Radio size={14} /> {fwd.status.proxyOk ? `自动管理 · 绑定 ${turn?.boundTokenLen ?? 292}` : "等待代理启动"}</span>
+          <div className="manual-collection">
+            <label htmlFor="manual-collection-model">手动采集</label>
+            <select
+              id="manual-collection-model"
+              value={manualModel}
+              disabled={
+                fwd.busy !== null
+                || !loggedIn
+                || fwd.status.availableModels.length === 0
+                || fwd.status.manualCollectionModels.length > 0
+              }
+              onChange={(event) => setManualModel(event.target.value)}
+            >
+              {fwd.status.availableModels.length > 0
+                ? fwd.status.availableModels.map((model) => (
+                    <option key={model} value={model}>{model}</option>
+                  ))
+                : <option value="">未发现模型</option>}
+            </select>
+            <button
+              className={`button ${manualCollecting ? "button--secondary" : "button--primary"}`}
+              type="button"
+              disabled={
+                fwd.busy !== null
+                || !loggedIn
+                || !manualModel
+                || (manualReady && !manualCollecting)
+              }
+              title={
+                manualCollecting
+                  ? `停止 ${manualModel} 的手动采集`
+                  : manualReady
+                    ? `${manualModel} 已有可用 Token`
+                    : `开始采集 ${manualModel}`
+              }
+              onClick={() => {
+                if (manualCollecting) {
+                  void fwd.stopManualCollection(manualModel);
+                } else {
+                  void fwd.startManualCollection(manualModel);
+                }
+              }}
+            >
+              {manualCollecting
+                ? <Square size={13} fill="currentColor" />
+                : manualReady
+                  ? <CircleCheck size={14} />
+                  : <Play size={14} fill="currentColor" />}
+              {manualCollecting ? "停止" : manualReady ? "已就绪" : "开始"}
+            </button>
+          </div>
           {turn?.models && turn.models.length > 0 ? (
             <div className="token-models">
               {turn.models.map((m) => {
@@ -272,6 +361,7 @@ export default function App() {
                   <span className={`token-model token-model--${m.status}`}>
                     <i />{m.model}{m.ageSecs != null ? ` · ${formatAge(m.ageSecs)}` : ""}{m.len ? ` · ${m.len}字节` : ""}
                     {hasOverride ? <span className="token-model__override">独立绑定 {effectiveBound}</span> : null}
+                    {manualCollectionModels.includes(m.model) ? <span className="token-model__manual">手动采集中</span> : null}
                   </span>
                   {/* 池中缓存的 token（所有长度），点击设置模型级绑定 */}
                   {m.poolTokens && m.poolTokens.length > 0 ? (

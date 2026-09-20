@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -132,6 +133,55 @@ pub fn preferred_model(home: &Path) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "gpt-6-astra".into())
+}
+
+/// Models offered by the local Codex installation. The current configured
+/// model is always present even when the official cache is absent or invalid.
+pub fn available_models(home: &Path) -> Vec<String> {
+    let preferred = preferred_model(home);
+    let mut models = BTreeSet::from([preferred.clone()]);
+    if let Ok(raw) = std::fs::read_to_string(home.join("models_cache.json")) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(entries) = value.get("models").and_then(serde_json::Value::as_array) {
+                for model in entries {
+                    if model
+                        .get("visibility")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("list")
+                        || model
+                            .get("supported_in_api")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false)
+                    {
+                        continue;
+                    }
+                    let Some(slug) = model
+                        .get("slug")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|slug| valid_model_name(slug))
+                    else {
+                        continue;
+                    };
+                    models.insert(slug.to_string());
+                }
+            }
+        }
+    }
+    let mut models: Vec<String> = models.into_iter().collect();
+    if let Some(index) = models.iter().position(|model| model == &preferred) {
+        models.swap(0, index);
+    }
+    models
+}
+
+pub fn valid_model_name(model: &str) -> bool {
+    let model = model.trim();
+    !model.is_empty()
+        && model.len() <= 128
+        && model.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':')
+        })
 }
 
 pub fn probe_body(model: &str) -> serde_json::Value {
@@ -415,6 +465,38 @@ mod tests {
         std::fs::write(root.path().join("config.toml"), "model = \"gpt-6-astra\"\n").unwrap();
         assert_eq!(preferred_model(root.path()), "gpt-6-astra");
         assert_eq!(preferred_model(root.path().join("missing").as_path()), "gpt-6-astra");
+    }
+
+    #[test]
+    fn available_models_merge_cache_with_preferred_model() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.toml"), "model = \"gpt-5.6-sol\"\n")
+            .unwrap();
+        std::fs::write(
+            root.path().join("models_cache.json"),
+            serde_json::json!({
+                "models": [
+                    {"slug": "gpt-6-astra", "visibility": "list", "supported_in_api": true},
+                    {"slug": "gpt-5.6-sol", "visibility": "hide", "supported_in_api": true},
+                    {"slug": " gpt-6-luna ", "visibility": "list"},
+                    {"slug": "gpt-hidden", "visibility": "hide"},
+                    {"slug": "gpt-disabled", "visibility": "list", "supported_in_api": false},
+                    {"slug": "bad model", "visibility": "list"},
+                    {"slug": "", "visibility": "list"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            available_models(root.path()),
+            ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-luna"]
+        );
+        std::fs::write(root.path().join("models_cache.json"), "not json").unwrap();
+        assert_eq!(available_models(root.path()), ["gpt-5.6-sol"]);
+        assert!(valid_model_name("openai/gpt-6-astra"));
+        assert!(!valid_model_name("gpt-6-astra\nforged"));
     }
 
     #[tokio::test]

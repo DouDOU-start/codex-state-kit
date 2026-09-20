@@ -3,11 +3,15 @@ use base64::Engine;
 use tokio::io::AsyncWriteExt;
 
 fn write_login(home: &Path, account: &str) {
+    write_login_with_access(home, account, "test-access");
+}
+
+fn write_login_with_access(home: &Path, account: &str, access_token: &str) {
     std::fs::write(
         login::kit_auth_path(home),
         serde_json::json!({
             "auth_mode":"chatgpt", "tokens":{
-                "access_token":"test-access", "refresh_token":"test-refresh", "account_id":account
+                "access_token":access_token, "refresh_token":"test-refresh", "account_id":account
             }
         })
         .to_string(),
@@ -192,7 +196,7 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
 
         // Changes while waiting must never send the original request on stale
         // credentials or silently fall back to client state.
-        for change in ["account", "policy", "route"] {
+        for change in ["account", "token", "policy", "route"] {
             app.turn_state.lock().await.invalidate_all();
             app.settings.lock().await.state_miss_policy = Wait;
             write_login(home.path(), "account-a");
@@ -201,6 +205,7 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
             assert!(!pending.is_finished());
             match change {
                 "account" => write_login(home.path(), "account-b"),
+                "token" => write_login_with_access(home.path(), "account-a", "rotated-access"),
                 "policy" => app.settings.lock().await.state_miss_policy = Strip,
                 _ => app.settings.lock().await.upstream.push_str("/changed"),
             }

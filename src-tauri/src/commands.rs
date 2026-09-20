@@ -110,6 +110,22 @@ pub async fn refresh_turn_state(state: State<'_, AppState>) -> CommandResult<Sta
 }
 
 #[tauri::command(async)]
+pub async fn start_manual_collection(
+    state: State<'_, AppState>,
+    model: String,
+) -> CommandResult<Status> {
+    command(state.core().start_manual_collection(&model).await)
+}
+
+#[tauri::command(async)]
+pub async fn stop_manual_collection(
+    state: State<'_, AppState>,
+    model: String,
+) -> CommandResult<Status> {
+    command(state.core().stop_manual_collection(&model).await)
+}
+
+#[tauri::command(async)]
 pub async fn get_login_status(
     state: State<'_, AppState>,
     home: Option<String>,
