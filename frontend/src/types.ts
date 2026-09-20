@@ -78,6 +78,8 @@ export interface TurnStateView {
 export interface Status {
   stateMissPolicy: StateMissPolicy;
   configuredModels: string[];
+  availableModels: string[];
+  manualCollectionModels: string[];
   currentAccountId?: string | null;
   currentAccountEmail?: string | null;
   accountTraffic: { concurrentRequests: number; rpm: number };

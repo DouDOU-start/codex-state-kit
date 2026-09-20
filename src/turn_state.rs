@@ -4,7 +4,7 @@ use chrono::{SecondsFormat, Utc};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 pub const HEADER_NAME: &str = "x-codex-turn-state";
 /// Token 有效期：40 分钟
@@ -354,6 +354,17 @@ impl TurnStateStore {
         models
     }
 
+    /// Models that still have useful state to display, even if their passive
+    /// request activity has aged out. This does not make them fetch targets.
+    pub fn all_known_models(&self) -> Vec<String> {
+        let mut models: BTreeSet<String> = self.all_active_models().into_iter().collect();
+        models.extend(self.tokens.keys().cloned());
+        models.extend(self.pool.keys().cloned());
+        models.extend(self.distributions.keys().cloned());
+        models.extend(self.model_bound_lens.keys().cloned());
+        models.into_iter().collect()
+    }
+
     // ─── 绑定 / 分布 ───────────────────────────────────────────
 
     /// 全局绑定的目标 token 长度。未手动指定时跟随账号见到的 292 或 332。
@@ -685,12 +696,12 @@ impl TurnStateStore {
 
     /// 生成状态视图，自动展示所有活跃模型。
     pub fn view(&self) -> TurnStateView {
-        let active = self.all_active_models();
-        self.view_for_models(&active)
+        let models = self.all_known_models();
+        self.view_for_models(&models)
     }
 
     /// 基于指定模型列表生成视图（内部方法，也用于带 seed 的场景）。
-    fn view_for_models(&self, models: &[String]) -> TurnStateView {
+    pub(crate) fn view_for_models(&self, models: &[String]) -> TurnStateView {
         let now = now_unix();
         let model_views: Vec<ModelTokenView> = models
             .iter()

@@ -5,7 +5,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -122,6 +122,23 @@ fn degraded_response_model<'a>(
     request_model.filter(|_| upstream_token.is_some_and(turn_state::is_degraded_token))
 }
 
+fn same_fetch_context(left: &Settings, right: &Settings) -> bool {
+    left.codex_home == right.codex_home
+        && left.upstream == right.upstream
+        && left.outbound_proxy == right.outbound_proxy
+        && left.outbound_mode == right.outbound_mode
+        && left.warp_http2 == right.warp_http2
+}
+
+fn same_request_identity(
+    left: &(login::ChatGptCredentials, bool),
+    right: &(login::ChatGptCredentials, bool),
+) -> bool {
+    left.1 == right.1
+        && left.0.account_id == right.0.account_id
+        && left.0.access_token == right.0.access_token
+}
+
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -161,6 +178,8 @@ pub struct Status {
     pub current_account_email: Option<String>,
     pub state_miss_policy: StateMissPolicy,
     pub configured_models: Vec<String>,
+    pub available_models: Vec<String>,
+    pub manual_collection_models: Vec<String>,
 }
 
 pub struct App {
@@ -191,6 +210,9 @@ pub struct App {
     model_notify: Notify,
     /// 是否已注册 settings.models 中的种子模型
     seeds_registered: AtomicBool,
+    /// User-started one-shot collection targets. Success, stop, account switch,
+    /// or route switch removes a target; passive discovery remains independent.
+    manual_collection_models: Mutex<BTreeSet<String>>,
 }
 
 /// Callers hold fetch_transition while this guard is alive. Dropping a request
@@ -245,6 +267,7 @@ impl App {
             warp_wake: Notify::new(),
             model_notify: Notify::new(),
             seeds_registered: AtomicBool::new(false),
+            manual_collection_models: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -281,6 +304,7 @@ impl App {
                 .lock()
                 .await
                 .bind_account(&identity.0.account_id);
+            self.manual_collection_models.lock().await.clear();
             self.seeds_registered.store(false, Ordering::Relaxed);
             *self.fetch_error.lock().await = None;
             *self.fetch_ok_at.lock().await = None;
@@ -347,6 +371,26 @@ impl App {
         let login_status = login::login_status(Path::new(&settings.codex_home));
         let account = login_status.account_id;
         let account_traffic = self.traffic.view(account.as_deref(), Instant::now());
+        let manual_collection_models: Vec<String> = self
+            .manual_collection_models
+            .lock()
+            .await
+            .iter()
+            .cloned()
+            .collect();
+        let turn_state = {
+            let store = self.turn_state.lock().await;
+            let mut visible: BTreeSet<String> = store.all_known_models().into_iter().collect();
+            visible.extend(manual_collection_models.iter().cloned());
+            let visible: Vec<String> = visible.into_iter().collect();
+            store.view_for_models(&visible)
+        };
+        let mut available_models = fetch::available_models(Path::new(&settings.codex_home));
+        for model in &settings.models {
+            if fetch::valid_model_name(model) && !available_models.contains(model) {
+                available_models.push(model.clone());
+            }
+        }
         let attached = is_attached(
             Path::new(&settings.codex_home),
             &format!("http://{}", settings.proxy_listen),
@@ -366,7 +410,7 @@ impl App {
             warp: self.warp.status(),
             fetch_error: self.fetch_error.lock().await.clone(),
             fetch_ok_at: self.fetch_ok_at.lock().await.clone(),
-            turn_state: self.turn_state.lock().await.view(),
+            turn_state,
             degraded: self.degraded.load(Ordering::Relaxed),
             degraded_at: self.degraded_at.lock().await.clone(),
             logs,
@@ -375,24 +419,107 @@ impl App {
             current_account_email: login_status.email,
             state_miss_policy: settings.state_miss_policy,
             configured_models: settings.models,
+            available_models,
+            manual_collection_models,
         }
+    }
+
+    pub async fn start_manual_collection(&self, model: &str) -> Result<Status> {
+        let model = model.trim();
+        if !fetch::valid_model_name(model) {
+            anyhow::bail!("请选择有效模型");
+        }
+        self.sync_logged_in_account().await;
+        let expected_settings = self.settings.lock().await.clone();
+        let expected_identity = login::request_credentials(Path::new(&expected_settings.codex_home))
+            .map_err(|_| anyhow::anyhow!("尚未登录 ChatGPT"))?;
+        let _transition = self.fetch_transition.lock().await;
+        let current_settings = self.settings.lock().await.clone();
+        let current_identity = login::request_credentials(Path::new(&current_settings.codex_home))
+            .map_err(|_| anyhow::anyhow!("尚未登录 ChatGPT"))?;
+        if !same_fetch_context(&expected_settings, &current_settings)
+            || !same_request_identity(&expected_identity, &current_identity)
+            || !self
+                .turn_state
+                .lock()
+                .await
+                .is_bound_to_account(&current_identity.0.account_id)
+        {
+            anyhow::bail!("账号或获取线路已变化，请重新开始手动采集");
+        }
+        let ready = !self.turn_state.lock().await.needs_refresh(model);
+        if !ready {
+            let final_identity = match login::request_credentials(Path::new(&current_settings.codex_home)) {
+                Ok(identity) => identity,
+                Err(_) => anyhow::bail!("账号已退出，请重新登录后开始手动采集"),
+            };
+            if !same_request_identity(&current_identity, &final_identity) {
+                anyhow::bail!("账号已变化，请重新开始手动采集");
+            }
+            let mut manual = self.manual_collection_models.lock().await;
+            if let Some(active) = manual.iter().next() {
+                if active != model {
+                    anyhow::bail!("{active} 正在手动采集，请先停止当前任务");
+                }
+            }
+            manual.insert(model.to_string());
+        }
+        drop(_transition);
+        if !ready {
+            self.model_notify.notify_one();
+        }
+        Ok(self.status().await)
+    }
+
+    pub async fn stop_manual_collection(&self, model: &str) -> Result<Status> {
+        let model = model.trim();
+        if !fetch::valid_model_name(model) {
+            anyhow::bail!("请选择有效模型");
+        }
+        let _transition = self.fetch_transition.lock().await;
+        let exists = self.manual_collection_models.lock().await.contains(model);
+        if exists {
+            // Odd means a transition is in progress. It closes the window where
+            // an old response could pass its final generation check while this
+            // target is being removed.
+            self.fetch_generation.fetch_add(1, Ordering::SeqCst);
+            self.fetch_change_notify.notify_waiters();
+            self.manual_collection_models.lock().await.remove(model);
+            self.fetch_generation.fetch_add(1, Ordering::SeqCst);
+            self.fetch_change_notify.notify_waiters();
+            self.model_notify.notify_one();
+            let mut error = self.fetch_error.lock().await;
+            if error
+                .as_deref()
+                .is_some_and(|message| message.contains(model))
+            {
+                *error = None;
+            }
+        }
+        drop(_transition);
+        Ok(self.status().await)
     }
 
     pub async fn refresh_turn_state(&self) -> Result<Status> {
         self.sync_logged_in_account().await;
         let settings = self.settings.lock().await.clone();
-        let mut models = settings.models.clone();
-        if models.is_empty() {
-            models = self.turn_state.lock().await.all_active_models();
-        }
+        let mut models: BTreeSet<String> = settings.models.iter().cloned().collect();
+        models.extend(self.turn_state.lock().await.all_active_models());
+        models.extend(
+            self.manual_collection_models
+                .lock()
+                .await
+                .iter()
+                .cloned(),
+        );
         if models.is_empty() {
             let model = fetch::preferred_model(Path::new(&settings.codex_home));
             self.turn_state.lock().await.register_model(&model);
-            models.push(model);
+            models.insert(model);
         }
         let mut first_error = None;
-        for model in &models {
-            if let Err(e) = self.fetch_once(model).await {
+        for model in models {
+            if let Err(e) = self.fetch_once(&model).await {
                 eprintln!("[refresh] 模型 {} 获取失败: {e}", model);
                 let can_try_other_model =
                     matches!(e.retry, FetchRetryClass::Forbidden | FetchRetryClass::Deferred);
@@ -553,12 +680,21 @@ impl App {
     }
 
     async fn fetch_once(&self, model: &str) -> std::result::Result<String, FetchOnceError> {
+        self.fetch_once_for_generation(model, None).await
+    }
+
+    async fn fetch_once_for_generation(
+        &self,
+        model: &str,
+        scheduled_generation: Option<u64>,
+    ) -> std::result::Result<String, FetchOnceError> {
         let _gate = self.fetch_gate.lock().await;
-        let generation = self.fetch_generation.load(Ordering::SeqCst);
-        if generation % 2 == 1 {
+        let current_generation = self.fetch_generation.load(Ordering::SeqCst);
+        let generation = scheduled_generation.unwrap_or(current_generation);
+        if generation != current_generation || generation % 2 == 1 {
             return Err(FetchOnceError::new(
-                format!("[{model}] 配置切换中，暂不获取票据"),
-                FetchRetryClass::Normal,
+                format!("[{model}] 采集目标或配置已变化，取消旧任务"),
+                FetchRetryClass::Stale,
             ));
         }
         let model_wait = self.model_fetch_wait(model).await;
@@ -697,6 +833,7 @@ impl App {
                     details.turn_state_action = "captured".into();
                     self.record_fetch(started, details).await;
                     self.clear_model_fetch_delay(model).await;
+                    self.manual_collection_models.lock().await.remove(model);
                     *self.fetch_error.lock().await = None;
                     *self.fetch_ok_at.lock().await = Some(
                         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -741,6 +878,42 @@ impl App {
         unreachable!("connect retry loop always returns")
     }
 
+    async fn models_needing_refresh(&self) -> Vec<String> {
+        let manual: Vec<String> = self
+            .manual_collection_models
+            .lock()
+            .await
+            .iter()
+            .cloned()
+            .collect();
+        let (models, completed_manual) = {
+            let store = self.turn_state.lock().await;
+            let mut tracked: BTreeSet<String> = store.all_active_models().into_iter().collect();
+            tracked.extend(manual.iter().cloned());
+            let completed_manual: Vec<String> = manual
+                .iter()
+                .filter(|model| !store.needs_refresh(model))
+                .cloned()
+                .collect();
+            let models: Vec<String> = tracked
+                .into_iter()
+                .filter(|model| store.needs_refresh(model))
+                .collect();
+            (models, completed_manual)
+        };
+        if !completed_manual.is_empty() {
+            let mut manual = self.manual_collection_models.lock().await;
+            for model in completed_manual {
+                manual.remove(&model);
+            }
+            drop(manual);
+            if models.is_empty() {
+                *self.fetch_error.lock().await = None;
+            }
+        }
+        models
+    }
+
     async fn refresh_if_needed(&self) -> Duration {
         let saved = self.settings.lock().await.clone();
         let settings = match self.fetch_settings(&saved) {
@@ -773,15 +946,10 @@ impl App {
             *self.degraded_at.lock().await = None;
         }
 
-        // 获取所有活跃模型（最近 60 分钟内有请求的），检查哪些需要刷新
-        let models_needing_refresh: Vec<String> = {
-            let store = self.turn_state.lock().await;
-            store
-                .all_active_models()
-                .into_iter()
-                .filter(|m| store.needs_refresh(m))
-                .collect()
-        };
+        // Passive discoveries and user-started one-shot targets share the same
+        // single-flight scheduler, pacing, and model-specific cooldowns.
+        let scheduled_generation = self.fetch_generation.load(Ordering::SeqCst);
+        let models_needing_refresh = self.models_needing_refresh().await;
 
         if models_needing_refresh.is_empty() {
             return fetch::CHECK_INTERVAL;
@@ -805,16 +973,13 @@ impl App {
             model, round, bound_len
         ));
 
-        match self.fetch_once(model).await {
+        match self
+            .fetch_once_for_generation(model, Some(scheduled_generation))
+            .await
+        {
             Ok(token) => {
                 debug_log(&format!("✅ [{}] 单发命中 {} 字节票据", model, token.len()));
-                let remaining = {
-                    let store = self.turn_state.lock().await;
-                    store
-                        .all_active_models()
-                        .into_iter()
-                        .any(|active| store.needs_refresh(&active))
-                };
+                let remaining = !self.models_needing_refresh().await.is_empty();
                 if remaining {
                     fetch::RETRY_INTERVAL
                 } else {
@@ -1078,6 +1243,7 @@ impl ProxyHandle {
             fetch_transition_guard = Some(self.app.fetch_transition.lock().await);
             self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
             self.app.fetch_change_notify.notify_waiters();
+            self.app.manual_collection_models.lock().await.clear();
             self.stop_fetch_loop().await;
             fetch_change_guard = Some(self.app.fetch_gate.lock().await);
             self.app.turn_state.lock().await.invalidate_all();
@@ -1155,6 +1321,7 @@ impl ProxyHandle {
         let fetch_transition = self.app.fetch_transition.lock().await;
         self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
         self.app.fetch_change_notify.notify_waiters();
+        self.app.manual_collection_models.lock().await.clear();
         self.stop_fetch_loop().await;
         let fetch_change = self.app.fetch_gate.lock().await;
         let result = self
@@ -1179,6 +1346,7 @@ impl ProxyHandle {
         let fetch_transition = self.app.fetch_transition.lock().await;
         self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
         self.app.fetch_change_notify.notify_waiters();
+        self.app.manual_collection_models.lock().await.clear();
         self.stop_fetch_loop().await;
         let fetch_change = self.app.fetch_gate.lock().await;
         self.app.warp.stop().await;
@@ -1525,6 +1693,7 @@ fn state_wait_error(details: &mut NetworkLogDetails, status: StatusCode, kind: &
 async fn wait_for_request_state(
     app: &App,
     request_settings: &Settings,
+    request_identity: &(login::ChatGptCredentials, bool),
     account: Option<&str>,
     model: Option<&str>,
     details: &mut NetworkLogDetails,
@@ -1546,7 +1715,9 @@ async fn wait_for_request_state(
             || current.outbound_mode != request_settings.outbound_mode || current.warp_http2 != request_settings.warp_http2 {
             return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_config_changed", "等待期间线路配置已变化，请重新发起请求；请求未转发"));
         }
-        if !login::chatgpt_credentials(Path::new(&request_settings.codex_home)).is_ok_and(|creds| creds.account_id == account) {
+        if !login::request_credentials(Path::new(&request_settings.codex_home))
+            .is_ok_and(|identity| same_request_identity(&identity, request_identity))
+        {
             return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_account_changed", "等待期间登录账号已变化或退出，请重新发起请求；请求未转发"));
         }
         {
@@ -1711,7 +1882,30 @@ async fn forward_http_tracked(
             };
             let waited = token.is_none() && state_miss_policy == StateMissPolicy::Wait;
             if waited {
-                token = Some(wait_for_request_state(app, &request_settings, effective_account.as_deref(), request_model.as_deref(), details).await?);
+                if !request_account_matches {
+                    return Err(state_wait_error(
+                        details,
+                        StatusCode::CONFLICT,
+                        "state_wait_account_mismatch",
+                        "请求身份与当前登录账号不一致，请重新发起请求；请求未转发",
+                    ));
+                }
+                let Some(identity) = request_identity.as_ref() else {
+                    return Err(state_wait_error(
+                        details,
+                        StatusCode::CONFLICT,
+                        "state_wait_account_unknown",
+                        "无法确认请求身份，请重新发起请求；请求未转发",
+                    ));
+                };
+                token = Some(wait_for_request_state(
+                    app,
+                    &request_settings,
+                    identity,
+                    effective_account.as_deref(),
+                    request_model.as_deref(),
+                    details,
+                ).await?);
             }
             if let Some(token) = token {
                 turn_state::apply_http_header(&mut parts.headers, &token);
@@ -2106,6 +2300,115 @@ mod tests {
         assert!(!login::credentials_match_headers(&headers, &creds));
         login::apply_chatgpt_credentials_headers(&mut headers, &creds);
         assert!(login::credentials_match_headers(&headers, &creds));
+    }
+
+    #[tokio::test]
+    async fn manual_collection_is_one_shot_and_keeps_passive_discovery() {
+        if std::env::var_os("CSK_MANUAL_COLLECTION_TEST_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "proxy::tests::manual_collection_is_one_shot_and_keeps_passive_discovery",
+                    "--nocapture",
+                ])
+                .env("CSK_MANUAL_COLLECTION_TEST_CHILD", "1")
+                .env("HOME", dir.path())
+                .env("USERPROFILE", dir.path())
+                .env("APPDATA", dir.path())
+                .env("LOCALAPPDATA", dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let home = crate::settings::home_dir().join("codex-manual");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            login::kit_auth_path(&home),
+            r#"{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "access_token": "manual-access",
+    "refresh_token": "manual-refresh",
+    "account_id": "manual-account"
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("models_cache.json"),
+            r#"{"models":[{"slug":"gpt-6-astra","visibility":"list"},{"slug":"gpt-5.6-sol","visibility":"list"}]}"#,
+        )
+        .unwrap();
+        let app = App::new(Settings {
+            codex_home: home.display().to_string(),
+            ..Settings::default()
+        })
+        .unwrap();
+
+        let started = app.start_manual_collection("gpt-6-astra").await.unwrap();
+        assert_eq!(started.manual_collection_models, ["gpt-6-astra"]);
+        assert!(started.available_models.contains(&"gpt-5.6-sol".into()));
+        assert_eq!(started.turn_state.models[0].model, "gpt-6-astra");
+        assert_eq!(started.turn_state.models[0].status, "empty");
+        assert_eq!(app.models_needing_refresh().await, ["gpt-6-astra"]);
+        assert!(app.start_manual_collection("gpt-5.6-sol").await.is_err());
+
+        let scheduled_generation = app.fetch_generation.load(Ordering::SeqCst);
+        let stopped = app.stop_manual_collection("gpt-6-astra").await.unwrap();
+        assert!(stopped.manual_collection_models.is_empty());
+        assert!(app.models_needing_refresh().await.is_empty());
+        assert_eq!(
+            app.fetch_once_for_generation("gpt-6-astra", Some(scheduled_generation))
+                .await
+                .unwrap_err()
+                .retry,
+            FetchRetryClass::Stale
+        );
+
+        app.start_manual_collection("gpt-6-astra").await.unwrap();
+        let ticket = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
+        assert!(app
+            .turn_state
+            .lock()
+            .await
+            .capture("gpt-6-astra", &ticket, "test"));
+        assert!(app.models_needing_refresh().await.is_empty());
+        let completed = app.status().await;
+        assert!(completed.manual_collection_models.is_empty());
+        assert_eq!(completed.turn_state.models[0].status, "active");
+
+        {
+            let mut store = app.turn_state.lock().await;
+            store.invalidate_model("gpt-6-astra");
+            store.register_model("gpt-6-astra");
+        }
+        app.start_manual_collection("gpt-6-astra").await.unwrap();
+        app.stop_manual_collection("gpt-6-astra").await.unwrap();
+        assert_eq!(app.models_needing_refresh().await, ["gpt-6-astra"]);
+        app.start_manual_collection("gpt-5.6-sol").await.unwrap();
+        std::fs::write(
+            login::kit_auth_path(&home),
+            r#"{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "access_token": "next-access",
+    "refresh_token": "next-refresh",
+    "account_id": "next-account"
+  }
+}"#,
+        )
+        .unwrap();
+        app.sync_logged_in_account().await;
+        assert!(app.manual_collection_models.lock().await.is_empty());
+        assert!(app.start_manual_collection("bad model").await.is_err());
     }
 
     #[tokio::test]

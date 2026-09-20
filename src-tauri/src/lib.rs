@@ -36,6 +36,8 @@ pub fn run() {
             commands::get_status,
             commands::set_config,
             commands::refresh_turn_state,
+            commands::start_manual_collection,
+            commands::stop_manual_collection,
             commands::get_codex_config,
             commands::get_login_status,
             commands::start_chatgpt_login,

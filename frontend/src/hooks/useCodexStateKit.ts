@@ -8,6 +8,8 @@ import {
   setConfig,
   setBoundTokenLen,
   setModelBoundTokenLen,
+  startManualCollection as startManualCollectionApi,
+  stopManualCollection as stopManualCollectionApi,
   openUrl,
   startChatgptLogin,
   openWarpTerms as openWarpTermsApi,
@@ -29,8 +31,9 @@ export function useCodexStateKit() {
   const [device, setDevice] = useState<LoginStart | null>(null);
   const [banner, setBanner] = useState<Banner | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<"login" | "save" | "refresh" | "warp" | null>(null);
+  const [busy, setBusy] = useState<"login" | "save" | "refresh" | "warp" | "manual" | null>(null);
   const request = useRef<Promise<void> | null>(null);
+  const statusRevision = useRef(0);
   const pollTimer = useRef<number | null>(null);
   const loginRequest = useRef(0);
   const loginGeneration = useRef(0);
@@ -41,9 +44,10 @@ export function useCodexStateKit() {
       await request.current;
     }
     if (!silent) setError(null);
+    const revision = statusRevision.current;
     const next = getStatus()
       .then((value) => {
-        setStatus(value);
+        if (revision === statusRevision.current) setStatus(value);
       })
       .catch((cause) => {
         const message = errorMessage(cause);
@@ -263,6 +267,49 @@ export function useCodexStateKit() {
     }
   }, []);
 
+  const startManualCollection = useCallback(async (model: string) => {
+    setBusy("manual");
+    const revision = ++statusRevision.current;
+    try {
+      const next = await startManualCollectionApi(model);
+      if (revision !== statusRevision.current) return;
+      statusRevision.current += 1;
+      setStatus(next);
+      const collecting = next.manualCollectionModels.includes(model);
+      const ready = next.turnState.models?.some(
+        (entry) => entry.model === model && entry.status === "active",
+      );
+      setBanner({
+        kind: collecting || ready ? "ok" : "error",
+        text: collecting
+          ? `${model} 已开始手动采集`
+          : ready
+            ? `${model} 已有可用 Token`
+            : `${model} 的手动采集未启动`,
+      });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const stopManualCollection = useCallback(async (model: string) => {
+    setBusy("manual");
+    const revision = ++statusRevision.current;
+    try {
+      const next = await stopManualCollectionApi(model);
+      if (revision !== statusRevision.current) return;
+      statusRevision.current += 1;
+      setStatus(next);
+      setBanner({ kind: "ok", text: `${model} 已停止手动采集` });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
   return {
     status,
     login,
@@ -281,6 +328,8 @@ export function useCodexStateKit() {
     loadLogin,
     bindTokenLen,
     bindModelTokenLen,
+    startManualCollection,
+    stopManualCollection,
     dismissBanner: () => setBanner(null),
   };
 }

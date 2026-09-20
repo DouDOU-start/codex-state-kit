@@ -1,6 +1,6 @@
 [package]
 name = "codex-state-kit"
-version = "0.0.6"
+version = "0.0.8"
 edition = "2021"
 rust-version = "1.85"
 description = "Transparent local reverse proxy for Codex HTTP SSE"
