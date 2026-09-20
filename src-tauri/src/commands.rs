@@ -1,6 +1,8 @@
 use codex_state_kit::{
-    inspect_codex_config, login_status, poll_device_login, start_device_login, CodexConfigView,
-    LoginEndpoints, LoginStart, LoginStatus, SettingsPatch, Status,
+    exchange_refresh_token, import_access_token as persist_access_token, inspect_codex_config,
+    login_status, persist_refresh_token_import, poll_device_login, start_device_login,
+    token_import_http_client, CodexConfigView, LoginEndpoints, LoginStart, LoginStatus,
+    SettingsPatch, Status,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -117,6 +119,51 @@ pub async fn get_login_status(
     let settings = state.core().settings.lock().await.clone();
     let home = home.unwrap_or(settings.codex_home);
     Ok(login_status(std::path::Path::new(&home)))
+}
+
+#[tauri::command(async)]
+pub async fn import_chatgpt_refresh_token(
+    state: State<'_, AppState>,
+    home: Option<String>,
+    refresh_token: String,
+) -> CommandResult<LoginStatus> {
+    let settings = state.core().settings.lock().await.clone();
+    let home = PathBuf::from(home.unwrap_or(settings.codex_home));
+    let generation = {
+        let mut slot = state.pending_login.lock().expect("pending login");
+        if slot.closed {
+            return Err("应用正在退出".into());
+        }
+        slot.cancel();
+        slot.generation
+    };
+    let client = command(token_import_http_client())?;
+    let tokens = command(exchange_refresh_token(&client, &refresh_token).await)?;
+    let slot = state.pending_login.lock().expect("pending login");
+    if slot.generation != generation || slot.closed {
+        return Err("登录已取消".into());
+    }
+    command(persist_refresh_token_import(
+        &home,
+        &refresh_token,
+        &tokens,
+    ))
+}
+
+#[tauri::command(async)]
+pub async fn import_chatgpt_access_token(
+    state: State<'_, AppState>,
+    home: Option<String>,
+    access_token: String,
+) -> CommandResult<LoginStatus> {
+    let settings = state.core().settings.lock().await.clone();
+    let home = PathBuf::from(home.unwrap_or(settings.codex_home));
+    let mut slot = state.pending_login.lock().expect("pending login");
+    if slot.closed {
+        return Err("应用正在退出".into());
+    }
+    slot.cancel();
+    command(persist_access_token(&home, &access_token))
 }
 
 #[tauri::command(async)]

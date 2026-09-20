@@ -11,7 +11,7 @@
 ![Codex State Kit 主界面（代理地址、账号与工作目录已打码）](docs/images/kit-overview.png)
 
 1. 安装并启动 Codex State Kit，确认「Codex 工作目录」与 Codex 客户端使用的配置目录一致，一般为用户目录下的 `.codex`。
-2. 尚未登录时，在「Codex 接入」中用浏览器回调或授权码完成 ChatGPT 登录。
+2. 尚未登录时，在「Codex 接入」中用浏览器回调、授权码、Refresh Token 或 Access Token 完成 ChatGPT 登录。
 3. 在「Token 获取代理」中选择出口。内置 WARP 可直接试用；若要稳定获取完整能力的 Token，建议改用手动代理，见下方说明。业务转发需要 Clash 等代理时，在独立的「上游转发代理」中填写 `http://127.0.0.1:7897`（使用实际端口），无需开启 TUN。
 4. 界面显示「已接入」且 Token 可用后，重启 Codex 客户端以加载本机路由。
 5. 使用期间保持 Kit 运行。正常退出后，再重启 Codex，即可回到退出前的官方账号与本地配置。
@@ -41,7 +41,7 @@
 ## 主要功能
 
 - **自动接入**：启动后配置 Codex 本地路由，正常退出时恢复。
-- **ChatGPT 登录**：默认使用浏览器回调，也支持授权码登录。
+- **ChatGPT 登录**：默认使用浏览器回调，也支持授权码、Refresh Token 和 Access Token 登录。
 - **Token 获取代理**：默认内置 WARP，无需安装额外客户端；支持手动代理。
 - **上游转发代理**：业务请求可单独设置 HTTP / HTTPS / SOCKS 代理，保存后对新请求生效。
 - **网络路由日志**：页脚入口按请求展示 Token 获取与业务请求的代理线路、目标、TCP peer、模型、Turn-State 动作、响应头耗时和业务响应流生命周期；生命周期只统计时间、块数和字节数，不记录响应正文。
@@ -64,7 +64,7 @@ Turn-State 获取 ── 内置 WARP / 手动代理 ── Codex 上游
 | 文档 | 内容 |
 | --- | --- |
 | [配置与自动接入](docs/config.md) | 工作目录、文件位置、路由恢复 |
-| [ChatGPT 登录](docs/browser-login.md) | 回调与授权码登录 |
+| [ChatGPT 登录](docs/browser-login.md) | 回调、授权码、Refresh Token 与 Access Token 登录 |
 | [出站代理与 WARP](docs/warp.md) | 自动连接、手动代理、运行限制 |
 | [网络路由日志](docs/network-logs.md) | Token 与业务线路、请求字段和数据边界 |
 | [常见问题](docs/troubleshooting.md) | 登录、网络、接入与恢复排查 |

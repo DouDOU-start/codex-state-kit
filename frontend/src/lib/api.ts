@@ -138,6 +138,7 @@ const defaultLogin = (): LoginStatus => ({
   authMode: "chatgpt",
   email: "mock@example.com",
   accountId: "mock-account-b",
+  refreshable: true,
 });
 
 let mockStatus = defaultStatus();
@@ -266,6 +267,38 @@ export async function getLoginStatus(home?: string): Promise<LoginStatus> {
   if (isTauri) {
     return invoke<LoginStatus>("get_login_status", { home: home ?? null });
   }
+  return { ...mockLogin };
+}
+
+export async function importChatgptRefreshToken(
+  home: string | undefined,
+  refreshToken: string,
+): Promise<LoginStatus> {
+  if (isTauri) {
+    return invoke<LoginStatus>("import_chatgpt_refresh_token", {
+      home: home ?? null,
+      refreshToken,
+    });
+  }
+  mockLogin = defaultLogin();
+  return { ...mockLogin };
+}
+
+export async function importChatgptAccessToken(
+  home: string | undefined,
+  accessToken: string,
+): Promise<LoginStatus> {
+  if (isTauri) {
+    return invoke<LoginStatus>("import_chatgpt_access_token", {
+      home: home ?? null,
+      accessToken,
+    });
+  }
+  mockLogin = {
+    ...defaultLogin(),
+    authMode: "chatgptAuthTokens",
+    refreshable: false,
+  };
   return { ...mockLogin };
 }
 

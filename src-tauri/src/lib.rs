@@ -38,6 +38,8 @@ pub fn run() {
             commands::refresh_turn_state,
             commands::get_codex_config,
             commands::get_login_status,
+            commands::import_chatgpt_refresh_token,
+            commands::import_chatgpt_access_token,
             commands::start_chatgpt_login,
             commands::poll_chatgpt_login,
             commands::cancel_chatgpt_login,

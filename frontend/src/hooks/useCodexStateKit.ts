@@ -3,6 +3,8 @@ import {
   cancelChatgptLogin,
   getLoginStatus,
   getStatus,
+  importChatgptAccessToken,
+  importChatgptRefreshToken,
   pollChatgptLogin,
   refreshTurnState,
   setConfig,
@@ -222,6 +224,40 @@ export function useCodexStateKit() {
     }
   }, [stopPolling]);
 
+  const importRefreshLogin = useCallback(async (home: string, refreshToken: string) => {
+    setBusy("login");
+    stopPolling();
+    setDevice(null);
+    try {
+      const loggedIn = await importChatgptRefreshToken(home.trim(), refreshToken.trim());
+      setLogin(loggedIn);
+      setBanner({ kind: "ok", text: "Refresh Token 已换取并同步到 Codex 账号" });
+      return true;
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  }, [stopPolling]);
+
+  const importAccessLogin = useCallback(async (home: string, accessToken: string) => {
+    setBusy("login");
+    stopPolling();
+    setDevice(null);
+    try {
+      const loggedIn = await importChatgptAccessToken(home.trim(), accessToken.trim());
+      setLogin(loggedIn);
+      setBanner({ kind: "ok", text: "Access Token 已同步到 Codex 账号" });
+      return true;
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  }, [stopPolling]);
+
   const cancelLogin = useCallback(async () => {
     stopPolling();
     setDevice(null);
@@ -276,6 +312,8 @@ export function useCodexStateKit() {
     refreshToken,
     openWarpTerms,
     startLogin,
+    importRefreshLogin,
+    importAccessLogin,
     cancelLogin,
     openLoginPage,
     loadLogin,

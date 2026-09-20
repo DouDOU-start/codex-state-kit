@@ -146,9 +146,11 @@ export interface LoginStatus {
   authMode?: string | null;
   email?: string | null;
   accountId?: string | null;
+  refreshable: boolean;
 }
 
 export type LoginMethod = "device" | "browser";
+export type LoginMode = LoginMethod | "refresh" | "access";
 
 export interface LoginStart {
   method: LoginMethod;

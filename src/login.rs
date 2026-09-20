@@ -7,7 +7,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Kit 独立登录文件。接入期间会覆盖官方 `auth.json`，退出时从备份还原。
@@ -24,10 +24,12 @@ pub enum LoginMethod {
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const USER_AGENT: &str = "codex-state-kit";
+const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
 const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const DEFAULT_EXPIRES_IN: u64 = 900;
 const DEFAULT_INTERVAL: u64 = 5;
+static AUTH_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct LoginEndpoints {
@@ -41,7 +43,7 @@ impl Default for LoginEndpoints {
         Self {
             usercode_url: "https://auth.openai.com/api/accounts/deviceauth/usercode".into(),
             poll_url: "https://auth.openai.com/api/accounts/deviceauth/token".into(),
-            oauth_token_url: "https://auth.openai.com/oauth/token".into(),
+            oauth_token_url: OAUTH_TOKEN_URL.into(),
         }
     }
 }
@@ -53,6 +55,7 @@ pub struct LoginStatus {
     pub auth_mode: Option<String>,
     pub email: Option<String>,
     pub account_id: Option<String>,
+    pub refreshable: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -128,7 +131,7 @@ struct DevicePollSuccess {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub(crate) struct OAuthTokenResponse {
+pub struct OAuthTokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     #[serde(default)]
@@ -139,6 +142,7 @@ pub(crate) struct OAuthTokenResponse {
 enum ResolvedAuthMode {
     ApiKey,
     Chatgpt,
+    ChatgptAuthTokens,
     Other,
 }
 
@@ -148,6 +152,15 @@ pub fn http_client() -> Result<reqwest::Client> {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .context("build login http client")
+}
+
+/// RT 换票请求携带长期凭据，禁止跟随重定向，避免请求体被转发到其他来源。
+pub fn token_import_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build token import http client")
 }
 
 pub fn kit_auth_path(home: &Path) -> PathBuf {
@@ -219,6 +232,7 @@ fn empty_login_status() -> LoginStatus {
         auth_mode: None,
         email: None,
         account_id: None,
+        refreshable: false,
     }
 }
 
@@ -251,11 +265,40 @@ pub(crate) struct ChatGptCredentials {
     pub access_token: String,
     pub account_id: String,
     pub email: Option<String>,
+    pub auth_mode: String,
+    pub refreshable: bool,
 }
 
 pub(crate) fn request_credentials(home: &Path) -> Result<(ChatGptCredentials, bool)> {
-    if let Some(creds) = credentials_from_file(&kit_auth_path(home))? {
-        return Ok((creds, true));
+    let kit_path = kit_auth_path(home);
+    if let Some(kit_auth) = read_auth_file(&kit_path)? {
+        if status_from_auth(&kit_auth).logged_in {
+            // Codex 会把轮换后的 OAuth 凭据写回官方 auth.json。Kit 独立登录
+            // 仍负责覆盖请求头，因此同账号且更新的官方凭据必须回写到 Kit，
+            // 否则会继续使用已经过期的 access token。
+            if let Ok(Some(official_auth)) = read_auth_file(&official_auth_path(home)) {
+                if should_adopt_official_refresh(&kit_auth, &official_auth) {
+                    let _guard = AUTH_SYNC_LOCK
+                        .get_or_init(|| Mutex::new(()))
+                        .lock()
+                        .expect("auth sync lock");
+                    if let (Ok(Some(latest_kit)), Ok(Some(latest_official))) = (
+                        read_auth_file(&kit_path),
+                        read_auth_file(&official_auth_path(home)),
+                    ) {
+                        if should_adopt_official_refresh(&latest_kit, &latest_official) {
+                            // 即使持久化失败，本次请求也优先使用已由 Codex 刷新的同账号凭据。
+                            let _ = atomic_write(
+                                &kit_path,
+                                &serde_json::to_vec_pretty(&latest_official)?,
+                            );
+                            return Ok((credentials_from_auth(&latest_official)?, true));
+                        }
+                    }
+                }
+            }
+            return Ok((credentials_from_auth(&kit_auth)?, true));
+        }
     }
     if let Some(creds) = credentials_from_file(&official_auth_path(home))? {
         return Ok((creds, false));
@@ -265,6 +308,32 @@ pub(crate) fn request_credentials(home: &Path) -> Result<(ChatGptCredentials, bo
 
 pub(crate) fn chatgpt_credentials(home: &Path) -> Result<ChatGptCredentials> {
     request_credentials(home).map(|(creds, _)| creds)
+}
+
+fn should_adopt_official_refresh(kit_auth: &Value, official_auth: &Value) -> bool {
+    if resolved_auth_mode(kit_auth) != ResolvedAuthMode::Chatgpt
+        || resolved_auth_mode(official_auth) != ResolvedAuthMode::Chatgpt
+    {
+        return false;
+    }
+    let kit_status = status_from_auth(kit_auth);
+    let official_status = status_from_auth(official_auth);
+    if !kit_status.logged_in
+        || !official_status.logged_in
+        || kit_status.account_id != official_status.account_id
+        || kit_auth.get("tokens") == official_auth.get("tokens")
+    {
+        return false;
+    }
+    let refreshed_at = |auth: &Value| {
+        auth.get("last_refresh")
+            .and_then(Value::as_str)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+    };
+    match (refreshed_at(kit_auth), refreshed_at(official_auth)) {
+        (Some(kit), Some(official)) => official > kit,
+        _ => false,
+    }
 }
 
 fn credentials_from_file(path: &Path) -> Result<Option<ChatGptCredentials>> {
@@ -300,10 +369,24 @@ fn credentials_from_auth(auth: &Value) -> Result<ChatGptCredentials> {
     let account_id = jwt_account
         .or(stored_account)
         .ok_or_else(|| anyhow::anyhow!("无法从登录文件提取 chatgpt_account_id"))?;
+    let resolved_mode = resolved_auth_mode(auth);
+    let refreshable = resolved_mode == ResolvedAuthMode::Chatgpt
+        && tokens
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+    let auth_mode = match resolved_mode {
+        ResolvedAuthMode::Chatgpt => "chatgpt",
+        ResolvedAuthMode::ChatgptAuthTokens => "chatgptAuthTokens",
+        _ => "chatgpt",
+    }
+    .to_string();
     Ok(ChatGptCredentials {
         access_token,
         account_id,
         email,
+        auth_mode,
+        refreshable,
     })
 }
 
@@ -333,9 +416,10 @@ pub fn apply_kit_auth_headers(headers: &mut HeaderMap, home: &Path) -> Option<Lo
     }
     Some(LoginStatus {
         logged_in: true,
-        auth_mode: Some("chatgpt".into()),
+        auth_mode: Some(creds.auth_mode),
         account_id: Some(creds.account_id),
         email: creds.email,
+        refreshable: creds.refreshable,
     })
 }
 
@@ -546,6 +630,135 @@ pub(crate) async fn exchange_tokens(
         .map_err(|_| anyhow::anyhow!("授权服务返回了无效的 Token 响应"))
 }
 
+pub async fn exchange_refresh_token(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<OAuthTokenResponse> {
+    exchange_refresh_token_at(client, OAUTH_TOKEN_URL, refresh_token).await
+}
+
+async fn exchange_refresh_token_at(
+    client: &reqwest::Client,
+    token_url: &str,
+    refresh_token: &str,
+) -> Result<OAuthTokenResponse> {
+    let refresh_token = refresh_token.trim();
+    if refresh_token.is_empty() {
+        bail!("请填写 refresh_token");
+    }
+    let response = client
+        .post(token_url)
+        .header("User-Agent", USER_AGENT)
+        .header("Originator", "codex_cli_rs")
+        .json(&json!({
+            "client_id": CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }))
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("无法连接授权服务，请检查网络后重试"))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let detail = oauth_error_detail(&body, &[refresh_token])
+            .map(|message| format!(" - {message}"))
+            .unwrap_or_default();
+        bail!("Refresh Token 换取失败: {status}{detail}");
+    }
+    serde_json::from_str(&body).map_err(|_| anyhow::anyhow!("授权服务返回了无效的 Token 响应"))
+}
+
+pub fn persist_refresh_token_import(
+    home: &Path,
+    supplied_refresh_token: &str,
+    tokens: &OAuthTokenResponse,
+) -> Result<LoginStatus> {
+    let access_token = tokens.access_token.trim();
+    if access_token.is_empty() {
+        bail!("刷新响应缺少 access_token");
+    }
+    let refresh_token = tokens
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| supplied_refresh_token.trim());
+    if refresh_token.is_empty() {
+        bail!("刷新响应缺少 refresh_token");
+    }
+
+    // Codex 原生 auth.json 要求 id_token 为可解析 JWT。部分刷新响应不返回
+    // id_token，此时沿用官方外部 AT 登录的做法，用 access token 提供身份声明。
+    let id_token = tokens
+        .id_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| parse_jwt_claims(value).is_some())
+        .or_else(|| {
+            parse_jwt_claims(access_token)
+                .is_some()
+                .then_some(access_token)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("无法从换取结果解析账号身份，请确认 RT 属于 Codex/ChatGPT 登录")
+        })?;
+    let (account_id, email) = extract_account_metadata(id_token, access_token);
+    let account_id =
+        account_id.ok_or_else(|| anyhow::anyhow!("无法从 token 中提取 chatgpt_account_id"))?;
+    write_imported_refresh_auth(home, id_token, access_token, refresh_token, &account_id)?;
+    overlay_kit_onto_official(home)?;
+    Ok(LoginStatus {
+        logged_in: true,
+        auth_mode: Some("chatgpt".into()),
+        email,
+        account_id: Some(account_id),
+        refreshable: true,
+    })
+}
+
+pub fn import_access_token(home: &Path, access_token: &str) -> Result<LoginStatus> {
+    let access_token = access_token.trim();
+    if access_token.is_empty() {
+        bail!("请填写 access_token");
+    }
+    if parse_jwt_claims(access_token).is_none() {
+        bail!("Access Token 不是可解析的 Codex JWT");
+    }
+    let (account_id, email) = extract_account_metadata(access_token, access_token);
+    let account_id =
+        account_id.ok_or_else(|| anyhow::anyhow!("无法从 Access Token 提取 chatgpt_account_id"))?;
+    write_access_token_auth(home, access_token, &account_id)?;
+    overlay_kit_onto_official(home)?;
+    Ok(LoginStatus {
+        logged_in: true,
+        auth_mode: Some("chatgptAuthTokens".into()),
+        email,
+        account_id: Some(account_id),
+        refreshable: false,
+    })
+}
+
+fn oauth_error_detail(body: &str, secrets: &[&str]) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let mut message = ["error_description", "error", "message"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(Value::as_str))?
+        .trim()
+        .to_string();
+    if message.is_empty() {
+        return None;
+    }
+    for secret in secrets {
+        let secret = secret.trim();
+        if !secret.is_empty() {
+            message = message.replace(secret, "[redacted]");
+        }
+    }
+    Some(message.chars().take(500).collect())
+}
+
 pub(crate) fn persist_tokens(home: &Path, tokens: &OAuthTokenResponse) -> Result<LoginStatus> {
     if tokens.access_token.trim().is_empty() {
         bail!("登录响应缺少 access_token");
@@ -578,7 +791,23 @@ pub(crate) fn persist_tokens(home: &Path, tokens: &OAuthTokenResponse) -> Result
         auth_mode: Some("chatgpt".into()),
         email,
         account_id: Some(account_id),
+        refreshable: true,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredAuthMode {
+    Managed,
+    ExternalAccessToken,
+}
+
+impl StoredAuthMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "chatgpt",
+            Self::ExternalAccessToken => "chatgptAuthTokens",
+        }
+    }
 }
 
 fn write_session_auth(
@@ -594,6 +823,40 @@ fn write_session_auth(
         access_token,
         refresh_token,
         account_id,
+        StoredAuthMode::Managed,
+        false,
+    )
+}
+
+fn write_imported_refresh_auth(
+    home: &Path,
+    id_token: &str,
+    access_token: &str,
+    refresh_token: &str,
+    account_id: &str,
+) -> Result<()> {
+    write_auth_json(
+        &kit_auth_path(home),
+        id_token,
+        access_token,
+        refresh_token,
+        account_id,
+        StoredAuthMode::Managed,
+        true,
+    )
+}
+
+fn write_access_token_auth(home: &Path, access_token: &str, account_id: &str) -> Result<()> {
+    // 与 Codex 的 external access token 结构一致：AT 同时提供 JWT 身份声明，
+    // refresh_token 保留为空字符串，auth_mode 标记为 chatgptAuthTokens。
+    write_auth_json(
+        &kit_auth_path(home),
+        access_token,
+        access_token,
+        "",
+        account_id,
+        StoredAuthMode::ExternalAccessToken,
+        true,
     )
 }
 
@@ -603,6 +866,8 @@ fn write_auth_json(
     access_token: &str,
     refresh_token: &str,
     account_id: &str,
+    auth_mode: StoredAuthMode,
+    replace_tokens: bool,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -625,18 +890,22 @@ fn write_auth_json(
     let obj = auth
         .as_object_mut()
         .expect("auth.json root must be an object");
-    obj.insert("auth_mode".into(), json!("chatgpt"));
+    obj.insert("auth_mode".into(), json!(auth_mode.as_str()));
     obj.insert("OPENAI_API_KEY".into(), Value::Null);
+    obj.remove("personal_access_token");
+    obj.remove("bedrock_api_key");
+    obj.remove("bedrock_access_keys");
     obj.insert(
         "last_refresh".into(),
         json!(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)),
     );
-    if account_changed {
-        // 官方桌面端会在 auth.json 里写入 agent_identity 等账号专属字段，切号后必须丢掉
+    if account_changed || auth_mode == StoredAuthMode::ExternalAccessToken {
+        // 官方桌面端会在 auth.json 里写入 agent_identity 等账号专属字段，
+        // 切号或改为外部 AT 后必须丢掉。
         obj.remove("agent_identity");
     }
 
-    let mut tokens = if account_changed {
+    let mut tokens = if account_changed || replace_tokens {
         serde_json::Map::new()
     } else {
         obj.get("tokens")
@@ -689,25 +958,33 @@ fn status_from_auth(auth: &Value) -> LoginStatus {
     let id_token = tokens
         .and_then(|map| map.get("id_token"))
         .and_then(Value::as_str);
-    let account_id = tokens
+    let stored_account = tokens
         .and_then(|map| map.get("account_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let (jwt_account, email) = extract_account_metadata(id_token.unwrap_or(""), access.unwrap_or(""));
-    let auth_mode = auth
+    let (jwt_account, email) =
+        extract_account_metadata(id_token.unwrap_or(""), access.unwrap_or(""));
+    let account_id = jwt_account.or(stored_account);
+    let explicit_auth_mode = auth
         .get("auth_mode")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let logged_in = resolved_auth_mode(auth) == ResolvedAuthMode::Chatgpt
-        && access.is_some()
-        && refresh.is_some();
+    let resolved_mode = resolved_auth_mode(auth);
+    let logged_in = access.is_some()
+        && account_id.is_some()
+        && match resolved_mode {
+            ResolvedAuthMode::Chatgpt => refresh.is_some(),
+            ResolvedAuthMode::ChatgptAuthTokens => true,
+            ResolvedAuthMode::ApiKey | ResolvedAuthMode::Other => false,
+        };
     LoginStatus {
         logged_in,
-        auth_mode: auth_mode.or_else(|| logged_in.then(|| "chatgpt".into())),
+        auth_mode: explicit_auth_mode.or_else(|| logged_in.then(|| "chatgpt".into())),
         email,
-        account_id: jwt_account.or(account_id),
+        account_id,
+        refreshable: logged_in && resolved_mode == ResolvedAuthMode::Chatgpt && refresh.is_some(),
     }
 }
 
@@ -718,7 +995,8 @@ fn resolved_auth_mode(auth: &Value) -> ResolvedAuthMode {
     let present = |key: &str| obj.get(key).is_some_and(|value| !value.is_null());
     if let Some(mode) = obj.get("auth_mode").and_then(Value::as_str) {
         return match mode {
-            "chatgpt" | "chatgptAuthTokens" => ResolvedAuthMode::Chatgpt,
+            "chatgpt" => ResolvedAuthMode::Chatgpt,
+            "chatgptAuthTokens" => ResolvedAuthMode::ChatgptAuthTokens,
             "apikey" => ResolvedAuthMode::ApiKey,
             _ => ResolvedAuthMode::Other,
         };
@@ -907,6 +1185,164 @@ mod tests {
         )
     }
 
+    async fn serve_refresh_response(
+        status: StatusCode,
+        response: Value,
+    ) -> (String, tokio::sync::mpsc::Receiver<Value>) {
+        let (send, receive) = tokio::sync::mpsc::channel(1);
+        let app = Router::new().route(
+            "/oauth/token",
+            post(move |Json(payload): Json<Value>| {
+                let send = send.clone();
+                let response = response.clone();
+                async move {
+                    send.send(payload).await.unwrap();
+                    (status, Json(response))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/oauth/token", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, receive)
+    }
+
+    #[tokio::test]
+    async fn refresh_token_import_rotates_and_writes_native_auth() {
+        let home = tempfile::tempdir().unwrap();
+        let access_token = test_jwt("acct-rt", "rt@example.com");
+        let (url, mut requests) = serve_refresh_response(
+            StatusCode::OK,
+            json!({
+                "access_token": access_token,
+                "refresh_token": "rotated-refresh"
+            }),
+        )
+        .await;
+        let client = token_import_http_client().unwrap();
+        let tokens = exchange_refresh_token_at(&client, &url, " supplied-refresh ")
+            .await
+            .unwrap();
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request["grant_type"], "refresh_token");
+        assert_eq!(request["refresh_token"], "supplied-refresh");
+        assert_eq!(request["client_id"], CLIENT_ID);
+
+        let status =
+            persist_refresh_token_import(home.path(), "supplied-refresh", &tokens).unwrap();
+        assert!(status.logged_in);
+        assert!(status.refreshable);
+        assert_eq!(status.account_id.as_deref(), Some("acct-rt"));
+        assert_eq!(status.email.as_deref(), Some("rt@example.com"));
+
+        let raw = std::fs::read_to_string(kit_auth_path(home.path())).unwrap();
+        let auth: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(auth["auth_mode"], "chatgpt");
+        assert_eq!(auth["tokens"]["access_token"], access_token);
+        assert_eq!(auth["tokens"]["id_token"], access_token);
+        assert_eq!(auth["tokens"]["refresh_token"], "rotated-refresh");
+        assert_eq!(auth["tokens"]["account_id"], "acct-rt");
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("auth.json")).unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn refresh_token_import_keeps_supplied_token_when_server_does_not_rotate() {
+        let home = tempfile::tempdir().unwrap();
+        let access_token = test_jwt("acct-rt-fallback", "fallback@example.com");
+        let status = persist_refresh_token_import(
+            home.path(),
+            "original-refresh",
+            &OAuthTokenResponse {
+                access_token,
+                refresh_token: None,
+                id_token: None,
+            },
+        )
+        .unwrap();
+        assert!(status.refreshable);
+        let auth: Value = serde_json::from_str(
+            &std::fs::read_to_string(kit_auth_path(home.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(auth["tokens"]["refresh_token"], "original-refresh");
+    }
+
+    #[tokio::test]
+    async fn refresh_token_error_redacts_supplied_secret() {
+        let (url, _requests) = serve_refresh_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error_description": "rejected supplied-refresh"}),
+        )
+        .await;
+        let client = token_import_http_client().unwrap();
+        let error = exchange_refresh_token_at(&client, &url, "supplied-refresh")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("supplied-refresh"));
+        assert!(error.contains("[redacted]"));
+    }
+
+    #[test]
+    fn access_token_import_writes_external_native_auth_without_old_refresh_token() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            kit_auth_path(home.path()),
+            r#"{
+  "auth_mode": "chatgpt",
+  "agent_identity": "old-identity",
+  "tokens": {
+    "id_token": "old-id",
+    "access_token": "old-access",
+    "refresh_token": "old-refresh",
+    "account_id": "acct-at",
+    "extra_flag": true
+  }
+}"#,
+        )
+        .unwrap();
+        let access_token = test_jwt("acct-at", "at@example.com");
+        let status = import_access_token(home.path(), &access_token).unwrap();
+        assert!(status.logged_in);
+        assert!(!status.refreshable);
+        assert_eq!(status.auth_mode.as_deref(), Some("chatgptAuthTokens"));
+        assert_eq!(status.account_id.as_deref(), Some("acct-at"));
+
+        let raw = std::fs::read_to_string(kit_auth_path(home.path())).unwrap();
+        let auth: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(auth["auth_mode"], "chatgptAuthTokens");
+        assert_eq!(auth["tokens"]["id_token"], access_token);
+        assert_eq!(auth["tokens"]["access_token"], access_token);
+        assert_eq!(auth["tokens"]["refresh_token"], "");
+        assert_eq!(auth["tokens"]["account_id"], "acct-at");
+        assert!(auth["tokens"].get("extra_flag").is_none());
+        assert!(auth.get("agent_identity").is_none());
+        assert!(login_status(home.path()).logged_in);
+        assert!(!login_status(home.path()).refreshable);
+        assert_eq!(
+            chatgpt_credentials(home.path()).unwrap().access_token,
+            access_token
+        );
+    }
+
+    #[test]
+    fn invalid_access_token_does_not_replace_existing_auth() {
+        let home = tempfile::tempdir().unwrap();
+        let existing = r#"{"auth_mode":"chatgpt","tokens":{"id_token":"old","access_token":"old","refresh_token":"old-refresh","account_id":"old-account"}}"#;
+        std::fs::write(kit_auth_path(home.path()), existing).unwrap();
+        assert!(import_access_token(home.path(), "not-a-jwt").is_err());
+        assert_eq!(
+            std::fs::read_to_string(kit_auth_path(home.path())).unwrap(),
+            existing
+        );
+        assert!(!home.path().join("auth.json").exists());
+    }
+
     #[tokio::test]
     async fn cancelled_device_session_cannot_write_auth() {
         let home = tempfile::tempdir().unwrap();
@@ -1022,6 +1458,94 @@ mod tests {
         assert_eq!(creds.account_id, "acct");
         let (_, override_headers) = request_credentials(home.path()).unwrap();
         assert!(!override_headers);
+    }
+
+    #[test]
+    fn newer_same_account_official_refresh_is_promoted_to_kit() {
+        let home = tempfile::tempdir().unwrap();
+        let old_access = test_jwt("acct-sync", "sync@example.com");
+        let new_access = test_jwt("acct-sync", "sync@example.com");
+        std::fs::write(
+            kit_auth_path(home.path()),
+            serde_json::to_vec_pretty(&json!({
+                "auth_mode": "chatgpt",
+                "last_refresh": "2026-09-20T01:00:00Z",
+                "tokens": {
+                    "id_token": old_access,
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "account_id": "acct-sync"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("auth.json"),
+            serde_json::to_vec_pretty(&json!({
+                "auth_mode": "chatgpt",
+                "last_refresh": "2026-09-20T02:00:00Z",
+                "tokens": {
+                    "id_token": new_access,
+                    "access_token": "new-access",
+                    "refresh_token": "rotated-refresh",
+                    "account_id": "acct-sync"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (credentials, override_headers) = request_credentials(home.path()).unwrap();
+        assert!(override_headers);
+        assert_eq!(credentials.access_token, "new-access");
+        let synced: Value = serde_json::from_str(
+            &std::fs::read_to_string(kit_auth_path(home.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(synced["tokens"]["refresh_token"], "rotated-refresh");
+    }
+
+    #[test]
+    fn newer_other_account_official_refresh_is_not_promoted() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            kit_auth_path(home.path()),
+            serde_json::to_vec_pretty(&json!({
+                "auth_mode": "chatgpt",
+                "last_refresh": "2026-09-20T01:00:00Z",
+                "tokens": {
+                    "id_token": test_jwt("kit-account", "kit@example.com"),
+                    "access_token": "kit-access",
+                    "refresh_token": "kit-refresh",
+                    "account_id": "kit-account"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("auth.json"),
+            serde_json::to_vec_pretty(&json!({
+                "auth_mode": "chatgpt",
+                "last_refresh": "2026-09-20T02:00:00Z",
+                "tokens": {
+                    "id_token": test_jwt("other-account", "other@example.com"),
+                    "access_token": "other-access",
+                    "refresh_token": "other-refresh",
+                    "account_id": "other-account"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (credentials, override_headers) = request_credentials(home.path()).unwrap();
+        assert!(override_headers);
+        assert_eq!(credentials.account_id, "kit-account");
+        assert_eq!(credentials.access_token, "kit-access");
+        let raw = std::fs::read_to_string(kit_auth_path(home.path())).unwrap();
+        assert!(!raw.contains("other-access"));
     }
 
     #[test]

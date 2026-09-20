@@ -349,6 +349,8 @@ mod tests {
             email: Some("test@example.com".into()),
             access_token: "access".into(),
             account_id: "acct".into(),
+            auth_mode: "chatgpt".into(),
+            refreshable: true,
         }
     }
 
