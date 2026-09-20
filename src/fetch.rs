@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::login::ChatGptCredentials;
 use crate::logs::{self, NetworkLogDetails};
 use crate::settings::{OutboundMode, Settings};
-use crate::turn_state::{self, HEADER_NAME};
+use crate::turn_state::{self, HEADER_NAME, MAX_FUTURE_SKEW_SECS};
 
 fn responses_url(upstream: &str) -> String {
     format!("{}/responses", upstream.trim().trim_end_matches('/'))
@@ -28,7 +28,6 @@ const CODEX_IDENTITY_VERSION: &str = "0.153.4";
 const CODEX_ORIGINATOR: &str = "codex-tui";
 const CODEX_USER_AGENT_SUFFIX: &str = " (Ubuntu 22.4.0; x86_64) xterm-256color";
 const MAX_FETCH_TICKET_AGE_SECS: i64 = 35 * 60;
-const MAX_FUTURE_SKEW_SECS: i64 = 5 * 60;
 
 pub fn outbound_proxy_for_client(raw: &str) -> String {
     let raw = raw.trim();

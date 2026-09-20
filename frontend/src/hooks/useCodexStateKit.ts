@@ -14,7 +14,7 @@ import {
   startChatgptLogin,
   openWarpTerms as openWarpTermsApi,
 } from "@/lib/api";
-import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy } from "@/types";
+import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy } from "@/types";
 
 function errorMessage(cause: unknown): string {
   if (typeof cause === "string") return cause;
@@ -104,6 +104,7 @@ export function useCodexStateKit() {
       outboundMode,
       warpHttp2,
       stateMissPolicy: current.stateMissPolicy,
+      tokenReusePolicy: current.tokenReusePolicy,
       models: current.configuredModels,
     });
   }, []);
@@ -144,9 +145,31 @@ export function useCodexStateKit() {
         outboundProxy: latest.outboundProxy, upstreamProxy: latest.upstreamProxy,
         outboundMode: latest.outboundMode, warpHttp2: latest.warpHttp2, stateMissPolicy,
         models: latest.configuredModels,
+        tokenReusePolicy: latest.tokenReusePolicy,
       });
       setStatus(next);
       setBanner({ kind: "ok", text: "State 处理策略已保存。" });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const setTokenReusePolicy = useCallback(async (tokenReusePolicy: TokenReusePolicy) => {
+    setBusy("save");
+    try {
+      const latest = await getStatus();
+      const next = await setConfig({
+        proxyListen: latest.proxyListen, upstream: latest.upstream, codexHome: latest.codexHome,
+        outboundProxy: latest.outboundProxy, upstreamProxy: latest.upstreamProxy,
+        outboundMode: latest.outboundMode, warpHttp2: latest.warpHttp2,
+        stateMissPolicy: latest.stateMissPolicy, models: latest.configuredModels, tokenReusePolicy,
+      });
+      setStatus(next);
+      setBanner({ kind: "ok", text: tokenReusePolicy === "shared_292"
+        ? "已启用跨模型复用 292，同账号共享有效票据。"
+        : "已恢复按模型独立，各模型分别获取和复用 Token。" });
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
     } finally {
@@ -309,6 +332,7 @@ export function useCodexStateKit() {
     refresh,
     saveSettings,
     setStateMissPolicy,
+    setTokenReusePolicy,
     refreshToken,
     openWarpTerms,
     startLogin,

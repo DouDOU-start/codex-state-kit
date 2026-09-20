@@ -15,7 +15,7 @@ import { NetworkLogDialog } from "@/components/NetworkLogDialog";
 import { WarpPanel } from "@/components/WarpPanel";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { LoginMode, Status, TurnStateView, StateMissPolicy } from "@/types";
+import type { LoginMode, Status, TurnStateView, StateMissPolicy, TokenReusePolicy } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -66,13 +66,13 @@ const STATE_POLICY_OPTIONS: Array<{
     value: "preserve",
     label: "无票保留",
     summary: "无票时沿用原值",
-    tooltip: "优先替换为当前账号、当前模型的有效凭证；没有匹配凭证时保留客户端原 State。默认策略，兼容性优先。",
+    tooltip: "按 Token 复用策略替换为当前账号的有效凭证；没有匹配凭证时保留客户端原 State。默认策略，兼容性优先。",
   },
   {
     value: "wait",
     label: "无票等待",
     summary: "等有效票再发送",
-    tooltip: "没有匹配凭证时持续等待，直到取得当前账号、模型和绑定长度的有效 State。请求身份冲突时立即报错，不转发。保证凭证匹配，不代表保证模型智力或回答质量。客户端取消，或账号、线路、策略变化时终止。",
+    tooltip: "没有匹配凭证时持续等待，直到取得当前账号和绑定长度的有效 State，模型匹配遵循 Token 复用策略。请求身份冲突时立即报错，不转发。保证凭证匹配，不代表保证模型智力或回答质量。客户端取消，或账号、线路、策略变化时终止。",
   },
   {
     value: "strip",
@@ -94,7 +94,7 @@ const STATE_POLICY_OPTIONS: Array<{
   },
 ];
 
-function tokenCopy(view?: TurnStateView | null, fetchError?: string | null) {
+function tokenCopy(view?: TurnStateView | null, fetchError?: string | null, reusePolicy: TokenReusePolicy = "shared_292") {
   const bound = view?.boundTokenLen ?? 292;
   if (fetchError && (!view || (view.status !== "active" && view.status !== "idle"))) {
     return {
@@ -121,8 +121,10 @@ function tokenCopy(view?: TurnStateView | null, fetchError?: string | null) {
     const summary = modelSummary(view);
     const bound = view.boundTokenLen ?? 292;
     return {
-      title: `${bound} Token 正在复用`,
-      body: summary,
+      title: reusePolicy === "shared_292" && bound === 292 ? "292 Token 正在跨模型复用" : `${bound} Token 正在复用`,
+      body: reusePolicy === "shared_292" && bound === 292 && view.sharedSourceModel
+        ? `同账号共享 · 来源 ${view.sharedSourceModel} · ${summary}`
+        : summary,
       loading: false,
     };
   }
@@ -201,6 +203,7 @@ export default function App() {
   const copy = tokenCopy(
     turn,
     fwd.status.fetchError ?? (fwd.status.outboundMode === "warp" ? fwd.status.warp.error : null),
+    fwd.status.tokenReusePolicy,
   );
   const age = formatAge(turn?.ageSecs);
   const sourceLabel =
@@ -298,6 +301,27 @@ export default function App() {
             </div>
           </div>
           <span className="token-card__badge"><Radio size={14} /> {fwd.status.proxyOk ? `自动管理 · 绑定 ${turn?.boundTokenLen ?? 292}` : "等待代理启动"}</span>
+          <div className="token-reuse-policy" role="group" aria-labelledby="token-reuse-policy-label">
+            <div className="token-reuse-policy__heading">
+              <strong id="token-reuse-policy-label">Token 复用策略</strong>
+              <span>自动保存 · 即时生效</span>
+            </div>
+            <div className="token-reuse-policy__options">
+              <label className="token-reuse-option">
+                <input type="radio" name="token-reuse-policy" value="shared_292"
+                  checked={fwd.status.tokenReusePolicy === "shared_292"} disabled={fwd.busy !== null}
+                  onChange={() => void fwd.setTokenReusePolicy("shared_292")} />
+                <span><strong>跨模型复用 292 <small>默认</small></strong><span>一张有效票据同账号共用，不再逐模型打票</span></span>
+              </label>
+              <label className="token-reuse-option">
+                <input type="radio" name="token-reuse-policy" value="per_model"
+                  checked={fwd.status.tokenReusePolicy === "per_model"} disabled={fwd.busy !== null}
+                  onChange={() => void fwd.setTokenReusePolicy("per_model")} />
+                <span><strong>按模型独立 <small>旧策略</small></strong><span>各模型分别获取，只复用各自的 Token</span></span>
+              </label>
+            </div>
+            <p>共享票满 35 分钟预取，超过 40 分钟停用；332 及其他绑定长度仍按模型独立。跨模型效果以实际请求为准，可随时切回旧策略。</p>
+          </div>
           {turn?.models && turn.models.length > 0 ? (
             <div className="token-models">
               {turn.models.map((m) => {
@@ -307,6 +331,7 @@ export default function App() {
                 <div key={m.model} className="token-model-row">
                   <span className={`token-model token-model--${m.status}`}>
                     <i />{m.model}{m.ageSecs != null ? ` · ${formatAge(m.ageSecs)}` : ""}{m.len ? ` · ${m.len}字节` : ""}
+                    {m.sharedFromModel ? <span className="token-model__shared" title={`票据来源：${m.sharedFromModel}`}>共享 · {m.sharedFromModel}</span> : null}
                     {hasOverride ? <span className="token-model__override">独立绑定 {effectiveBound}</span> : null}
                   </span>
                   {/* 池中缓存的 token（所有长度），点击设置模型级绑定 */}

@@ -23,7 +23,7 @@ use crate::logs::{self, LogEntry, NetworkLogDetails, StreamLifecycle};
 #[cfg(test)]
 use crate::logs::ObservedStream;
 use crate::traffic::{AccountTraffic, RequestActivity, TrafficTracker};
-use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch, StateMissPolicy};
+use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch, StateMissPolicy, TokenReusePolicy};
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
 use crate::warp::{WarpRuntime, WarpStatus};
 
@@ -106,12 +106,26 @@ fn model_for_fetch_round(models: &[String], round: u32) -> Option<&str> {
     Some(models[(round.saturating_sub(1) as usize) % models.len()].as_str())
 }
 
+/// Shared 292 is one refresh target. Pick any eligible donor at random, while
+/// retaining round-robin fairness for independently bound non-292 models.
+fn model_for_reuse_round<'a>(store: &TurnStateStore, models: &'a [String], round: u32) -> Option<&'a str> {
+    let shared: Vec<&String> = models.iter().filter(|model| store.shares_292_for(model)).collect();
+    if shared.is_empty() {
+        return model_for_fetch_round(models, round);
+    }
+    let donor = shared[(rand::random::<u64>() % shared.len() as u64) as usize];
+    let mut candidates = vec![donor.as_str()];
+    candidates.extend(models.iter().filter(|model| !store.shares_292_for(model)).map(String::as_str));
+    Some(candidates[(round.saturating_sub(1) as usize) % candidates.len()])
+}
+
 fn capture_fetched_ticket(store: &mut TurnStateStore, model: &str, token: &str) -> bool {
     if !store.capture(model, token, "fetch") {
         return false;
     }
     token.trim().len() == store.bound_len_for(model)
-        && store.peek_for_model(model).as_deref() == Some(token.trim())
+        && (store.shares_292_for(model)
+            || store.peek_for_model(model).as_deref() == Some(token.trim()))
         && !store.needs_refresh(model)
 }
 
@@ -160,6 +174,7 @@ pub struct Status {
     pub current_account_id: Option<String>,
     pub current_account_email: Option<String>,
     pub state_miss_policy: StateMissPolicy,
+    pub token_reuse_policy: TokenReusePolicy,
     pub configured_models: Vec<String>,
 }
 
@@ -219,6 +234,8 @@ impl App {
 
     pub fn with_warp(settings: Settings, warp: WarpRuntime) -> Result<Self> {
         let http = upstream_http_client(&settings.upstream_proxy)?;
+        let mut turn_state = TurnStateStore::load();
+        turn_state.set_reuse_policy(settings.token_reuse_policy);
         Ok(Self {
             warp,
             settings: Mutex::new(settings),
@@ -237,7 +254,7 @@ impl App {
             fetch_generation: AtomicU64::new(0),
             fetch_change_notify: Notify::new(),
             fetch_transition: Mutex::new(()),
-            turn_state: Mutex::new(TurnStateStore::load()),
+            turn_state: Mutex::new(turn_state),
             http: Mutex::new(http),
             degraded: AtomicBool::new(false),
             degraded_at: Mutex::new(None),
@@ -308,6 +325,7 @@ impl App {
         else {
             return false;
         };
+        let mut shared = false;
         let invalidated = {
             let mut store = self.turn_state.lock().await;
             let current_matches = store.peek_for_model(model).as_deref() == Some(injected_token);
@@ -315,6 +333,7 @@ impl App {
                 && current_matches
                 && store.is_bound_to_account(&creds.account_id)
             {
+                shared = store.shares_292_for(model);
                 store.invalidate_model(model);
                 true
             } else {
@@ -322,14 +341,16 @@ impl App {
             }
         };
         if invalidated {
-            self.clear_model_fetch_delay(model).await;
+            if shared {
+                self.fetch_model_next_allowed_at.lock().await.clear();
+            } else {
+                self.clear_model_fetch_delay(model).await;
+            }
+            let scope = if shared { "共享 292 票据" } else { "该模型票据" };
             *self.fetch_error.lock().await =
-                Some(format!("[{model}] 业务响应返回 312，已清除旧票据并重新获取"));
+                Some(format!("[{model}] 业务响应返回 312，已清除{scope}并重新获取"));
             self.model_notify.notify_one();
-            debug_log(&format!(
-                "[degraded] [{}] 业务响应返回 312，清除该模型票据并唤醒获取",
-                model
-            ));
+            debug_log(&format!("[degraded] [{model}] 业务响应返回 312，清除{scope}并唤醒获取"));
         }
         invalidated
     }
@@ -374,6 +395,7 @@ impl App {
             current_account_id: account,
             current_account_email: login_status.email,
             state_miss_policy: settings.state_miss_policy,
+            token_reuse_policy: settings.token_reuse_policy,
             configured_models: settings.models,
         }
     }
@@ -390,8 +412,13 @@ impl App {
             self.turn_state.lock().await.register_model(&model);
             models.push(model);
         }
-        let mut first_error = None;
+        let mut errors = Vec::new();
+        let mut shared_refreshed = false;
         for model in &models {
+            let shared = self.turn_state.lock().await.shares_292_for(model);
+            if shared && shared_refreshed {
+                continue;
+            }
             if let Err(e) = self.fetch_once(model).await {
                 eprintln!("[refresh] 模型 {} 获取失败: {e}", model);
                 let can_try_other_model =
@@ -399,13 +426,18 @@ impl App {
                 if !can_try_other_model {
                     return Err(e.into());
                 }
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
+                errors.push((model.clone(), e));
+            } else if shared {
+                shared_refreshed = true;
             }
         }
-        if let Some(err) = first_error {
-            return Err(err.into());
+        // A forbidden donor does not fail the refresh if another model supplied
+        // the shared ticket. Independent model failures still remain errors.
+        for (model, err) in errors {
+            let store = self.turn_state.lock().await;
+            if !store.shares_292_for(&model) || store.needs_refresh(&model) {
+                return Err(err.into());
+            }
         }
         Ok(self.status().await)
     }
@@ -553,6 +585,10 @@ impl App {
     }
 
     async fn fetch_once(&self, model: &str) -> std::result::Result<String, FetchOnceError> {
+        self.fetch_once_inner(model, false).await
+    }
+
+    async fn fetch_once_inner(&self, model: &str, only_if_needed: bool) -> std::result::Result<String, FetchOnceError> {
         let _gate = self.fetch_gate.lock().await;
         let generation = self.fetch_generation.load(Ordering::SeqCst);
         if generation % 2 == 1 {
@@ -614,6 +650,14 @@ impl App {
             ));
         }
 
+        if only_if_needed && fetch_account_is_current(&settings, &creds.account_id) {
+            let store = self.turn_state.lock().await;
+            if !store.needs_refresh(model) {
+                if let Some(token) = store.peek_for_model(model) {
+                    return Ok(token);
+                }
+            }
+        }
         for attempt in 1..=fetch::CONNECT_ATTEMPTS {
             if !self.wait_for_fetch_slot(generation).await {
                 let message = format!("[{model}] 配置已变化，取消旧线路票据请求");
@@ -621,6 +665,16 @@ impl App {
             }
             if !fetch_account_is_current(&settings, &creds.account_id) {
                 return Err(FetchOnceError::new(format!("[{model}] 登录账号已变化，取消旧账号票据请求"), FetchRetryClass::Stale));
+            }
+            // Recheck after waiting for the global slot: a manual refresh or a
+            // previous queued donor may already have refreshed the shared pool.
+            if only_if_needed {
+                let store = self.turn_state.lock().await;
+                if !store.needs_refresh(model) {
+                    if let Some(token) = store.peek_for_model(model) {
+                        return Ok(token);
+                    }
+                }
             }
             let client = match fetch::http_client(&settings.outbound_proxy) {
                 Ok(client) => client,
@@ -793,8 +847,12 @@ impl App {
         }
 
         let round = self.fetch_round.fetch_add(1, Ordering::Relaxed) + 1;
-        let model = model_for_fetch_round(&eligible_models, round)
-            .expect("eligible_models is not empty");
+        let selected = {
+            let store = self.turn_state.lock().await;
+            model_for_reuse_round(&store, &eligible_models, round)
+                .expect("eligible_models is not empty").to_string()
+        };
+        let model = selected.as_str();
         let bound_len = self.turn_state.lock().await.bound_len_for(model);
         *self.fetch_error.lock().await = Some(format!(
             "正在单发获取 {} 的 {} Token（第 {} 轮）…",
@@ -805,7 +863,7 @@ impl App {
             model, round, bound_len
         ));
 
-        match self.fetch_once(model).await {
+        match self.fetch_once_inner(model, true).await {
             Ok(token) => {
                 debug_log(&format!("✅ [{}] 单发命中 {} 字节票据", model, token.len()));
                 let remaining = {
@@ -1072,33 +1130,42 @@ impl ProxyHandle {
             || old.warp_http2 != next.warp_http2
             || old.upstream != next.upstream
             || old.codex_home != next.codex_home;
+        let reuse_changed = old.token_reuse_policy != next.token_reuse_policy;
+        let fetch_changed = route_changed || reuse_changed;
         let mut fetch_transition_guard = None;
         let mut fetch_change_guard = None;
-        if route_changed {
+        if fetch_changed {
             fetch_transition_guard = Some(self.app.fetch_transition.lock().await);
             self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
             self.app.fetch_change_notify.notify_waiters();
             self.stop_fetch_loop().await;
             fetch_change_guard = Some(self.app.fetch_gate.lock().await);
-            self.app.turn_state.lock().await.invalidate_all();
+            if route_changed {
+                self.app.turn_state.lock().await.invalidate_all();
+            }
             *self.app.fetch_error.lock().await = None;
             *self.app.fetch_ok_at.lock().await = None;
             self.app.degraded.store(false, Ordering::Relaxed);
             *self.app.degraded_at.lock().await = None;
-            if next.outbound_mode == OutboundMode::Manual || old.warp_http2 != next.warp_http2 {
+            if route_changed && (next.outbound_mode == OutboundMode::Manual || old.warp_http2 != next.warp_http2) {
                 self.app.warp.stop().await;
             }
         }
         {
             let mut settings = self.app.settings.lock().await;
             *settings = next.clone();
+            self.app.turn_state.lock().await.set_reuse_policy(next.token_reuse_policy);
             if let Some(http) = next_http {
                 *self.app.http.lock().await = http;
             }
         }
-        if route_changed {
+        if fetch_changed {
             self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
-            self.app.reset_fetch_schedule().await;
+            // A policy-only switch is still the same upstream route/account:
+            // preserve physical request spacing and any auth/rate-limit cooldown.
+            if route_changed {
+                self.app.reset_fetch_schedule().await;
+            }
             self.app.fetch_change_notify.notify_waiters();
             drop(fetch_change_guard.take());
             drop(fetch_transition_guard.take());
@@ -1117,7 +1184,7 @@ impl ProxyHandle {
             if self.managed_routes.lock().expect("managed routes").is_none() {
                 attach::update_attached_base_url(&next)?;
             }
-        } else if route_changed {
+        } else if fetch_changed {
             self.start_fetch_loop().await;
         }
         self.app.warp_wake.notify_one();
@@ -1538,7 +1605,8 @@ async fn wait_for_request_state(
     app.model_notify.notify_one();
     loop {
         let current = app.settings.lock().await.clone();
-        if current.state_miss_policy != StateMissPolicy::Wait {
+        if current.state_miss_policy != StateMissPolicy::Wait
+            || current.token_reuse_policy != request_settings.token_reuse_policy {
             return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_policy_changed", "等待策略已切换，请重新发起请求；请求未转发"));
         }
         if current.codex_home != request_settings.codex_home || current.upstream != request_settings.upstream
@@ -1965,6 +2033,26 @@ mod tests {
     }
 
     #[test]
+    fn shared_fetch_round_groups_donors_without_starving_other_bindings() {
+        let mut store = TurnStateStore::default();
+        let models = vec!["a".into(), "b".into(), "independent".into()];
+        store.set_model_bound_len("independent", Some(332));
+        for round in 1..=20 {
+            let selected = model_for_reuse_round(&store, &models, round).unwrap();
+            if round % 2 == 0 {
+                assert_eq!(selected, "independent");
+            } else {
+                assert!(["a", "b"].contains(&selected));
+            }
+        }
+        store.set_reuse_policy(TokenReusePolicy::PerModel);
+        for round in 1..=6 {
+            assert_eq!(model_for_reuse_round(&store, &models, round), model_for_fetch_round(&models, round));
+        }
+        assert!(model_for_reuse_round(&store, &[], 1).is_none());
+    }
+
+    #[test]
     fn fetch_round_rotates_models_without_starvation() {
         let models = vec!["astra".to_string(), "sol".to_string(), "other".to_string()];
         let selected: Vec<_> = (1..=5)
@@ -2270,3 +2358,7 @@ mod tests {
         assert!(!waiter.await.unwrap());
     }
 }
+
+#[cfg(test)]
+#[path = "token_reuse_tests.rs"]
+mod token_reuse_tests;

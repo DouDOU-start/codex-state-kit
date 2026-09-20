@@ -6,11 +6,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+use crate::settings::TokenReusePolicy;
+
 pub const HEADER_NAME: &str = "x-codex-turn-state";
 /// Token 有效期：40 分钟
 pub const MAX_AGE_SECS: i64 = 2400;
 /// 提前获取阈值：35 分钟时开始预取下一个 token
 pub const PREFETCH_AGE_SECS: i64 = 2100;
+/// 与探针校验一致，允许小幅服务端时钟偏移。
+pub(crate) const MAX_FUTURE_SKEW_SECS: i64 = 300;
 /// 模型活跃窗口：60 分钟内有请求则视为活跃，持续预取
 const ACTIVE_WINDOW_SECS: i64 = 3600;
 
@@ -71,6 +75,8 @@ pub struct ModelTokenView {
     pub pool_tokens: Vec<PoolTokenInfo>,
     /// 模型级绑定覆盖（None 表示跟随全局）
     pub bound_override: Option<usize>,
+    /// 共享模式实际使用的票据来源模型；不伪造目标模型的缓存或获取记录。
+    pub shared_from_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -84,6 +90,7 @@ pub struct TurnStateView {
     pub models: Vec<ModelTokenView>,
     /// 当前绑定的 token 长度（用户指定，或账号自动识别的 292/332）
     pub bound_token_len: usize,
+    pub shared_source_model: Option<String>,
 }
 
 // ─── 持久化结构 ───────────────────────────────────────────────
@@ -121,8 +128,10 @@ const PERSIST_VERSION: u32 = 2;
 
 // ─── TurnStateStore ───────────────────────────────────────────
 
-/// 按模型管理 token 池，支持被动发现 + 自动预取。
+/// 按来源模型保存票据；读取和预取按配置选择共享 292 或模型隔离。
 pub struct TurnStateStore {
+    /// 来自应用设置，不写入票据文件，切换策略不复制或清空原模型缓存。
+    reuse_policy: TokenReusePolicy,
     /// 当前绑定长度的活跃 token（直接用于注入）
     tokens: HashMap<String, TurnState>,
     /// 所有长度的 token 缓存：model → [各长度最新 TurnState]
@@ -144,6 +153,7 @@ pub struct TurnStateStore {
 impl Default for TurnStateStore {
     fn default() -> Self {
         Self {
+            reuse_policy: TokenReusePolicy::default(),
             tokens: HashMap::new(),
             pool: HashMap::new(),
             active_models: HashMap::new(),
@@ -236,6 +246,7 @@ impl TurnStateStore {
                     eprintln!("[token] 账号默认质量长度: {}", len);
                 }
                 return Self {
+                    reuse_policy: TokenReusePolicy::default(),
                     tokens,
                     pool,
                     active_models: store.active_models,
@@ -271,6 +282,7 @@ impl TurnStateStore {
                     .collect();
                 let auto = infer_auto_quality_len(&tokens, &pool);
                 return Self {
+                    reuse_policy: TokenReusePolicy::default(),
                     tokens,
                     pool,
                     active_models,
@@ -293,6 +305,7 @@ impl TurnStateStore {
                 let mut pool = HashMap::new();
                 pool.insert("_default".to_string(), vec![ts]);
                 return Self {
+                    reuse_policy: TokenReusePolicy::default(),
                     tokens,
                     pool,
                     active_models: HashMap::new(),
@@ -454,11 +467,45 @@ impl TurnStateStore {
 
     // ─── Token 操作 ────────────────────────────────────────────
 
-    /// 取特定模型的 token（不消费）。仅返回未过期（≤40min）的 token。
+    pub fn set_reuse_policy(&mut self, policy: TokenReusePolicy) {
+        self.reuse_policy = policy;
+    }
+
+    /// 显式绑定其他长度的模型仍独立取票；332 和其他长度不跨模型共享。
+    pub fn shares_292_for(&self, model: &str) -> bool {
+        self.reuse_policy == TokenReusePolicy::Shared292
+            && self.bound_len_for(model) == QUALITY_TOKEN_LEN
+    }
+
+    fn shared_292_state(&self) -> Option<(&str, &TurnState)> {
+        // 无账号归属的旧缓存不可用于跨模型共享；绑定账号时会清掉旧缓存。
+        self.account_id.as_ref()?;
+        let now = now_unix();
+        self.pool.iter()
+            .flat_map(|(model, entries)| entries.iter().map(move |ts| (model.as_str(), ts)))
+            .filter(|(_, ts)| ts.len == QUALITY_TOKEN_LEN && ts.token.len() == QUALITY_TOKEN_LEN)
+            .filter(|(_, ts)| issued_unix(&ts.token) == Some(ts.issued_unix))
+            .filter(|(_, ts)| now.saturating_sub(ts.issued_unix) >= -MAX_FUTURE_SKEW_SECS)
+            .max_by(|(a_model, a), (b_model, b)| {
+                a.issued_unix.cmp(&b.issued_unix)
+                    .then_with(|| a.captured_at.cmp(&b.captured_at))
+                    .then_with(|| a_model.cmp(b_model))
+            })
+    }
+
+    fn state_for_model(&self, model: &str) -> Option<(&str, &TurnState)> {
+        if self.shares_292_for(model) && self.account_id.is_some() {
+            self.shared_292_state()
+        } else {
+            self.tokens.get_key_value(model).map(|(model, ts)| (model.as_str(), ts))
+        }
+    }
+
+    /// 按复用策略取票（不消费）。仅返回未过期（≤40min）的 token。
     pub fn peek_for_model(&self, model: &str) -> Option<String> {
-        self.tokens.get(model).and_then(|ts| {
-            let age = now_unix() - ts.issued_unix;
-            if age <= MAX_AGE_SECS {
+        self.state_for_model(model).and_then(|(_, ts)| {
+            let age = now_unix().saturating_sub(ts.issued_unix);
+            if (-MAX_FUTURE_SKEW_SECS..=MAX_AGE_SECS).contains(&age) {
                 Some(ts.token.clone())
             } else {
                 None
@@ -466,7 +513,7 @@ impl TurnStateStore {
         })
     }
 
-    /// ⚠ 已弃用：不同模型 token 不可混用。仅用于测试和兜底。
+    /// 仅用于测试；业务请求必须通过 peek_for_model 遵循复用策略与绑定长度。
     /// 返回任意模型中最新的有效 token。
     #[allow(dead_code)]
     pub fn peek_freshest(&self) -> Option<String> {
@@ -484,11 +531,11 @@ impl TurnStateStore {
     /// - 无 token → 需要
     /// - token 年龄 > 35 分钟（PREFETCH_AGE_SECS）→ 需要预取
     pub fn needs_refresh(&self, model: &str) -> bool {
-        match self.tokens.get(model) {
+        match self.state_for_model(model) {
             None => true,
-            Some(ts) => {
-                let age = now_unix() - ts.issued_unix;
-                age > PREFETCH_AGE_SECS
+            Some((_, ts)) => {
+                let age = now_unix().saturating_sub(ts.issued_unix);
+                !(-MAX_FUTURE_SKEW_SECS..=PREFETCH_AGE_SECS).contains(&age)
             }
         }
     }
@@ -501,10 +548,18 @@ impl TurnStateStore {
         self.persist();
     }
 
-    /// 清除指定模型的 token 和缓存池
+    /// 共享票被拒绝时移除所有来源的 292，防止切换来源后继续复用旧票。
+    /// 模型隔离模式及非 292 绑定仍只清除对应模型。
     pub fn invalidate_model(&mut self, model: &str) {
-        self.tokens.remove(model);
-        self.pool.remove(model);
+        if self.shares_292_for(model) && self.account_id.is_some() {
+            self.tokens.retain(|_, ts| ts.len != QUALITY_TOKEN_LEN);
+            for entries in self.pool.values_mut() {
+                entries.retain(|ts| ts.len != QUALITY_TOKEN_LEN);
+            }
+        } else {
+            self.tokens.remove(model);
+            self.pool.remove(model);
+        }
         self.persist();
     }
 
@@ -556,7 +611,10 @@ impl TurnStateStore {
         } else {
             entries.push(state.clone());
         }
-        self.observe_quality_len(state.len);
+        // An explicit model override must not change the account-wide target.
+        if self.model_bound_len(model).is_none() {
+            self.observe_quality_len(state.len);
+        }
         // 如果匹配该模型的绑定长度，同时更新 tokens（活跃注入用）
         let target = self.bound_len_for(model);
         if is_matching_token_len(state.len, target) {
@@ -675,7 +733,7 @@ impl TurnStateStore {
             .count()
     }
 
-    /// ⚠ 已弃用：不同模型 token 不可混用。
+    /// 仅用于测试；业务注入请使用 peek_for_model。
     #[allow(dead_code)]
     pub fn stampable(&self) -> Option<String> {
         self.peek_freshest()
@@ -721,8 +779,8 @@ impl TurnStateStore {
                     })
                     .unwrap_or_default();
 
-                match self.tokens.get(model) {
-                    Some(state) => {
+                match self.state_for_model(model) {
+                    Some((source_model, state)) => {
                         let age = now - state.issued_unix;
                         let status = if age > MAX_AGE_SECS {
                             "expired"
@@ -741,6 +799,8 @@ impl TurnStateStore {
                             distribution: dist,
                             pool_tokens,
                             bound_override: model_override,
+                            shared_from_model: (self.shares_292_for(model) && self.account_id.is_some())
+                                .then(|| source_model.to_string()),
                         }
                     }
                     None => ModelTokenView {
@@ -752,6 +812,7 @@ impl TurnStateStore {
                         distribution: dist,
                         pool_tokens,
                         bound_override: model_override,
+                        shared_from_model: None,
                     },
                 }
             })
@@ -770,10 +831,21 @@ impl TurnStateStore {
             "empty"
         };
 
-        let freshest = self
-            .tokens
-            .values()
-            .max_by_key(|ts| ts.issued_unix);
+        let shared_state = if models.iter().any(|model| self.shares_292_for(model)) {
+            self.shared_292_state()
+        } else {
+            None
+        };
+        // The headline describes the shared ticket, not a newer independent
+        // 332 override whose age could conceal an aging shared pool.
+        let freshest = shared_state.map(|(_, ts)| ts).or_else(|| {
+            models.iter()
+                .filter_map(|model| self.state_for_model(model).map(|(_, ts)| ts))
+                .max_by_key(|ts| ts.issued_unix)
+        });
+        let shared_source = shared_state
+            .filter(|(_, ts)| now.saturating_sub(ts.issued_unix) <= MAX_AGE_SECS)
+            .map(|(model, _)| model.to_string());
 
         TurnStateView {
             status: overall_status.into(),
@@ -784,6 +856,7 @@ impl TurnStateStore {
                 .and_then(|ts| Some(ts.captured_at.clone()).filter(|v| !v.is_empty())),
             models: model_views,
             bound_token_len: self.bound_len(),
+            shared_source_model: shared_source,
         }
     }
 }
@@ -1069,6 +1142,148 @@ mod tests {
         let needed_raw = (target_len * 3 / 4).saturating_sub(raw.len());
         raw.extend_from_slice(&vec![0u8; needed_raw]);
         URL_SAFE.encode(raw)
+    }
+
+    fn shared_store() -> TurnStateStore {
+        let mut store = TurnStateStore::default();
+        store.bind_account("shared-test-account");
+        store.set_bound_len(Some(QUALITY_TOKEN_LEN));
+        store
+    }
+
+    #[test]
+    fn shared_292_serves_existing_and_new_models_without_copying_caches() {
+        let mut store = shared_store();
+        store.register_model("donor");
+        store.register_model("consumer");
+        let token = token_for(now_unix() - 30);
+        assert!(store.capture("donor", &token, "fetch"));
+        assert_eq!(store.peek_for_model("consumer").as_deref(), Some(token.as_str()));
+        store.register_model("new-model");
+        assert!(!store.needs_refresh("new-model"));
+        assert_eq!(store.tokens.len(), 1);
+        assert_eq!(store.pool.len(), 1);
+        let view = store.view();
+        assert_eq!(view.status, "active");
+        assert_eq!(view.shared_source_model.as_deref(), Some("donor"));
+        assert!(view.models.iter().all(|m| m.shared_from_model.as_deref() == Some("donor")));
+        assert!(view.models.iter().find(|m| m.model == "consumer").unwrap().pool_tokens.is_empty());
+
+        store.set_reuse_policy(TokenReusePolicy::PerModel);
+        assert!(store.peek_for_model("consumer").is_none());
+        assert!(store.needs_refresh("consumer"));
+        assert_eq!(store.peek_for_model("donor").as_deref(), Some(token.as_str()));
+        assert_eq!(store.view().status, "partial");
+        assert!(store.view().shared_source_model.is_none());
+        store.set_reuse_policy(TokenReusePolicy::Shared292);
+        assert_eq!(store.peek_for_model("consumer").as_deref(), Some(token.as_str()));
+        assert_eq!(store.pool.len(), 1);
+    }
+
+    #[test]
+    fn shared_292_uses_newest_donor_and_one_refresh_window() {
+        let mut store = shared_store();
+        let older = token_for(now_unix() - 2160);
+        store.capture("a", &older, "fetch");
+        assert!(store.needs_refresh("b"));
+        assert_eq!(store.peek_for_model("b").as_deref(), Some(older.as_str()));
+        let fresh = token_for(now_unix() - 10);
+        store.capture("c", &fresh, "fetch");
+        for model in ["a", "b", "c", "new"] {
+            assert_eq!(store.peek_for_model(model).as_deref(), Some(fresh.as_str()));
+            assert!(!store.needs_refresh(model));
+        }
+        store.invalidate_all();
+        store.capture("a", &token_for(now_unix() - MAX_AGE_SECS - 10), "fetch");
+        assert!(store.peek_for_model("b").is_none());
+        assert!(store.needs_refresh("b"));
+        store.register_model("b");
+        assert_eq!(store.view().models[0].status, "expired");
+    }
+
+    #[test]
+    fn shared_292_rejects_other_lengths_future_and_malformed_cached_tickets() {
+        let mut store = shared_store();
+        for len in [288, 296, 312, 332] {
+            store.capture(&format!("source-{len}"), &token_for_len(now_unix() - 10, len), "fetch");
+        }
+        store.capture("future", &token_for(now_unix() + MAX_FUTURE_SKEW_SECS + 60), "fetch");
+        store.pool.insert("bad-cache".into(), vec![TurnState {
+            token: "gAAAAA".to_string() + &"!".repeat(286),
+            len: QUALITY_TOKEN_LEN, issued_unix: now_unix(), source: "fetch".into(), captured_at: String::new(),
+        }]);
+        assert!(store.peek_for_model("consumer").is_none());
+        assert!(store.needs_refresh("consumer"));
+        let token = token_for(now_unix() - 10);
+        store.capture("donor", &token, "fetch");
+        assert_eq!(store.peek_for_model("consumer").as_deref(), Some(token.as_str()));
+    }
+
+    #[test]
+    fn shared_292_keeps_other_bindings_and_accounts_isolated() {
+        let mut store = shared_store();
+        let shared = token_for(now_unix() - 30);
+        let independent = token_for_len(now_unix() - 10, QUALITY_TOKEN_LEN_332);
+        store.capture("donor", &shared, "fetch");
+        store.set_model_bound_len("independent", Some(QUALITY_TOKEN_LEN_332));
+        assert!(store.peek_for_model("independent").is_none());
+        store.capture("independent", &independent, "fetch");
+        assert_eq!(store.peek_for_model("independent").as_deref(), Some(independent.as_str()));
+        assert_eq!(store.peek_for_model("consumer").as_deref(), Some(shared.as_str()));
+        store.set_model_bound_len("other-independent", Some(QUALITY_TOKEN_LEN_332));
+        assert!(store.peek_for_model("other-independent").is_none());
+        store.bind_account("another-account");
+        assert!(store.peek_for_model("consumer").is_none());
+        assert!(store.peek_for_model("independent").is_none());
+        assert!(store.needs_refresh("new-model"));
+        assert_eq!(store.reuse_policy, TokenReusePolicy::Shared292);
+    }
+
+    #[test]
+    fn model_override_does_not_change_default_shared_target() {
+        let mut store = TurnStateStore::default();
+        store.bind_account("account");
+        let token = token_for(now_unix() - 10);
+        store.capture("donor", &token, "fetch");
+        store.register_model("donor");
+        store.register_model("independent");
+        store.set_model_bound_len("independent", Some(QUALITY_TOKEN_LEN_332));
+        store.capture("independent", &token_for_len(now_unix() - 5, QUALITY_TOKEN_LEN_332), "fetch");
+        assert_eq!(store.bound_len(), QUALITY_TOKEN_LEN);
+        assert_eq!(store.view().len, Some(QUALITY_TOKEN_LEN));
+        assert_eq!(store.view().shared_source_model.as_deref(), Some("donor"));
+        assert_eq!(store.peek_for_model("new-model").as_deref(), Some(token.as_str()));
+        assert!(!store.needs_refresh("new-model"));
+        store.set_reuse_policy(TokenReusePolicy::PerModel);
+        assert!(store.peek_for_model("new-model").is_none());
+        assert!(store.peek_for_model("independent").is_some());
+    }
+
+    #[test]
+    fn shared_292_invalidation_clears_all_donors_not_other_lengths() {
+        let mut store = shared_store();
+        store.capture("a", &token_for(now_unix() - 30), "fetch");
+        store.capture("b", &token_for(now_unix() - 60), "fetch");
+        store.register_model("consumer");
+        store.set_model_bound_len("independent", Some(QUALITY_TOKEN_LEN_332));
+        store.capture("independent", &token_for_len(now_unix() - 10, QUALITY_TOKEN_LEN_332), "fetch");
+        store.invalidate_model("consumer");
+        for model in ["a", "b", "consumer"] {
+            assert!(store.peek_for_model(model).is_none());
+            assert!(store.needs_refresh(model));
+        }
+        assert!(store.peek_for_model("independent").is_some());
+        assert!(store.all_active_models().contains(&"consumer".to_string()));
+    }
+
+    #[test]
+    fn unowned_legacy_cache_does_not_become_shared() {
+        let mut store = TurnStateStore::default();
+        store.capture("source", &token_for(now_unix() - 30), "fetch");
+        assert!(store.peek_for_model("other").is_none());
+        store.bind_account("current-account");
+        assert!(store.peek_for_model("other").is_none());
+        assert!(store.peek_for_model("source").is_none());
     }
 
     #[test]

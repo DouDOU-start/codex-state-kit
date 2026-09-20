@@ -63,6 +63,7 @@ async fn fixed_response_proxy(
 
 fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
     SettingsPatch {
+        token_reuse_policy: settings.token_reuse_policy,
         state_miss_policy: settings.state_miss_policy,
         proxy_listen: settings.proxy_listen.clone(),
         upstream: settings.upstream.clone(),

@@ -27,6 +27,7 @@ const emptyTurnState = () => ({
 
 const defaultStatus = (): Status => ({
   stateMissPolicy: "preserve",
+  tokenReusePolicy: "shared_292",
   configuredModels: [],
   currentAccountId: "mock-account-b",
   currentAccountEmail: "mock@example.com",
@@ -187,6 +188,7 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
     outboundMode: settings.outboundMode,
     warpHttp2: settings.warpHttp2,
     stateMissPolicy: settings.stateMissPolicy,
+    tokenReusePolicy: settings.tokenReusePolicy,
     configuredModels: settings.models,
     proxyOk: true,
   };

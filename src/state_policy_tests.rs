@@ -69,6 +69,7 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app = Arc::new(App::new(Settings {
+            token_reuse_policy: TokenReusePolicy::PerModel,
             upstream: format!("http://{}", listener.local_addr().unwrap()),
             codex_home: home.path().display().to_string(),
             ..Settings::default()

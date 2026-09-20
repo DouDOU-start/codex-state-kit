@@ -63,6 +63,7 @@ export interface ModelTokenView {
   poolTokens?: PoolTokenInfo[];
   /** 模型级绑定覆盖（null/undefined 表示跟随全局） */
   boundOverride?: number | null;
+  sharedFromModel?: string | null;
 }
 
 export interface TurnStateView {
@@ -73,9 +74,11 @@ export interface TurnStateView {
   capturedAt?: string | null;
   models?: ModelTokenView[];
   boundTokenLen?: number;
+  sharedSourceModel?: string | null;
 }
 
 export interface Status {
+  tokenReusePolicy: TokenReusePolicy;
   stateMissPolicy: StateMissPolicy;
   configuredModels: string[];
   currentAccountId?: string | null;
@@ -102,6 +105,7 @@ export interface Status {
 }
 
 export interface SettingsPatch {
+  tokenReusePolicy: TokenReusePolicy;
   models: string[];
   stateMissPolicy: StateMissPolicy;
   proxyListen: string;
@@ -113,6 +117,7 @@ export interface SettingsPatch {
   warpHttp2: boolean;
 }
 
+export type TokenReusePolicy = "shared_292" | "per_model";
 export type OutboundMode = "manual" | "warp";
 export type StateMissPolicy = "preserve" | "wait" | "strip" | "passthrough" | "strip_all";
 

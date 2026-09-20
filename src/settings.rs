@@ -23,6 +23,16 @@ pub enum StateMissPolicy {
     StripAll,
 }
 
+/// 仅同账号内共享精确 292 字节的 Turn-State，其他绑定长度保持模型隔离。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenReusePolicy {
+    #[default]
+    #[serde(rename = "shared_292")]
+    Shared292,
+    PerModel,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -36,6 +46,7 @@ pub struct Settings {
     pub warp_http2: bool,
     pub models: Vec<String>,
     pub state_miss_policy: StateMissPolicy,
+    pub token_reuse_policy: TokenReusePolicy,
 }
 
 impl Default for Settings {
@@ -50,6 +61,7 @@ impl Default for Settings {
             warp_http2: false,
             models: vec![],
             state_miss_policy: StateMissPolicy::Preserve,
+            token_reuse_policy: TokenReusePolicy::default(),
         }
     }
 }
@@ -86,6 +98,8 @@ pub struct SettingsPatch {
     pub models: Vec<String>,
     #[serde(default)]
     pub state_miss_policy: StateMissPolicy,
+    #[serde(default)]
+    pub token_reuse_policy: TokenReusePolicy,
 }
 
 impl SettingsPatch {
@@ -101,6 +115,7 @@ impl SettingsPatch {
             warp_http2: self.warp_http2,
             models,
             state_miss_policy: self.state_miss_policy,
+            token_reuse_policy: self.token_reuse_policy,
         };
         if settings.proxy_listen.is_empty()
             || settings.upstream.is_empty()
@@ -199,6 +214,30 @@ mod tests {
     }
 
     #[test]
+    fn token_reuse_policy_defaults_and_round_trips() {
+        assert_eq!(Settings::default().token_reuse_policy, TokenReusePolicy::Shared292);
+        let legacy = settings_from_json(r#"{"models":["a","b"],"outbound_mode":"manual"}"#).unwrap();
+        assert_eq!(legacy.token_reuse_policy, TokenReusePolicy::Shared292);
+        assert_eq!(legacy.models, ["a", "b"]);
+        for (name, policy) in [("shared_292", TokenReusePolicy::Shared292), ("per_model", TokenReusePolicy::PerModel)] {
+            let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+                "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
+                "tokenReusePolicy":name, "stateMissPolicy":"wait", "models":["a","b"]
+            })).unwrap();
+            let settings = patch.into_settings().unwrap();
+            let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(loaded.token_reuse_policy, policy);
+            assert_eq!(loaded.state_miss_policy, StateMissPolicy::Wait);
+            assert_eq!(loaded.models, ["a", "b"]);
+        }
+        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test"
+        })).unwrap();
+        assert_eq!(patch.token_reuse_policy, TokenReusePolicy::Shared292);
+        assert!(serde_json::from_str::<TokenReusePolicy>("\"unknown\"").is_err());
+    }
+
+    #[test]
     fn upstream_proxy_defaults_and_round_trips() {
         assert!(settings_from_json("{}").unwrap().upstream_proxy.is_empty());
         for proxy in [
@@ -257,6 +296,7 @@ mod tests {
     #[test]
     fn patch_keeps_optional_proxy() {
         let settings = SettingsPatch {
+            token_reuse_policy: TokenReusePolicy::default(),
             state_miss_policy: StateMissPolicy::Preserve,
             proxy_listen: "127.0.0.1:8787".into(),
             upstream: "https://chatgpt.com/backend-api/codex".into(),
