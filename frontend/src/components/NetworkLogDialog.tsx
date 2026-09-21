@@ -47,18 +47,26 @@ function ticketRoute(status: Status): string[] {
   }
   return [
     "State Kit",
-    status.outboundProxy ? `手动代理 · ${safeNetworkUrl(effectiveProxyUrl(status.outboundProxy))}` : "手动代理未配置",
+    status.outboundProxy ? `手动代理 · ${safeNetworkUrl(effectiveProxyUrl(status.outboundProxy))}${status.turnState?.boundProxySession ? ` · session ${status.turnState.boundProxySession}` : ""}` : "手动代理未配置",
     safeNetworkUrl(status.upstream, true),
   ];
 }
 
 function businessRoute(status: Status): string[] {
+  const sameNetwork = (status.networkRoutePolicy ?? "same_network") === "same_network";
+  const hop = sameNetwork
+    ? status.outboundMode === "warp"
+      ? ticketRoute(status)[1]
+      : status.outboundProxy
+        ? `同网代理 · ${safeNetworkUrl(effectiveProxyUrl(status.outboundProxy))}${status.turnState?.boundProxySession ? ` · session ${status.turnState.boundProxySession}` : ""}`
+        : "同网代理未配置"
+    : status.upstreamProxy
+      ? `上游转发代理 · ${safeNetworkUrl(effectiveProxyUrl(status.upstreamProxy))}`
+      : "系统默认网络（可能受环境代理影响）";
   return [
     "Codex",
     `本机代理 · http://${status.proxyListen}`,
-    status.upstreamProxy
-      ? `上游转发代理 · ${safeNetworkUrl(effectiveProxyUrl(status.upstreamProxy))}`
-      : "系统默认网络（可能受环境代理影响）",
+    hop,
     safeNetworkUrl(status.upstream, true),
   ];
 }
@@ -68,7 +76,7 @@ function routeLabel(entry: LogEntry): string {
     case "embedded_warp":
       return `内置 WARP · ${entry.proxyEndpoint || "本地端点"} → ${entry.targetOrigin || "上游"}`;
     case "manual_proxy":
-      return `手动代理 · ${entry.proxyEndpoint || "已配置"} → ${entry.targetOrigin || "上游"}`;
+      return `手动代理 · ${entry.proxyEndpoint || "已配置"}${entry.proxySession ? ` · session ${entry.proxySession}` : ""} → ${entry.targetOrigin || "上游"}`;
     case "explicit_proxy":
       return `${entry.proxyEndpoint || "显式代理"} → ${entry.targetOrigin || "上游"}`;
     default:
@@ -81,6 +89,8 @@ function stateLabel(entry: LogEntry): string {
   switch (entry.turnStateAction) {
     case "replaced": return `已替换${length}`;
     case "replaced_after_wait": return `等待后已替换${length}`;
+    case "injected": return `已补上 State${length}`;
+    case "injected_after_wait": return `等待后已补上 State${length}`;
     case "removed_by_policy": return "按策略剥离 State";
     case "removed_all_policy": return "全部剥离策略，未携带 State";
     case "preserved_by_policy": return `不替换，原样转发${length}`;
@@ -230,7 +240,7 @@ function logExport(status: Status, account: string): string {
     `  account=${accountLabel(status, entry.accountId, entry.accountEmail)}`,
     `  model=${entry.model || "unknown"} transport=${transportLabel(entry.transport)} route=${routeLabel(entry)}`,
     `  upstreamResponseModel=${entry.upstreamResponseModel || "unknown"} modelComparison=${modelComparison(entry)}`,
-    `  peer=${entry.peerAddr || "unknown"} final=${entry.finalOrigin || "unknown"} http=${entry.httpVersion || "unknown"}`,
+    `  peer=${entry.peerAddr || "unknown"} final=${entry.finalOrigin || "unknown"} http=${entry.httpVersion || "unknown"} session=${entry.proxySession || "none"}`,
     `  responseHeaderMs=${entry.responseHeaderMs ?? "unknown"} responseEncoding=${entry.responseContentEncoding ?? "unknown"} firstTokenMs=${entry.firstTokenMs ?? "unknown"} totalMs=${entry.inProgress ? "pending" : entry.ms} outputTokens=${entry.outputTokens ?? "unknown"} tokensPerSecond=${entry.tokensPerSecond?.toFixed(1) ?? "unknown"} inProgress=${Boolean(entry.inProgress)}`,
     `  policy=${policyLabel(entry)} state=${stateLabel(entry)} returnedState=${entry.returnedTurnStateLen || 0} body=${formatBytes(entry.bodyBytes)} encoding=${entry.contentEncoding || "none"} error=${entry.errorKind || "none"}`,
     `  stream_state=${entry.streamState || "not_tracked"} first_chunk_ms=${entry.firstChunkMs ?? "none"} last_chunk_ms=${entry.lastChunkMs ?? "none"} total_ms=${entry.streamTotalMs ?? "none"} chunks=${entry.streamChunks || 0} bytes=${entry.streamBytes || 0} max_idle_ms=${entry.maxIdleMs ?? "none"} current_idle_ms=${entry.currentIdleMs ?? "none"}`,

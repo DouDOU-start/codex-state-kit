@@ -2,7 +2,7 @@
 
 [返回首页](../README.md)
 
-Token 获取代理用于获取 Turn-State。Codex 业务请求经过本机代理转发，使用独立的「上游转发代理」设置。WARP 和 Token 手动代理仍仅用于获取 Turn-State。
+默认「同网获取并发送」时，WARP 或手动代理同时用于获取 Turn-State 和转发 Codex 业务请求。切到「Token 与业务分路」后，WARP / 手动代理只负责打票，业务仍走独立的「上游转发代理」。
 
 ## 内置 WARP
 
@@ -33,11 +33,19 @@ socks5h://user:password@proxy.example.com:1080
 
 建议使用 HTTP 或 SOCKS5；获取 Turn-State 时，`socks5://` 会转换为 `socks5h://`，由代理解析域名。账号和密码中的特殊字符需进行 URL 编码。
 
+需要轮换住宅代理出口时，把 session 段写成 `{session}`：
+
+```text
+socks5://xmtt1126849-region-DE-sid-{session}-t-120:password@us.arxlabs.io:3010
+```
+
+Kit 每次打票都会生成新的 session。拿到稳定 292 后，把该 session 绑在票据上，同网策略下的业务请求继续走同一条出口，直到票据过期、312 失效或你改了代理地址。日志和状态只显示 session，不会回显密码。
+
 切换到 WARP 会保留手动地址。旧配置已设置代理时继续使用原模式；没有代理且未保存模式的旧配置迁移为 WARP。
 
 ## 上游转发代理
 
-在「Token 获取代理」区域下方填写独立的「上游转发代理」，例如 Clash 的 HTTP / mixed 端口：
+仅在网络策略为「Token 与业务分路」时显示。填写独立的业务转发代理，例如 Clash 的 HTTP / mixed 端口：
 
 ```text
 http://127.0.0.1:7897
@@ -45,7 +53,7 @@ http://127.0.0.1:7897
 
 保持 Clash 运行，填写实际监听端口，无需开启 TUN。支持 HTTP、HTTPS 和 SOCKS；`socks5://` 使用代理端 DNS。认证信息可写入 URL，特殊字符需要 URL 编码。
 
-失焦或 Enter 保存后，新业务请求立即使用新代理，在途流式响应继续完成。此设置不影响登录、Token 获取代理或 WARP，也不清空 Token 缓存。留空恢复原有默认网络行为（可能受进程代理环境变量影响），并非强制直连。本功能不增加操作系统代理自动识别。
+失焦或 Enter 保存后，新业务请求立即使用新代理，在途流式响应继续完成。此设置不影响登录、Token 获取或 WARP，也不清空 Token 缓存。留空恢复原有默认网络行为（可能受进程代理环境变量影响），并非强制直连。本功能不增加操作系统代理自动识别。同网策略下不会使用该字段。
 
 代理不可用时业务请求返回 502，不会自动退回直连。WebSocket 仍返回 426，由客户端回退到 HTTP SSE。
 

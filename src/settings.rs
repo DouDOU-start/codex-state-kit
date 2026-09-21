@@ -33,6 +33,15 @@ pub enum TokenReusePolicy {
     PerModel,
 }
 
+/// 业务转发与 Token 获取是否共用同一条出站线路。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkRoutePolicy {
+    #[default]
+    SameNetwork,
+    Separate,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -47,6 +56,8 @@ pub struct Settings {
     pub models: Vec<String>,
     pub state_miss_policy: StateMissPolicy,
     pub token_reuse_policy: TokenReusePolicy,
+    pub network_route_policy: NetworkRoutePolicy,
+    pub forced_model: String,
 }
 
 impl Default for Settings {
@@ -62,7 +73,20 @@ impl Default for Settings {
             models: vec![],
             state_miss_policy: StateMissPolicy::Preserve,
             token_reuse_policy: TokenReusePolicy::default(),
+            network_route_policy: NetworkRoutePolicy::default(),
+            forced_model: String::new(),
         }
+    }
+}
+
+impl Settings {
+    pub fn same_network(&self) -> bool {
+        self.network_route_policy == NetworkRoutePolicy::SameNetwork
+    }
+
+    pub fn forced_model(&self) -> Option<&str> {
+        let model = self.forced_model.trim();
+        (!model.is_empty()).then_some(model)
     }
 }
 
@@ -100,6 +124,10 @@ pub struct SettingsPatch {
     pub state_miss_policy: StateMissPolicy,
     #[serde(default)]
     pub token_reuse_policy: TokenReusePolicy,
+    #[serde(default)]
+    pub network_route_policy: NetworkRoutePolicy,
+    #[serde(default)]
+    pub forced_model: String,
 }
 
 impl SettingsPatch {
@@ -116,6 +144,8 @@ impl SettingsPatch {
             models,
             state_miss_policy: self.state_miss_policy,
             token_reuse_policy: self.token_reuse_policy,
+            network_route_policy: self.network_route_policy,
+            forced_model: normalize_forced_model(&self.forced_model)?,
         };
         if settings.proxy_listen.is_empty()
             || settings.upstream.is_empty()
@@ -158,6 +188,10 @@ fn settings_from_json(raw: &str) -> Result<Settings> {
     if value.get("outbound_mode").is_none() && settings.outbound_proxy.trim().is_empty() {
         settings.outbound_mode = OutboundMode::Warp;
     }
+    // 旧配置若已单独填写上游转发代理，保持分路，避免业务突然改走 Token 线路。
+    if value.get("network_route_policy").is_none() && !settings.upstream_proxy.trim().is_empty() {
+        settings.network_route_policy = NetworkRoutePolicy::Separate;
+    }
     Ok(settings)
 }
 
@@ -166,6 +200,20 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
     let raw = serde_json::to_string_pretty(settings)?;
     std::fs::write(&path, raw).with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+pub fn normalize_forced_model(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    if raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("强制绑定模型不能包含空白或控制字符");
+    }
+    if raw.len() > 80 {
+        bail!("强制绑定模型过长");
+    }
+    Ok(raw.to_string())
 }
 
 pub fn normalize_outbound_proxy(raw: &str) -> Result<String> {
@@ -177,7 +225,8 @@ pub fn normalize_proxy(raw: &str, label: &str) -> Result<String> {
     if raw.is_empty() {
         return Ok(String::new());
     }
-    let url = Url::parse(raw).with_context(|| format!("{label}地址无效"))?;
+    let parsed = raw.replace("{session}", "sessionid").replace("{SESSION}", "sessionid");
+    let url = Url::parse(&parsed).with_context(|| format!("{label}地址无效"))?;
     match url.scheme() {
         "http" | "https" | "socks5" | "socks5h" | "socks4" | "socks4a" => {}
         _ => bail!("不支持的{label}协议。请用 socks5:// 或 http://"),
@@ -276,6 +325,13 @@ mod tests {
     }
 
     #[test]
+    fn accepts_session_placeholder_in_proxy_url() {
+        let raw = "socks5://xmtt1126849-region-DE-sid-{session}-t-120:pass@us.arxlabs.io:3010";
+        assert_eq!(normalize_outbound_proxy(raw).unwrap(), raw);
+        assert_eq!(normalize_proxy(raw, "上游转发代理").unwrap(), raw);
+    }
+
+    #[test]
     fn accepts_socks_and_http() {
         assert_eq!(
             normalize_outbound_proxy("socks5://127.0.0.1:1080").unwrap(),
@@ -306,10 +362,63 @@ mod tests {
             outbound_mode: OutboundMode::Manual,
             warp_http2: false,
             models: vec![],
+            network_route_policy: NetworkRoutePolicy::SameNetwork,
+            forced_model: String::new(),
         }
         .into_settings()
         .unwrap();
         assert_eq!(settings.outbound_proxy, "socks5://127.0.0.1:1080");
+        assert_eq!(settings.network_route_policy, NetworkRoutePolicy::SameNetwork);
+    }
+
+    #[test]
+    fn network_route_policy_defaults_and_legacy_upstream_stays_separate() {
+        assert_eq!(
+            Settings::default().network_route_policy,
+            NetworkRoutePolicy::SameNetwork
+        );
+        assert!(settings_from_json("{}").unwrap().same_network());
+        let legacy_split = settings_from_json(
+            r#"{"outbound_proxy":"socks5://localhost:1080","upstream_proxy":"http://127.0.0.1:7897"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_split.network_route_policy, NetworkRoutePolicy::Separate);
+        let explicit = settings_from_json(
+            r#"{"upstream_proxy":"http://127.0.0.1:7897","network_route_policy":"same_network"}"#,
+        )
+        .unwrap();
+        assert!(explicit.same_network());
+        for (name, policy) in [
+            ("same_network", NetworkRoutePolicy::SameNetwork),
+            ("separate", NetworkRoutePolicy::Separate),
+        ] {
+            let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+                "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
+                "networkRoutePolicy":name
+            }))
+            .unwrap();
+            let settings = patch.into_settings().unwrap();
+            let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(loaded.network_route_policy, policy);
+        }
+        assert!(serde_json::from_str::<NetworkRoutePolicy>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn forced_model_defaults_and_round_trips() {
+        assert!(Settings::default().forced_model().is_none());
+        assert!(settings_from_json("{}").unwrap().forced_model().is_none());
+        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
+            "forcedModel":" gpt-6-astra "
+        }))
+        .unwrap();
+        let settings = patch.into_settings().unwrap();
+        assert_eq!(settings.forced_model(), Some("gpt-6-astra"));
+        let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.forced_model(), Some("gpt-6-astra"));
+        assert!(normalize_forced_model("gpt 6").is_err());
+        assert!(normalize_forced_model(&"m".repeat(81)).is_err());
     }
 
     #[test]

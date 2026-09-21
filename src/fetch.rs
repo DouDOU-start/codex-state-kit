@@ -29,6 +29,16 @@ const CODEX_ORIGINATOR: &str = "codex-tui";
 const CODEX_USER_AGENT_SUFFIX: &str = " (Ubuntu 22.4.0; x86_64) xterm-256color";
 const MAX_FETCH_TICKET_AGE_SECS: i64 = 35 * 60;
 
+const SESSION_PLACEHOLDER_LC: &str = "{session}";
+const SESSION_PLACEHOLDER_UC: &str = "{SESSION}";
+const PROBE_RESPONSE_ID_LIMIT: usize = 256 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct FetchedTicket {
+    pub token: String,
+    pub previous_response_id: Option<String>,
+}
+
 pub fn outbound_proxy_for_client(raw: &str) -> String {
     let raw = raw.trim();
     if let Some(rest) = raw.strip_prefix("socks5://") {
@@ -36,6 +46,60 @@ pub fn outbound_proxy_for_client(raw: &str) -> String {
     } else {
         raw.to_string()
     }
+}
+
+pub fn has_session_placeholder(raw: &str) -> bool {
+    raw.contains(SESSION_PLACEHOLDER_LC) || raw.contains(SESSION_PLACEHOLDER_UC)
+}
+
+pub fn replace_session_placeholder(raw: &str, session: &str) -> String {
+    raw.replace(SESSION_PLACEHOLDER_LC, session)
+        .replace(SESSION_PLACEHOLDER_UC, session)
+}
+
+pub fn generate_proxy_session() -> String {
+    use rand::Rng;
+    rand::rng()
+        .sample_iter(rand::distr::Alphanumeric)
+        .take(8)
+        .map(char::from)
+        .collect()
+}
+
+pub fn normalize_proxy_session(session: Option<&str>) -> Option<String> {
+    session
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 32
+                && value.chars().all(|ch| ch.is_ascii_alphanumeric())
+        })
+        .map(|value| value.to_string())
+}
+
+/// 打票时把 `{session}` 换成新的随机出口；没有占位符则原样返回。
+pub fn resolve_probe_proxy(raw: &str) -> (String, Option<String>) {
+    let raw = raw.trim();
+    if !has_session_placeholder(raw) {
+        return (raw.to_string(), None);
+    }
+    let session = generate_proxy_session();
+    (
+        replace_session_placeholder(raw, &session),
+        Some(session),
+    )
+}
+
+/// 业务发送使用已绑定的 session。模板含 `{session}` 但还没绑定时失败，避免误走未解析地址。
+pub fn apply_bound_session(raw: &str, session: Option<&str>) -> Result<String> {
+    let raw = raw.trim();
+    if !has_session_placeholder(raw) {
+        return Ok(raw.to_string());
+    }
+    let session = normalize_proxy_session(session).ok_or_else(|| {
+        anyhow::anyhow!("代理 URL 含 {{session}}，但还没有绑定出口。请先打到稳定 292")
+    })?;
+    Ok(replace_session_placeholder(raw, &session))
 }
 
 /// 每次调用时随机化代理 URL 中的 session ID（`-sid-XXX`），
@@ -158,7 +222,7 @@ pub(crate) async fn fetch_turn_state_with_log(
     target_len: usize,
     allow_auto_quality: bool,
     details: &mut NetworkLogDetails,
-) -> Result<String> {
+) -> Result<FetchedTicket> {
     let url = responses_url(&settings.upstream);
     let effective_proxy = outbound_proxy_for_client(&settings.outbound_proxy);
     *details = logs::token_network_details(
@@ -262,7 +326,79 @@ pub(crate) async fn fetch_turn_state_with_log(
         bail!("上游返回的 {HEADER_NAME} 已超过预取年龄");
     }
     details.turn_state_action = "received".into();
-    Ok(token)
+    let previous_response_id = read_probe_response_id(response).await;
+    Ok(FetchedTicket {
+        token,
+        previous_response_id,
+    })
+}
+
+fn is_response_id(id: &str) -> bool {
+    let id = id.trim();
+    (id.starts_with("resp_") || id.starts_with("response_"))
+        && !id.is_empty()
+        && id.len() <= 128
+        && id.chars().all(|ch| ch.is_ascii_graphic())
+}
+
+fn response_id_from_value(value: &serde_json::Value) -> Option<String> {
+    const KEYS: [&str; 2] = ["id", "response_id"];
+    for key in KEYS {
+        if let Some(id) = value.get(key).and_then(serde_json::Value::as_str).filter(|id| is_response_id(id)) {
+            return Some(id.trim().to_string());
+        }
+    }
+    if let Some(response) = value.get("response") {
+        for key in KEYS {
+            if let Some(id) = response
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| is_response_id(id))
+            {
+                return Some(id.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn parse_probe_response_id(body: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(id) = response_id_from_value(&value) {
+            return Some(id);
+        }
+    }
+    for block in body.split("\n\n") {
+        for line in block.lines() {
+            let data = line.strip_prefix("data:").map(str::trim).unwrap_or(line.trim());
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(id) = response_id_from_value(&value) {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn read_probe_response_id(response: reqwest::Response) -> Option<String> {
+    use futures_util::StreamExt;
+    let mut buf = String::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        if let Some(id) = parse_probe_response_id(&buf) {
+            return Some(id);
+        }
+        if buf.len() > PROBE_RESPONSE_ID_LIMIT {
+            break;
+        }
+    }
+    parse_probe_response_id(&buf)
 }
 
 #[cfg(test)]
@@ -282,6 +418,7 @@ mod tests {
     struct MockState {
         status: StatusCode,
         token: Option<String>,
+        body: Option<String>,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
     }
 
@@ -319,17 +456,29 @@ mod tests {
         if let Some(token) = &state.token {
             headers.insert(HEADER_NAME, HeaderValue::from_str(token).unwrap());
         }
-        (state.status, headers, Json(json!({ "ok": true })))
+        if let Some(body) = &state.body {
+            return (state.status, headers, body.clone()).into_response();
+        }
+        (state.status, headers, Json(json!({ "ok": true }))).into_response()
     }
 
     async fn serve(
         status: StatusCode,
         token: Option<String>,
     ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        serve_with_body(status, token, None).await
+    }
+
+    async fn serve_with_body(
+        status: StatusCode,
+        token: Option<String>,
+        body: Option<String>,
+    ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = MockState {
             status,
             token,
+            body,
             requests: requests.clone(),
         };
         let app = Router::new()
@@ -396,11 +545,11 @@ mod tests {
     #[test]
     fn randomize_proxy_session_auto_inserts_sid() {
         // 没有 -sid- 的 URL 也要自动加上随机 session
-        let input = "socks5://xmtt1126849-region-Rand:kfpbxiwv@us.arxlabs.io:3010";
+        let input = "socks5://xmtt1126849-region-Rand:pass@us.arxlabs.io:3010";
         let a = randomize_proxy_session(input);
         let b = randomize_proxy_session(input);
         assert!(a.contains("-sid-"), "should insert -sid-: {a}");
-        assert!(a.contains(":kfpbxiwv@"), "password should remain: {a}");
+        assert!(a.contains(":pass@"), "password should remain: {a}");
         assert_ne!(a, b, "两次随机化应该产生不同 session ID");
     }
 
@@ -408,6 +557,34 @@ mod tests {
     fn randomize_proxy_session_no_sid_passthrough() {
         let input = "socks5://user:pass@127.0.0.1:1080";
         assert_eq!(randomize_proxy_session(input), input);
+    }
+
+    #[test]
+    fn session_placeholder_rotates_then_binds() {
+        let template =
+            "socks5://xmtt1126849-region-DE-sid-{session}-t-120:pass@us.arxlabs.io:3010";
+        assert!(has_session_placeholder(template));
+        let (probe_a, session_a) = resolve_probe_proxy(template);
+        let (_probe_b, session_b) = resolve_probe_proxy(template);
+        let session_a = session_a.expect("probe session");
+        let session_b = session_b.expect("probe session");
+        assert_ne!(session_a, session_b);
+        assert!(probe_a.contains(&format!("-sid-{session_a}-t-120")));
+        assert!(probe_a.contains(":pass@us.arxlabs.io:3010"));
+        assert!(!probe_a.contains("{session}"));
+        assert_eq!(
+            apply_bound_session(template, Some(&session_a)).unwrap(),
+            probe_a
+        );
+        assert!(apply_bound_session(template, None).unwrap_err().to_string().contains("{session}"));
+        assert_eq!(
+            apply_bound_session("socks5://127.0.0.1:1080", None).unwrap(),
+            "socks5://127.0.0.1:1080"
+        );
+        assert_eq!(
+            resolve_probe_proxy("socks5://127.0.0.1:1080"),
+            ("socks5://127.0.0.1:1080".into(), None)
+        );
     }
 
     #[test]
@@ -427,7 +604,7 @@ mod tests {
             ..Settings::default()
         };
         let mut details = NetworkLogDetails::default();
-        let token = fetch_turn_state_with_log(
+        let fetched = fetch_turn_state_with_log(
             &http_client("").unwrap(),
             &settings,
             &creds(),
@@ -438,11 +615,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(token, expected);
+        assert_eq!(fetched.token, expected);
+        assert_eq!(fetched.previous_response_id, None);
         assert_eq!(details.response_status, Some(200));
         assert!(details.response_header_ms.is_some());
         assert_eq!(details.turn_state_action, "received");
-        assert_eq!(details.returned_turn_state_len, Some(token.len()));
+        assert_eq!(details.returned_turn_state_len, Some(fetched.token.len()));
         assert_eq!(details.peer_addr.as_deref(), upstream.strip_prefix("http://"));
         assert_eq!(details.final_origin.as_deref(), Some(upstream.as_str()));
         assert_eq!(details.http_version.as_deref(), Some("HTTP/1.1"));
@@ -636,7 +814,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(accepted, token_332);
+        assert_eq!(accepted.token, token_332);
 
         let (upstream, _) = serve(StatusCode::OK, Some(token_332.clone())).await;
         let settings = Settings {
@@ -655,6 +833,51 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(auto_accepted, token_332);
+        assert_eq!(auto_accepted.token, token_332);
+    }
+
+    #[test]
+    fn parse_probe_response_id_reads_json_and_sse() {
+        assert_eq!(
+            parse_probe_response_id(r#"{"id":"resp_json"}"#).as_deref(),
+            Some("resp_json")
+        );
+        assert_eq!(
+            parse_probe_response_id(
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_sse\"}}\n\n"
+            )
+            .as_deref(),
+            Some("resp_sse")
+        );
+        assert!(parse_probe_response_id(r#"{"ok":true}"#).is_none());
+    }
+
+    #[tokio::test]
+    async fn extracts_probe_response_id_from_sse() {
+        let expected = token_for_len(turn_state::QUALITY_TOKEN_LEN);
+        let (upstream, _) = serve_with_body(
+            StatusCode::OK,
+            Some(expected.clone()),
+            Some("event: response.created\ndata: {\"response\":{\"id\":\"resp_probe\"}}\n\n".into()),
+        )
+        .await;
+        let settings = Settings {
+            upstream,
+            ..Settings::default()
+        };
+        let mut details = NetworkLogDetails::default();
+        let fetched = fetch_turn_state_with_log(
+            &http_client("").unwrap(),
+            &settings,
+            &creds(),
+            "gpt-6-astra",
+            turn_state::QUALITY_TOKEN_LEN,
+            false,
+            &mut details,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched.token, expected);
+        assert_eq!(fetched.previous_response_id.as_deref(), Some("resp_probe"));
     }
 }

@@ -22,5 +22,7 @@ pub use login::{
 };
 pub use logs::LogEntry;
 pub use proxy::{join_upstream, App, ProxyHandle, Status};
-pub use settings::{home_dir, load_settings, save_settings, Settings, SettingsPatch};
+pub use settings::{
+    home_dir, load_settings, save_settings, NetworkRoutePolicy, Settings, SettingsPatch,
+};
 pub use turn_state::{ModelTokenView, PoolTokenInfo, TokenLenCount, TurnStateView};

@@ -15,7 +15,7 @@ import { NetworkLogDialog } from "@/components/NetworkLogDialog";
 import { WarpPanel } from "@/components/WarpPanel";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { LoginMode, Status, TurnStateView, StateMissPolicy, TokenReusePolicy } from "@/types";
+import type { LoginMode, Status, TurnStateView, StateMissPolicy, TokenReusePolicy, NetworkRoutePolicy } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -66,19 +66,19 @@ const STATE_POLICY_OPTIONS: Array<{
     value: "preserve",
     label: "无票保留",
     summary: "无票时沿用原值",
-    tooltip: "按 Token 复用策略替换为当前账号的有效凭证；没有匹配凭证时保留客户端原 State。默认策略，兼容性优先。",
+    tooltip: "已带 State 则替换为当前账号的有效凭证。未带时只要有规范票据就补上，并把下游首包包装成探针同轮的第二包。没有匹配凭证时保留客户端原值。",
   },
   {
     value: "wait",
     label: "无票等待",
     summary: "等有效票再发送",
-    tooltip: "没有匹配凭证时持续等待，直到取得当前账号和绑定长度的有效 State，模型匹配遵循 Token 复用策略。请求身份冲突时立即报错，不转发。保证凭证匹配，不代表保证模型智力或回答质量。客户端取消，或账号、线路、策略变化时终止。",
+    tooltip: "缺少规范票据时持续等待，再写入并包装成同轮第二包。请求身份冲突时立即报错，不转发。客户端取消，或账号、线路、策略变化时终止。",
   },
   {
     value: "strip",
     label: "无票剥离",
     summary: "无票时删除",
-    tooltip: "优先替换为有效凭证；没有匹配凭证时删除客户端 State，让上游自行处理。用于观察无 State 请求的效果。",
+    tooltip: "已带则替换，未带则补上规范票据，并把下游首包包装成探针同轮的第二包。没有匹配凭证时删除客户端 State，让上游自行处理。",
   },
   {
     value: "passthrough",
@@ -148,6 +148,7 @@ export default function App() {
   const [codexHome, setCodexHome] = useState("");
   const [outboundProxy, setOutboundProxy] = useState("");
   const [upstreamProxy, setUpstreamProxy] = useState("");
+  const [forcedModel, setForcedModel] = useState("");
   const [loginMode, setLoginMode] = useState<LoginMode>("browser");
   const [refreshTokenInput, setRefreshTokenInput] = useState("");
   const [accessTokenInput, setAccessTokenInput] = useState("");
@@ -161,6 +162,7 @@ export default function App() {
     setCodexHome(fwd.status.codexHome);
     setOutboundProxy(fwd.status.outboundProxy ?? "");
     setUpstreamProxy(fwd.status.upstreamProxy ?? "");
+    setForcedModel(fwd.status.forcedModel ?? "");
   }, [fwd.status]);
 
 
@@ -208,7 +210,7 @@ export default function App() {
   const age = formatAge(turn?.ageSecs);
   const sourceLabel =
     turn?.source === "fetch" ? "StateKit 获取" : turn?.source === "ws" ? "WebSocket" : turn?.source === "http" ? "HTTP" : null;
-  const meta = [age, turn?.len ? `${turn.len} 字节` : null, sourceLabel].filter(Boolean).join(" · ");
+  const meta = [age, turn?.len ? `${turn.len} 字节` : null, sourceLabel, turn?.boundProxySession ? `session ${turn.boundProxySession}` : null].filter(Boolean).join(" · ");
 
   const copyCode = async () => {
     if (!fwd.device?.userCode) return;
@@ -425,9 +427,29 @@ export default function App() {
         <div className="panel dash-grid">
         <section className="connection-section panel--proxy">
           <header>
-            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>Token 获取代理</h2><p>为 Token 获取配置网络</p></div></div>
+            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站网络</h2><p>{(fwd.status.networkRoutePolicy ?? "same_network") === "same_network" ? "获取 292 与业务发送使用同一条线路" : "Token 获取与业务转发可分开配置"}</p></div></div>
             <span className="section-step">01</span>
           </header>
+          <div className="token-reuse-policy network-route-policy" role="group" aria-labelledby="network-route-policy-label">
+            <div className="token-reuse-policy__heading">
+              <strong id="network-route-policy-label">网络策略</strong>
+              <span>自动保存 · 即时生效</span>
+            </div>
+            <div className="token-reuse-policy__options">
+              <label className="token-reuse-option">
+                <input type="radio" name="network-route-policy" value="same_network"
+                  checked={(fwd.status.networkRoutePolicy ?? "same_network") === "same_network"} disabled={fwd.busy !== null}
+                  onChange={() => void fwd.setNetworkRoutePolicy("same_network" as NetworkRoutePolicy)} />
+                <span><strong>同网获取并发送 <small>默认</small></strong><span>用当前代理打 292，拿到后业务请求走同一条线路</span></span>
+              </label>
+              <label className="token-reuse-option">
+                <input type="radio" name="network-route-policy" value="separate"
+                  checked={fwd.status.networkRoutePolicy === "separate"} disabled={fwd.busy !== null}
+                  onChange={() => void fwd.setNetworkRoutePolicy("separate")} />
+                <span><strong>Token 与业务分路 <small>旧</small></strong><span>Token 走获取代理，业务单独走上游转发代理</span></span>
+              </label>
+            </div>
+          </div>
           <div className="proxy-mode" role="group" aria-label="出站代理模式">
             <button type="button" aria-pressed={fwd.status.outboundMode === "warp"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "warp")}><Cloud size={15} />内置 WARP</button>
             <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "manual")}><Network size={14} />手动代理</button>
@@ -441,7 +463,7 @@ export default function App() {
               autoComplete="off"
               disabled={fwd.busy !== null}
               value={outboundProxy}
-              placeholder="http://127.0.0.1:7890"
+              placeholder="socks5://user-region-DE-sid-{session}-t-120:pass@host:3010"
               onChange={(event) => setOutboundProxy(event.target.value)}
               onBlur={() => void fwd.saveSettings(codexHome, outboundProxy)}
               onKeyDown={(event) => {
@@ -449,8 +471,11 @@ export default function App() {
               }}
             />
           </label>
-          <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。</p>
+          <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。可把出口写成 {'{session}'}，打票时自动轮换；拿到稳定 292 后绑定该 session 发业务。{(fwd.status.networkRoutePolicy ?? "same_network") === "same_network" ? " 同网策略下，业务转发也使用绑定后的同一条线路。" : ""}</p>
           </> : <WarpPanel status={fwd.status.warp} onTerms={() => void fwd.openWarpTerms()} />}
+          {(fwd.status.networkRoutePolicy ?? "same_network") === "same_network" ? (
+            <p className="panel__hint">业务请求会复用上面这条出站线路，不再单独填写上游转发代理。</p>
+          ) : <>
           <label className="field">
             <span>上游转发代理</span>
             <input
@@ -468,6 +493,7 @@ export default function App() {
             />
           </label>
           <p className="panel__hint">仅用于业务转发，留空保持默认网络行为。支持 HTTP / HTTPS / SOCKS，失焦或 Enter 自动保存。</p>
+          </>}
         </section>
 
         <section className="connection-section">
@@ -602,6 +628,22 @@ export default function App() {
               onBlur={() => void fwd.saveSettings(codexHome, outboundProxy)}
               onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} />
           </label>
+          <label className="field connection-directory">
+            <span>强制绑定模型</span>
+            <input
+              spellCheck={false}
+              autoComplete="off"
+              disabled={fwd.busy !== null}
+              value={forcedModel}
+              placeholder="例如 gpt-6-astra，留空按下游原模型转发"
+              onChange={(event) => setForcedModel(event.target.value)}
+              onBlur={() => void fwd.saveForcedModel(forcedModel)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+            />
+          </label>
+          <p className="panel__hint">填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游，Token 也按该模型获取和复用。</p>
           <div className="connection-policy">
             <div className="field connection-directory state-policy-field">
               <span>State 处理策略</span>

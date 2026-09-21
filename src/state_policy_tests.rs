@@ -1,4 +1,5 @@
 use super::*;
+use axum::body::Bytes;
 use base64::Engine;
 use tokio::io::AsyncWriteExt;
 
@@ -23,6 +24,24 @@ fn ticket(age: i64) -> String {
 }
 
 fn request(state: bool, model: bool) -> Request<Body> {
+    request_body(
+        state,
+        if model {
+            r#"{"model":"policy-model"}"#
+        } else {
+            "{}"
+        },
+    )
+}
+
+fn follow_up_request(state: bool) -> Request<Body> {
+    request_body(
+        state,
+        r#"{"model":"policy-model","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"c1","output":"ok"}]}"#,
+    )
+}
+
+fn request_body(state: bool, body: &'static str) -> Request<Body> {
     let mut builder = Request::builder()
         .method("POST")
         .uri("/responses")
@@ -30,13 +49,7 @@ fn request(state: bool, model: bool) -> Request<Body> {
     if state {
         builder = builder.header(turn_state::HEADER_NAME, "client-state");
     }
-    builder
-        .body(Body::from(if model {
-            r#"{"model":"policy-model"}"#
-        } else {
-            "{}"
-        }))
-        .unwrap()
+    builder.body(Body::from(body)).unwrap()
 }
 
 #[tokio::test]
@@ -62,14 +75,18 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
     tokio::time::timeout(Duration::from_secs(20), async {
         let home = tempfile::tempdir().unwrap();
         write_login(home.path(), "account-a");
-        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<HeaderMap>();
-        let upstream = axum::Router::new().fallback(move |headers: HeaderMap| {
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<(HeaderMap, Vec<u8>)>();
+        let upstream = axum::Router::new().fallback(move |headers: HeaderMap, body: Bytes| {
             let sent = sent.clone();
-            async move { sent.send(headers).unwrap(); "ok" }
+            async move {
+                sent.send((headers, body.to_vec())).unwrap();
+                "ok"
+            }
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app = Arc::new(App::new(Settings {
             token_reuse_policy: TokenReusePolicy::PerModel,
+            network_route_policy: NetworkRoutePolicy::Separate,
             upstream: format!("http://{}", listener.local_addr().unwrap()),
             codex_home: home.path().display().to_string(),
             ..Settings::default()
@@ -86,10 +103,12 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
             (Preserve, true, true, true, Some(fresh.as_str()), "replaced"),
             (Wait, true, true, true, Some(fresh.as_str()), "replaced"),
             (Strip, true, true, true, Some(fresh.as_str()), "replaced"),
+            (Preserve, true, true, false, Some(fresh.as_str()), "injected"),
+            (Wait, true, true, false, Some(fresh.as_str()), "injected"),
+            (Strip, true, true, false, Some(fresh.as_str()), "injected"),
+            (Preserve, false, true, false, None, "initial_request"),
             (Passthrough, true, true, true, Some("client-state"), "preserved_by_policy"),
             (StripAll, true, true, true, None, "removed_all_policy"),
-            (Wait, true, true, false, None, "initial_request"),
-            (Wait, false, true, false, None, "initial_request"),
             (Passthrough, false, true, false, None, "initial_request"),
             (StripAll, false, false, false, None, "removed_all_policy"),
         ] {
@@ -99,17 +118,49 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
             let response = proxy_http(app.clone(), request(has_state, model)).await;
             assert_eq!(response.status(), StatusCode::OK, "{policy:?}");
             axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-            let headers = received.recv().await.unwrap();
+            let (headers, _) = received.recv().await.unwrap();
             assert_eq!(headers.get(turn_state::HEADER_NAME).and_then(|v| v.to_str().ok()), expected, "{policy:?}");
             let log = app.logs.lock().await.back().cloned().unwrap();
             assert_eq!(log.turn_state_action, action);
             assert_eq!(log.state_policy, Some(policy));
         }
+        for (policy, action) in [(Preserve, "injected"), (Wait, "injected"), (Strip, "injected")] {
+            app.settings.lock().await.state_miss_policy = policy;
+            app.turn_state.lock().await.invalidate_all();
+            assert!(app.turn_state.lock().await.capture("policy-model", &fresh, "test"));
+            let response = proxy_http(app.clone(), follow_up_request(false)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{policy:?}");
+            axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(
+                received.recv().await.unwrap().0.get(turn_state::HEADER_NAME).and_then(|v| v.to_str().ok()),
+                Some(fresh.as_str()),
+                "{policy:?}"
+            );
+            assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, action);
+        }
+        app.settings.lock().await.state_miss_policy = Preserve;
+        app.turn_state.lock().await.invalidate_all();
+        assert!(app.turn_state.lock().await.capture("policy-model", &fresh, "test"));
+        let response = proxy_http(app.clone(), request_body(
+            false,
+            r#"{"model":"policy-model","previous_response_id":"resp_client"}"#,
+        )).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let (headers, body) = received.recv().await.unwrap();
+        assert_eq!(headers.get(turn_state::HEADER_NAME).and_then(|v| v.to_str().ok()), Some(fresh.as_str()));
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.get("previous_response_id").is_none());
+        assert_eq!(
+            value.pointer("/client_metadata/x-codex-turn-state").and_then(|v| v.as_str()),
+            Some(fresh.as_str())
+        );
         // Strip-all also applies to routes other than /responses.
+        app.settings.lock().await.state_miss_policy = StripAll;
         let response = proxy_http(app.clone(), Request::builder().uri("/models")
             .header(turn_state::HEADER_NAME, "client-state").body(Body::empty()).unwrap()).await;
         axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-        assert!(!received.recv().await.unwrap().contains_key(turn_state::HEADER_NAME));
+        assert!(!received.recv().await.unwrap().0.contains_key(turn_state::HEADER_NAME));
 
         // Reject explicit identity conflicts before either Kit header override
         // or waiting. A cached ticket and an absent state header are not bypasses.
@@ -157,7 +208,7 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
             let response = proxy_http(app.clone(), req).await;
             assert_eq!(response.status(), StatusCode::OK);
             axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-            assert_eq!(received.recv().await.unwrap()[turn_state::HEADER_NAME], fresh);
+            assert_eq!(received.recv().await.unwrap().0[turn_state::HEADER_NAME], fresh);
         }
         write_login(home.path(), "account-a");
         // Absent identity is allowed when Kit supplies it from its own login.
@@ -166,7 +217,7 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
         let response = proxy_http(app.clone(), req).await;
         assert_eq!(response.status(), StatusCode::OK);
         axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-        let headers = received.recv().await.unwrap();
+        let (headers, _) = received.recv().await.unwrap();
         assert_eq!(headers["authorization"], "Bearer test-access");
         assert_eq!(headers[turn_state::HEADER_NAME], fresh);
 
@@ -188,8 +239,19 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
         app.turn_state.lock().await.capture("policy-model", &fresh, "test");
         let response = pending.await.unwrap();
         axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-        assert_eq!(received.recv().await.unwrap()[turn_state::HEADER_NAME], fresh);
+        assert_eq!(received.recv().await.unwrap().0[turn_state::HEADER_NAME], fresh);
         assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, "replaced_after_wait");
+
+        app.turn_state.lock().await.invalidate_all();
+        let pending = tokio::spawn(proxy_http(app.clone(), follow_up_request(false)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!pending.is_finished());
+        assert!(received.try_recv().is_err());
+        app.turn_state.lock().await.capture("policy-model", &fresh, "test");
+        let response = pending.await.unwrap();
+        axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(received.recv().await.unwrap().0[turn_state::HEADER_NAME], fresh);
+        assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, "injected_after_wait");
 
         // Changes while waiting must never send the original request on stale
         // credentials or silently fall back to client state.

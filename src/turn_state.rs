@@ -39,6 +39,12 @@ pub struct TurnState {
     pub source: String,
     #[serde(default)]
     pub captured_at: String,
+    /// 打到该票据时使用的代理 session；业务转发复用同一出口。
+    #[serde(default)]
+    pub proxy_session: String,
+    /// 探针第一包返回的 response.id，用来把下游请求包装成同轮第二包。
+    #[serde(default)]
+    pub previous_response_id: String,
 }
 
 /// 单种 token 长度的计数
@@ -91,6 +97,7 @@ pub struct TurnStateView {
     /// 当前绑定的 token 长度（用户指定，或账号自动识别的 292/332）
     pub bound_token_len: usize,
     pub shared_source_model: Option<String>,
+    pub bound_proxy_session: Option<String>,
 }
 
 // ─── 持久化结构 ───────────────────────────────────────────────
@@ -598,9 +605,32 @@ impl TurnStateStore {
     /// 将 token 存入缓存池（不管长度是否匹配绑定）。
     /// 每个 (model, len_bucket) 只保留最新的一个。
     pub fn store_to_pool(&mut self, model: &str, token: &str, source: &str) -> bool {
-        let Some(state) = TurnState::from_token(token, source) else {
+        self.store_to_pool_with_session(model, token, source, None, None)
+    }
+
+    fn store_to_pool_with_session(
+        &mut self,
+        model: &str,
+        token: &str,
+        source: &str,
+        proxy_session: Option<&str>,
+        previous_response_id: Option<&str>,
+    ) -> bool {
+        let Some(mut state) = TurnState::from_token(token, source) else {
             return false;
         };
+        if let Some(session) = proxy_session.map(str::trim).filter(|value| {
+            !value.is_empty()
+                && value.len() <= 32
+                && value.chars().all(|ch| ch.is_ascii_alphanumeric())
+        }) {
+            state.proxy_session = session.to_string();
+        }
+        if let Some(response_id) = previous_response_id.map(str::trim).filter(|value| {
+            !value.is_empty() && value.len() <= 128 && value.chars().all(|ch| ch.is_ascii_graphic())
+        }) {
+            state.previous_response_id = response_id.to_string();
+        }
         let entries = self.pool.entry(model.to_string()).or_default();
         // 替换同长度区间的旧 token（±4 范围算同一种）
         if let Some(pos) = entries
@@ -655,11 +685,72 @@ impl TurnStateStore {
 
     /// 兼容旧接口：存入匹配绑定长度的 token 到 tokens + pool。
     pub fn capture(&mut self, model: &str, token: &str, source: &str) -> bool {
-        let ok = self.store_to_pool(model, token, source);
+        self.capture_with_session(model, token, source, None, None)
+    }
+
+    pub fn capture_with_session(
+        &mut self,
+        model: &str,
+        token: &str,
+        source: &str,
+        proxy_session: Option<&str>,
+        previous_response_id: Option<&str>,
+    ) -> bool {
+        let ok = self.store_to_pool_with_session(
+            model,
+            token,
+            source,
+            proxy_session,
+            previous_response_id,
+        );
         if ok {
             self.persist();
         }
         ok
+    }
+
+    pub fn bound_proxy_session(&self) -> Option<String> {
+        if let Some((_, ts)) = self.shared_292_state() {
+            if !ts.proxy_session.is_empty() {
+                let age = now_unix().saturating_sub(ts.issued_unix);
+                if (-MAX_FUTURE_SKEW_SECS..=MAX_AGE_SECS).contains(&age) {
+                    return Some(ts.proxy_session.clone());
+                }
+            }
+        }
+        self.tokens
+            .values()
+            .filter(|ts| !ts.proxy_session.is_empty() && !is_degraded_token(&ts.token))
+            .filter(|ts| {
+                let age = now_unix().saturating_sub(ts.issued_unix);
+                (-MAX_FUTURE_SKEW_SECS..=MAX_AGE_SECS).contains(&age)
+            })
+            .max_by_key(|ts| ts.issued_unix)
+            .map(|ts| ts.proxy_session.clone())
+    }
+
+    pub fn proxy_session_for_token(&self, token: Option<&str>) -> Option<String> {
+        if let Some(token) = token.map(str::trim).filter(|value| !value.is_empty()) {
+            let found = self
+                .tokens
+                .values()
+                .chain(self.pool.values().flatten())
+                .find(|ts| ts.token == token && !ts.proxy_session.is_empty())
+                .map(|ts| ts.proxy_session.clone());
+            if found.is_some() {
+                return found;
+            }
+        }
+        self.bound_proxy_session()
+    }
+
+    pub fn previous_response_id_for_token(&self, token: Option<&str>) -> Option<String> {
+        let token = token.map(str::trim).filter(|value| !value.is_empty())?;
+        self.tokens
+            .values()
+            .chain(self.pool.values().flatten())
+            .find(|ts| ts.token == token && !ts.previous_response_id.is_empty())
+            .map(|ts| ts.previous_response_id.clone())
     }
 
     /// 获取某模型在池中所有有效 token 的长度分类。
@@ -857,6 +948,7 @@ impl TurnStateStore {
             models: model_views,
             bound_token_len: self.bound_len(),
             shared_source_model: shared_source,
+            bound_proxy_session: self.bound_proxy_session(),
         }
     }
 }
@@ -871,6 +963,8 @@ impl TurnState {
             len: token.len(),
             source: source.to_string(),
             captured_at: now_rfc3339(),
+            proxy_session: String::new(),
+            previous_response_id: String::new(),
         })
     }
 }
@@ -909,13 +1003,94 @@ pub fn has_http_turn_state(headers: &HeaderMap) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+pub fn has_body_turn_state(bytes: &[u8]) -> bool {
+    request_json(bytes)
+        .as_ref()
+        .and_then(|value| value.pointer(&format!("/client_metadata/{HEADER_NAME}")))
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// 下游请求已经是同轮续跑时，不再改写它自带的 previous_response_id。
+pub fn is_same_turn_follow_up(bytes: &[u8]) -> bool {
+    let Some(value) = request_json(bytes) else {
+        return false;
+    };
+    if value
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return true;
+    }
+    input_items(&value)
+        .last()
+        .is_some_and(is_tool_output_item)
+}
+
+fn request_json(bytes: &[u8]) -> Option<Value> {
+    if let Ok(value) = serde_json::from_slice(bytes) {
+        return Some(value);
+    }
+    decode_request_json_bytes(bytes).and_then(|plain| serde_json::from_slice(&plain).ok())
+}
+
+fn decode_request_json_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xB5 && bytes[2] == 0x2F && bytes[3] == 0xFD {
+        if let Ok(plain) = zstd::decode_all(std::io::Cursor::new(bytes)) {
+            return Some(plain);
+        }
+    }
+    if bytes.len() >= 2 && bytes[0] == 0x1F && bytes[1] == 0x8B {
+        if let Some(plain) = decompress_named(bytes, "gzip") {
+            return Some(plain);
+        }
+    }
+    decompress_named(bytes, "deflate").or_else(|| decompress_named(bytes, "raw_deflate"))
+}
+
+fn input_items(value: &Value) -> &[Value] {
+    value
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn is_tool_output_item(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some(
+            "function_call_output"
+            | "custom_tool_call_output"
+            | "computer_call_output"
+            | "local_shell_call_output"
+            | "shell_call_output"
+            | "mcp_tool_call_output"
+            | "tool_result",
+        ) => true,
+        _ => item.get("role").and_then(Value::as_str) == Some("tool"),
+    }
+}
+
 pub fn apply_http_header(headers: &mut HeaderMap, token: &str) {
+    let Some(token) = injectable_http_token(token) else {
+        return;
+    };
     if let (Ok(name), Ok(value)) = (
         HeaderName::from_bytes(HEADER_NAME.as_bytes()),
-        HeaderValue::from_str(token),
+        HeaderValue::from_str(&token),
     ) {
         headers.insert(name, value);
     }
+}
+
+/// 只允许把可解析、非降级的 Fernet 票据写入请求头，避免补一个上游会拒的假值。
+pub fn injectable_http_token(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() || is_degraded_token(token) {
+        return None;
+    }
+    TurnState::from_token(token, "").map(|state| state.token)
 }
 
 pub fn clear_http_header(headers: &mut HeaderMap) {
@@ -982,6 +1157,167 @@ pub fn extract_model_from_body(bytes: &[u8]) -> Option<String> {
         return Some(model);
     }
     None
+}
+
+/// 将 JSON 请求体中的 `model` 改成指定值。压缩体按原编码写回。
+pub fn rewrite_model_in_body(
+    bytes: &[u8],
+    encoding: Option<&str>,
+    model: &str,
+) -> Result<Vec<u8>, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+    if extract_model_from_json(bytes).as_deref() == Some(model) {
+        return Ok(bytes.to_vec());
+    }
+    match detect_body_compression(bytes, encoding) {
+        None => rewrite_json_model(bytes, model),
+        Some("zstd") => {
+            let plain = zstd::decode_all(std::io::Cursor::new(bytes))
+                .map_err(|_| "无法解压 zstd 请求体，不能强制绑定模型".to_string())?;
+            if extract_model_from_json(&plain).as_deref() == Some(model) {
+                return Ok(bytes.to_vec());
+            }
+            let rewritten = rewrite_json_model(&plain, model)?;
+            zstd::encode_all(rewritten.as_slice(), 0)
+                .map_err(|_| "无法重新压缩 zstd 请求体".to_string())
+        }
+        Some("gzip") => {
+            let plain = decompress_named(bytes, "gzip")
+                .ok_or_else(|| "无法解压 gzip 请求体，不能强制绑定模型".to_string())?;
+            if extract_model_from_json(&plain).as_deref() == Some(model) {
+                return Ok(bytes.to_vec());
+            }
+            compress_gzip(&rewrite_json_model(&plain, model)?)
+        }
+        Some("deflate") => {
+            let plain = decompress_named(bytes, "deflate")
+                .or_else(|| decompress_named(bytes, "raw_deflate"))
+                .ok_or_else(|| "无法解压 deflate 请求体，不能强制绑定模型".to_string())?;
+            if extract_model_from_json(&plain).as_deref() == Some(model) {
+                return Ok(bytes.to_vec());
+            }
+            compress_deflate(&rewrite_json_model(&plain, model)?)
+        }
+        Some(_) => Err("不支持的请求体压缩，不能强制绑定模型".into()),
+    }
+}
+
+/// 把下游请求包装成带 State 的同轮续跑：只写 client_metadata 里的票据。
+/// Codex HTTP `/responses` 不接受 `previous_response_id`，转发前会去掉该字段。
+pub fn wrap_as_second_packet(
+    bytes: &[u8],
+    encoding: Option<&str>,
+    token: &str,
+) -> Result<Vec<u8>, String> {
+    let Some(token) = injectable_http_token(token).or_else(|| {
+        let token = token.trim();
+        (!token.is_empty()).then(|| token.to_string())
+    }) else {
+        return Ok(bytes.to_vec());
+    };
+    match detect_body_compression(bytes, encoding) {
+        None => wrap_json_as_second_packet(bytes, &token),
+        Some("zstd") => {
+            let plain = zstd::decode_all(std::io::Cursor::new(bytes))
+                .map_err(|_| "无法解压 zstd 请求体，不能包装为同轮第二包".to_string())?;
+            let rewritten = wrap_json_as_second_packet(&plain, &token)?;
+            zstd::encode_all(rewritten.as_slice(), 0)
+                .map_err(|_| "无法重新压缩 zstd 请求体".to_string())
+        }
+        Some("gzip") => {
+            let plain = decompress_named(bytes, "gzip")
+                .ok_or_else(|| "无法解压 gzip 请求体，不能包装为同轮第二包".to_string())?;
+            compress_gzip(&wrap_json_as_second_packet(&plain, &token)?)
+        }
+        Some("deflate") => {
+            let plain = decompress_named(bytes, "deflate")
+                .or_else(|| decompress_named(bytes, "raw_deflate"))
+                .ok_or_else(|| "无法解压 deflate 请求体，不能包装为同轮第二包".to_string())?;
+            compress_deflate(&wrap_json_as_second_packet(&plain, &token)?)
+        }
+        Some(_) => Err("不支持的请求体压缩，不能包装为同轮第二包".into()),
+    }
+}
+
+fn wrap_json_as_second_packet(bytes: &[u8], token: &str) -> Result<Vec<u8>, String> {
+    let mut value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| "请求体不是 JSON，不能包装为同轮第二包".to_string())?;
+    let Some(object) = value.as_object_mut() else {
+        return Err("请求体不是 JSON 对象，不能包装为同轮第二包".into());
+    };
+    object.remove("previous_response_id");
+    let metadata = object
+        .entry("client_metadata")
+        .or_insert_with(|| json!({}));
+    if let Some(metadata) = metadata.as_object_mut() {
+        metadata.insert(HEADER_NAME.to_string(), json!(token));
+    }
+    serde_json::to_vec(&value).map_err(|_| "无法序列化包装后的请求体".to_string())
+}
+
+fn detect_body_compression(bytes: &[u8], encoding: Option<&str>) -> Option<&'static str> {
+    let encoding = encoding.unwrap_or("").to_ascii_lowercase();
+    if encoding.contains("zstd")
+        || (bytes.len() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xB5 && bytes[2] == 0x2F && bytes[3] == 0xFD)
+    {
+        return Some("zstd");
+    }
+    if encoding.contains("gzip") || (bytes.len() >= 2 && bytes[0] == 0x1F && bytes[1] == 0x8B) {
+        return Some("gzip");
+    }
+    if encoding.contains("deflate") {
+        return Some("deflate");
+    }
+    None
+}
+
+fn rewrite_json_model(bytes: &[u8], model: &str) -> Result<Vec<u8>, String> {
+    let mut value: Value =
+        serde_json::from_slice(bytes).map_err(|_| "请求体不是 JSON，不能强制绑定模型".to_string())?;
+    let Some(object) = value.as_object_mut() else {
+        return Err("请求体不是 JSON 对象，不能强制绑定模型".into());
+    };
+    object.insert("model".into(), Value::String(model.to_string()));
+    serde_json::to_vec(&value).map_err(|_| "无法序列化改写后的请求体".to_string())
+}
+
+fn decompress_named(bytes: &[u8], method: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut decompressed = Vec::new();
+    let ok = match method {
+        "gzip" => flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut decompressed)
+            .is_ok(),
+        "deflate" => flate2::read::ZlibDecoder::new(bytes)
+            .read_to_end(&mut decompressed)
+            .is_ok(),
+        "raw_deflate" => flate2::read::DeflateDecoder::new(bytes)
+            .read_to_end(&mut decompressed)
+            .is_ok(),
+        _ => false,
+    };
+    (ok && !decompressed.is_empty()).then_some(decompressed)
+}
+
+fn compress_gzip(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(bytes)
+        .and_then(|_| encoder.finish())
+        .map_err(|_| "无法重新压缩 gzip 请求体".to_string())
+}
+
+fn compress_deflate(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(bytes)
+        .and_then(|_| encoder.finish())
+        .map_err(|_| "无法重新压缩 deflate 请求体".to_string())
 }
 
 fn extract_model_from_json(bytes: &[u8]) -> Option<String> {
@@ -1211,6 +1547,8 @@ mod tests {
         store.pool.insert("bad-cache".into(), vec![TurnState {
             token: "gAAAAA".to_string() + &"!".repeat(286),
             len: QUALITY_TOKEN_LEN, issued_unix: now_unix(), source: "fetch".into(), captured_at: String::new(),
+            proxy_session: String::new(),
+            previous_response_id: String::new(),
         }]);
         assert!(store.peek_for_model("consumer").is_none());
         assert!(store.needs_refresh("consumer"));
@@ -1564,6 +1902,68 @@ mod tests {
         assert_eq!(header_token(&headers).as_deref(), Some(token.as_str()));
         assert!(should_stamp_http("POST", "/backend-api/codex/responses"));
         assert!(!should_stamp_http("GET", "/responses"));
+        assert!(injectable_http_token(&token).is_some());
+        assert!(injectable_http_token("client-state").is_none());
+        assert!(injectable_http_token(&token_for_len(now_unix(), DEGRADED_TOKEN_LEN)).is_none());
+        apply_http_header(&mut headers, "not-a-ticket");
+        assert_eq!(header_token(&headers).as_deref(), Some(token.as_str()));
+    }
+
+    #[test]
+    fn same_turn_follow_up_uses_previous_response_or_trailing_tool_output() {
+        assert!(!is_same_turn_follow_up(br#"{"model":"gpt-6-astra"}"#));
+        assert!(!is_same_turn_follow_up(
+            br#"{"model":"gpt-6-astra","input":[{"role":"user","content":"hi"}]}"#
+        ));
+        assert!(!is_same_turn_follow_up(br#"{"model":"gpt-6-astra","input":[
+            {"type":"function_call_output","call_id":"c1","output":"old"},
+            {"role":"user","content":"next turn"}
+        ]}"#));
+        assert!(is_same_turn_follow_up(
+            br#"{"model":"gpt-6-astra","previous_response_id":"resp_1"}"#
+        ));
+        assert!(is_same_turn_follow_up(br#"{"model":"gpt-6-astra","input":[
+            {"role":"user","content":"hi"},
+            {"type":"function_call_output","call_id":"c1","output":"ok"}
+        ]}"#));
+        assert!(has_body_turn_state(
+            br#"{"client_metadata":{"x-codex-turn-state":"gAAAAAexample"}}"#
+        ));
+        assert!(!has_body_turn_state(br#"{"client_metadata":{}}"#));
+    }
+
+    #[test]
+    fn wrap_second_packet_stamps_metadata_and_strips_previous_response_id() {
+        let token = token_for(now_unix());
+        let wrapped = wrap_as_second_packet(
+            br#"{"model":"gpt-6-astra","input":[{"role":"user","content":"hi"}]}"#,
+            None,
+            &token,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&wrapped).unwrap();
+        assert!(value.get("previous_response_id").is_none());
+        assert_eq!(
+            value
+                .pointer(&format!("/client_metadata/{HEADER_NAME}"))
+                .and_then(Value::as_str),
+            Some(token.as_str())
+        );
+
+        let stripped = wrap_as_second_packet(
+            br#"{"model":"gpt-6-astra","previous_response_id":"resp_client"}"#,
+            None,
+            &token,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&stripped).unwrap();
+        assert!(value.get("previous_response_id").is_none());
+        assert_eq!(
+            value
+                .pointer(&format!("/client_metadata/{HEADER_NAME}"))
+                .and_then(Value::as_str),
+            Some(token.as_str())
+        );
     }
 
     #[test]
@@ -1575,6 +1975,48 @@ mod tests {
         );
         assert!(extract_model_from_body(b"not-json").is_none());
         assert!(extract_model_from_body(b"{}").is_none());
+    }
+
+    #[test]
+    fn rewrite_model_inserts_and_replaces_json() {
+        let replaced = rewrite_model_in_body(
+            br#"{"model":"gpt-5.4","stream":true}"#,
+            None,
+            "gpt-6-astra",
+        )
+        .unwrap();
+        assert_eq!(
+            extract_model_from_body(&replaced).as_deref(),
+            Some("gpt-6-astra")
+        );
+        let inserted = rewrite_model_in_body(br#"{"stream":true}"#, None, "gpt-6-astra").unwrap();
+        assert_eq!(
+            extract_model_from_body(&inserted).as_deref(),
+            Some("gpt-6-astra")
+        );
+        assert!(rewrite_model_in_body(b"not-json", None, "gpt-6-astra").is_err());
+    }
+
+    #[test]
+    fn rewrite_model_round_trips_gzip_and_zstd() {
+        let json = br#"{"model":"other","input":[]}"#;
+        let gzip = {
+            use std::io::Write;
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(json).unwrap();
+            encoder.finish().unwrap()
+        };
+        let rewritten = rewrite_model_in_body(&gzip, Some("gzip"), "gpt-6-astra").unwrap();
+        assert_eq!(
+            extract_model_from_body(&rewritten).as_deref(),
+            Some("gpt-6-astra")
+        );
+        let zstd = zstd::encode_all(&json[..], 0).unwrap();
+        let rewritten = rewrite_model_in_body(&zstd, Some("zstd"), "gpt-6-astra").unwrap();
+        assert_eq!(
+            extract_model_from_body(&rewritten).as_deref(),
+            Some("gpt-6-astra")
+        );
     }
 
     #[test]
@@ -1602,6 +2044,58 @@ mod tests {
         assert_eq!(restored.version, PERSIST_VERSION);
         assert_eq!(restored.tokens.len(), 1);
         assert_eq!(restored.active_models.len(), 2);
+    }
+
+    #[test]
+    fn capture_binds_and_restores_proxy_session() {
+        let mut store = TurnStateStore::default();
+        let token = token_for(now_unix() - 10);
+        assert!(store.capture_with_session("m1", &token, "fetch", Some("1Z5jzVPs"), Some("resp_probe")));
+        assert_eq!(
+            store.previous_response_id_for_token(Some(&token)).as_deref(),
+            Some("resp_probe")
+        );
+        assert_eq!(store.bound_proxy_session().as_deref(), Some("1Z5jzVPs"));
+        assert_eq!(
+            store.proxy_session_for_token(Some(&token)).as_deref(),
+            Some("1Z5jzVPs")
+        );
+        assert_eq!(store.view().bound_proxy_session.as_deref(), Some("1Z5jzVPs"));
+
+        let persisted = serde_json::to_string(&PersistedStore {
+            version: PERSIST_VERSION,
+            tokens: store.tokens.clone(),
+            active_models: store.active_models.clone(),
+            bound_token_len: store.bound_token_len,
+            auto_quality_len: store.auto_quality_len,
+            model_bound_lens: store.model_bound_lens.clone(),
+            pool: store.pool.clone(),
+            distributions: store.distributions.clone(),
+            account_id: store.account_id.clone(),
+        })
+        .unwrap();
+        let restored: PersistedStore = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(
+            restored.tokens.get("m1").map(|ts| ts.proxy_session.as_str()),
+            Some("1Z5jzVPs")
+        );
+        assert_eq!(
+            restored
+                .tokens
+                .get("m1")
+                .map(|ts| ts.previous_response_id.as_str()),
+            Some("resp_probe")
+        );
+        let legacy: TurnState = serde_json::from_value(serde_json::json!({
+            "token": token,
+            "issued_unix": now_unix() - 10,
+            "len": token.len(),
+            "source": "fetch",
+            "captured_at": ""
+        }))
+        .unwrap();
+        assert!(legacy.proxy_session.is_empty());
+        assert!(legacy.previous_response_id.is_empty());
     }
 
     #[test]

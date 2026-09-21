@@ -23,7 +23,10 @@ use crate::logs::{self, LogEntry, NetworkLogDetails, StreamLifecycle};
 #[cfg(test)]
 use crate::logs::ObservedStream;
 use crate::traffic::{AccountTraffic, RequestActivity, TrafficTracker};
-use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch, StateMissPolicy, TokenReusePolicy};
+use crate::settings::{
+    save_settings, NetworkRoutePolicy, OutboundMode, Settings, SettingsPatch, StateMissPolicy,
+    TokenReusePolicy,
+};
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
 use crate::warp::{WarpRuntime, WarpStatus};
 
@@ -119,8 +122,14 @@ fn model_for_reuse_round<'a>(store: &TurnStateStore, models: &'a [String], round
     Some(candidates[(round.saturating_sub(1) as usize) % candidates.len()])
 }
 
-fn capture_fetched_ticket(store: &mut TurnStateStore, model: &str, token: &str) -> bool {
-    if !store.capture(model, token, "fetch") {
+fn capture_fetched_ticket(
+    store: &mut TurnStateStore,
+    model: &str,
+    token: &str,
+    proxy_session: Option<&str>,
+    previous_response_id: Option<&str>,
+) -> bool {
+    if !store.capture_with_session(model, token, "fetch", proxy_session, previous_response_id) {
         return false;
     }
     token.trim().len() == store.bound_len_for(model)
@@ -175,6 +184,8 @@ pub struct Status {
     pub current_account_email: Option<String>,
     pub state_miss_policy: StateMissPolicy,
     pub token_reuse_policy: TokenReusePolicy,
+    pub network_route_policy: NetworkRoutePolicy,
+    pub forced_model: String,
     pub configured_models: Vec<String>,
 }
 
@@ -233,7 +244,7 @@ impl App {
     }
 
     pub fn with_warp(settings: Settings, warp: WarpRuntime) -> Result<Self> {
-        let http = upstream_http_client(&settings.upstream_proxy)?;
+        let http = business_http_client(&resolved_business_proxy(&settings, &warp), None)?;
         let mut turn_state = TurnStateStore::load();
         turn_state.set_reuse_policy(settings.token_reuse_policy);
         Ok(Self {
@@ -396,6 +407,8 @@ impl App {
             current_account_email: login_status.email,
             state_miss_policy: settings.state_miss_policy,
             token_reuse_policy: settings.token_reuse_policy,
+            network_route_policy: settings.network_route_policy,
+            forced_model: settings.forced_model,
             configured_models: settings.models,
         }
     }
@@ -408,9 +421,17 @@ impl App {
             models = self.turn_state.lock().await.all_active_models();
         }
         if models.is_empty() {
-            let model = fetch::preferred_model(Path::new(&settings.codex_home));
+            let model = settings
+                .forced_model()
+                .map(str::to_string)
+                .unwrap_or_else(|| fetch::preferred_model(Path::new(&settings.codex_home)));
             self.turn_state.lock().await.register_model(&model);
             models.push(model);
+        } else if let Some(model) = settings.forced_model() {
+            if !models.iter().any(|item| item == model) {
+                self.turn_state.lock().await.register_model(model);
+                models.insert(0, model.to_string());
+            }
         }
         let mut errors = Vec::new();
         let mut shared_refreshed = false;
@@ -488,6 +509,14 @@ impl App {
             anyhow::bail!("尚未配置出站代理");
         }
         Ok(effective)
+    }
+
+    async fn refresh_business_http(&self) -> Result<()> {
+        let settings = self.settings.lock().await.clone();
+        let proxy = resolved_business_proxy(&settings, &self.warp);
+        let session = self.turn_state.lock().await.bound_proxy_session();
+        *self.http.lock().await = business_http_client(&proxy, session.as_deref())?;
+        Ok(())
     }
 
     async fn wait_for_fetch_slot(&self, generation: u64) -> bool {
@@ -676,7 +705,10 @@ impl App {
                     }
                 }
             }
-            let client = match fetch::http_client(&settings.outbound_proxy) {
+            let (probe_proxy, probe_session) = fetch::resolve_probe_proxy(&settings.outbound_proxy);
+            let mut fetch_settings = settings.clone();
+            fetch_settings.outbound_proxy = probe_proxy;
+            let client = match fetch::http_client(&fetch_settings.outbound_proxy) {
                 Ok(client) => client,
                 Err(err) => {
                     let message = format!("{err:#}");
@@ -690,7 +722,7 @@ impl App {
             let mut details = NetworkLogDetails::default();
             let result = fetch::fetch_turn_state_with_log(
                 &client,
-                &settings,
+                &fetch_settings,
                 &creds,
                 model,
                 target_len,
@@ -698,6 +730,7 @@ impl App {
                 &mut details,
             )
             .await;
+            details.proxy_session = probe_session.clone();
 
             if !fetch_account_is_current(&settings, &creds.account_id) {
                 details.turn_state_action = "discarded_stale_account".into();
@@ -705,7 +738,8 @@ impl App {
                 return Err(FetchOnceError::new(format!("[{model}] 登录账号已变化，丢弃旧账号票据结果"), FetchRetryClass::Stale));
             }
             match result {
-                Ok(token) => {
+                Ok(fetched) => {
+                    let token = fetched.token;
                     if self.fetch_generation.load(Ordering::SeqCst) != generation {
                         details.turn_state_action = "discarded_stale_config".into();
                         self.record_fetch(started, details).await;
@@ -726,7 +760,13 @@ impl App {
                                     count: 1,
                                 }],
                             );
-                            Some(capture_fetched_ticket(&mut store, model, &token))
+                            Some(capture_fetched_ticket(
+                                &mut store,
+                                model,
+                                &token,
+                                probe_session.as_deref(),
+                                fetched.previous_response_id.as_deref(),
+                            ))
                         }
                     };
                     let Some(ready) = ready else {
@@ -750,6 +790,9 @@ impl App {
                     }
                     details.turn_state_action = "captured".into();
                     self.record_fetch(started, details).await;
+                    if let Err(err) = self.refresh_business_http().await {
+                        eprintln!("[{model}] 绑定出口 session 后刷新业务代理失败: {err:#}");
+                    }
                     self.clear_model_fetch_delay(model).await;
                     *self.fetch_error.lock().await = None;
                     *self.fetch_ok_at.lock().await = Some(
@@ -816,6 +859,11 @@ impl App {
             for model in &settings.models {
                 if !model.is_empty() && store.register_model(model) {
                     eprintln!("[seed] 从设置注册种子模型: {}", model);
+                }
+            }
+            if let Some(model) = settings.forced_model() {
+                if store.register_model(model) {
+                    eprintln!("[seed] 从强制绑定注册模型: {}", model);
                 }
             }
         }
@@ -1112,8 +1160,9 @@ impl ProxyHandle {
             self.settings_change.lock().await
         };
         let old = self.app.settings.lock().await.clone();
-        let next_http = if old.upstream_proxy != next.upstream_proxy {
-            Some(upstream_http_client(&next.upstream_proxy)?)
+        let next_business = resolved_business_proxy(&next, &self.app.warp);
+        let next_http = if resolved_business_proxy(&old, &self.app.warp) != next_business {
+            Some(business_http_client(&next_business, None)?)
         } else {
             None
         };
@@ -1187,6 +1236,12 @@ impl ProxyHandle {
         } else if fetch_changed {
             self.start_fetch_loop().await;
         }
+        if old.forced_model != next.forced_model {
+            if let Some(model) = next.forced_model() {
+                self.app.turn_state.lock().await.register_model(model);
+            }
+            self.app.model_notify.notify_one();
+        }
         self.app.warp_wake.notify_one();
         Ok(self.managed_status().await)
     }
@@ -1238,6 +1293,7 @@ impl ProxyHandle {
         drop(fetch_transition);
         self.start_fetch_loop().await;
         result?;
+        self.app.refresh_business_http().await?;
         Ok(self.app.status().await)
     }
 
@@ -1249,6 +1305,7 @@ impl ProxyHandle {
         self.stop_fetch_loop().await;
         let fetch_change = self.app.fetch_gate.lock().await;
         self.app.warp.stop().await;
+        let _ = self.app.refresh_business_http().await;
         self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
         self.app.reset_fetch_schedule().await;
         self.app.fetch_change_notify.notify_waiters();
@@ -1541,6 +1598,40 @@ impl Drop for ResponseLogTracker {
     }
 }
 
+fn resolved_business_proxy(settings: &Settings, warp: &WarpRuntime) -> String {
+    if !settings.same_network() {
+        return settings.upstream_proxy.clone();
+    }
+    if settings.outbound_mode == OutboundMode::Warp {
+        warp.proxy_url().unwrap_or_default()
+    } else {
+        settings.outbound_proxy.clone()
+    }
+}
+
+fn business_network_details(settings: &Settings, upstream: &str, proxy: &str) -> NetworkLogDetails {
+    let mut details = logs::network_details(upstream, proxy);
+    if settings.same_network() && !proxy.trim().is_empty() {
+        details.route_kind = if settings.outbound_mode == OutboundMode::Warp {
+            logs::ROUTE_EMBEDDED_WARP.into()
+        } else {
+            logs::ROUTE_MANUAL_PROXY.into()
+        };
+    }
+    details
+}
+
+fn business_http_client(template: &str, session: Option<&str>) -> Result<reqwest::Client> {
+    let proxy = match fetch::apply_bound_session(template, session) {
+        Ok(proxy) => proxy,
+        Err(_) if fetch::has_session_placeholder(template) => {
+            fetch::replace_session_placeholder(template, "unbound0")
+        }
+        Err(err) => return Err(err),
+    };
+    upstream_http_client(&proxy)
+}
+
 fn upstream_http_client(proxy: &str) -> Result<reqwest::Client> {
     let proxy = crate::settings::normalize_proxy(proxy, "上游转发代理")?;
     let mut builder = reqwest::Client::builder()
@@ -1611,7 +1702,9 @@ async fn wait_for_request_state(
         }
         if current.codex_home != request_settings.codex_home || current.upstream != request_settings.upstream
             || current.upstream_proxy != request_settings.upstream_proxy || current.outbound_proxy != request_settings.outbound_proxy
-            || current.outbound_mode != request_settings.outbound_mode || current.warp_http2 != request_settings.warp_http2 {
+            || current.outbound_mode != request_settings.outbound_mode || current.warp_http2 != request_settings.warp_http2
+            || current.network_route_policy != request_settings.network_route_policy
+            || current.forced_model != request_settings.forced_model {
             return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_config_changed", "等待期间线路配置已变化，请重新发起请求；请求未转发"));
         }
         if !login::chatgpt_credentials(Path::new(&request_settings.codex_home)).is_ok_and(|creds| creds.account_id == account) {
@@ -1646,26 +1739,38 @@ async fn forward_http_tracked(
     activity: &mut Option<RequestActivity>,
     started: Instant,
 ) -> Result<Response> {
-    let (upstream, home, upstream_proxy, http, state_miss_policy, request_settings) = {
+    let (upstream, home, upstream_proxy, cached_http, state_miss_policy, request_settings) = {
         let settings = app.settings.lock().await;
+        let business_proxy = resolved_business_proxy(&settings, &app.warp);
         (
             settings.upstream.clone(),
             settings.codex_home.clone(),
-            settings.upstream_proxy.clone(),
+            business_proxy,
             app.http.lock().await.clone(),
             settings.state_miss_policy,
             settings.clone(),
         )
     };
     let effective_proxy = fetch::outbound_proxy_for_client(&upstream_proxy);
-    *details = logs::network_details(&upstream, &effective_proxy);
+    *details = business_network_details(&request_settings, &upstream, &effective_proxy);
+    if request_settings.same_network()
+        && request_settings.outbound_mode == OutboundMode::Warp
+        && upstream_proxy.trim().is_empty()
+    {
+        anyhow::bail!(
+            "{}",
+            app.warp.proxy_url().err().map(|err| err.to_string()).unwrap_or_else(|| {
+                "内置 WARP 正在自动连接，请稍候。".into()
+            })
+        );
+    }
     details.state_policy = Some(state_miss_policy);
     let (mut parts, body) = req.into_parts();
     let target = join_upstream(&upstream, &parts.uri)?;
     let path = parts.uri.path();
 
-    // 先读取 body，以便从中提取 model 字段
-    let bytes = axum::body::to_bytes(body, 32 * 1024 * 1024)
+    // 先读取 body，以便从中提取或改写 model 字段
+    let mut bytes = axum::body::to_bytes(body, 32 * 1024 * 1024)
         .await
         .context("read body")?;
     details.body_bytes = bytes.len();
@@ -1674,8 +1779,17 @@ async fn forward_http_tracked(
     let content_encoding = parts
         .headers
         .get("content-encoding")
-        .and_then(|v| v.to_str().ok());
-    details.content_encoding = logs::safe_content_encoding(content_encoding);
+        .and_then(|v| v.to_str().ok())
+        .map(|value| value.to_string());
+    details.content_encoding = logs::safe_content_encoding(content_encoding.as_deref());
+    if should_stamp {
+        if let Some(forced) = request_settings.forced_model() {
+            bytes = turn_state::rewrite_model_in_body(&bytes, content_encoding.as_deref(), forced)
+                .map_err(|err| anyhow::anyhow!("{err}"))?
+                .into();
+            details.body_bytes = bytes.len();
+        }
+    }
     details.transport = if parts
         .headers
         .get(header::ACCEPT)
@@ -1759,7 +1873,8 @@ async fn forward_http_tracked(
             }
         }
 
-        let client_already_has = turn_state::has_http_turn_state(&parts.headers);
+        let client_already_has = turn_state::has_http_turn_state(&parts.headers)
+            || turn_state::has_body_turn_state(&bytes);
         if state_miss_policy == StateMissPolicy::StripAll {
             parts.headers.remove(turn_state::HEADER_NAME);
             details.turn_state_action = "removed_all_policy".into();
@@ -1767,62 +1882,92 @@ async fn forward_http_tracked(
             details.turn_state_action = if client_already_has { "preserved_by_policy" } else { "initial_request" }.into();
             details.turn_state_len = parts.headers.get(turn_state::HEADER_NAME)
                 .and_then(|value| value.to_str().ok()).map(str::trim).filter(|value| !value.is_empty()).map(str::len);
-        } else if client_already_has {
-            // Match the immutable outgoing credential snapshot, not the latest UI account.
+        } else {
+            // 探针当作每轮第一包。下游请求一律带上规范票据，并包装成同轮第二包。
             let mut token = {
                 let store = app.turn_state.lock().await;
                 if request_account_matches && effective_account.as_deref().is_some_and(|id| store.is_bound_to_account(id)) {
-                    request_model.as_deref().and_then(|model| store.peek_for_model(model))
+                    request_model
+                        .as_deref()
+                        .and_then(|model| store.peek_for_model(model))
+                        .and_then(|value| turn_state::injectable_http_token(&value))
                 } else {
                     None
                 }
             };
             let waited = token.is_none() && state_miss_policy == StateMissPolicy::Wait;
             if waited {
-                token = Some(wait_for_request_state(app, &request_settings, effective_account.as_deref(), request_model.as_deref(), details).await?);
+                token = turn_state::injectable_http_token(
+                    &wait_for_request_state(
+                        app,
+                        &request_settings,
+                        effective_account.as_deref(),
+                        request_model.as_deref(),
+                        details,
+                    )
+                    .await?,
+                );
             }
             if let Some(token) = token {
                 turn_state::apply_http_header(&mut parts.headers, &token);
-                details.turn_state_action = if waited { "replaced_after_wait" } else { "replaced" }.into();
+                match turn_state::wrap_as_second_packet(&bytes, content_encoding.as_deref(), &token)
+                {
+                    Ok(wrapped) => {
+                        bytes = wrapped.into();
+                        details.body_bytes = bytes.len();
+                    }
+                    Err(err) => {
+                        eprintln!("[stamp] 包装同轮第二包失败，仅写入请求头: {err}");
+                    }
+                }
+                details.turn_state_action = match (client_already_has, waited) {
+                    (true, true) => "replaced_after_wait".into(),
+                    (true, false) => "replaced".into(),
+                    (false, true) => "injected_after_wait".into(),
+                    (false, false) => "injected".into(),
+                };
                 details.turn_state_len = Some(token.len());
                 eprintln!(
-                    "[stamp] 替换 turn_state → token len={} model={:?} 到 {} {}",
+                    "[stamp] {} turn_state → token len={} model={:?} 到 {} {}",
+                    if client_already_has { "替换" } else { "补上" },
                     token.len(),
                     request_model,
                     parts.method,
                     path
                 );
                 injected_token = Some(token);
-            } else if state_miss_policy == StateMissPolicy::Strip {
-                parts.headers.remove(turn_state::HEADER_NAME);
-                details.turn_state_action = "removed_by_policy".into();
-            } else if account_changed {
-                parts.headers.remove(turn_state::HEADER_NAME);
-                details.turn_state_action = "removed_account_mismatch".into();
+            } else if client_already_has {
+                if state_miss_policy == StateMissPolicy::Strip {
+                    parts.headers.remove(turn_state::HEADER_NAME);
+                    details.turn_state_action = "removed_by_policy".into();
+                } else if account_changed {
+                    parts.headers.remove(turn_state::HEADER_NAME);
+                    details.turn_state_action = "removed_account_mismatch".into();
+                } else {
+                    details.turn_state_action = match (&request_model, request_account_matches) {
+                        (None, _) => "preserved_unknown_model".into(),
+                        (Some(_), false) => "preserved_account_mismatch".into(),
+                        (Some(_), true) => "preserved_no_ticket".into(),
+                    };
+                    details.turn_state_len = parts
+                        .headers
+                        .get(turn_state::HEADER_NAME)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::len);
+                    eprintln!(
+                        "[stamp] 无可用 token（model={:?}），保留客户端原值 {} {}",
+                        request_model, parts.method, path
+                    );
+                }
             } else {
-                details.turn_state_action = match (&request_model, request_account_matches) {
-                    (None, _) => "preserved_unknown_model".into(),
-                    (Some(_), false) => "preserved_account_mismatch".into(),
-                    (Some(_), true) => "preserved_no_ticket".into(),
-                };
-                details.turn_state_len = parts
-                    .headers
-                    .get(turn_state::HEADER_NAME)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::len);
+                details.turn_state_action = "initial_request".into();
                 eprintln!(
-                    "[stamp] 无可用 token（model={:?}），保留客户端原值 {} {}",
-                    request_model, parts.method, path
+                    "[stamp] 客户端未携带 State，且没有可注入的规范票据 {} {} model={:?}",
+                    parts.method, path, request_model
                 );
             }
-        } else {
-            details.turn_state_action = "initial_request".into();
-            eprintln!(
-                "[stamp] 客户端未携带 State，不主动注入 {} {} model={:?}",
-                parts.method, path, request_model
-            );
         }
     } else {
         details.turn_state_action = "not_applicable".into();
@@ -1831,6 +1976,18 @@ async fn forward_http_tracked(
             details.turn_state_action = "removed_all_policy".into();
         }
     }
+    let bound_session = {
+        let store = app.turn_state.lock().await;
+        store.proxy_session_for_token(injected_token.as_deref())
+    };
+    details.proxy_session = bound_session.clone();
+    let http = if fetch::has_session_placeholder(&upstream_proxy) {
+        let resolved = fetch::apply_bound_session(&upstream_proxy, bound_session.as_deref())?;
+        details.proxy_endpoint = Some(logs::endpoint_origin(&resolved));
+        business_http_client(&upstream_proxy, bound_session.as_deref())?
+    } else {
+        cached_http
+    };
     let mut builder = http
         .request(
             reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?,
@@ -2316,20 +2473,20 @@ mod tests {
         let mut store = TurnStateStore::default();
         store.set_model_bound_len("astra", Some(turn_state::QUALITY_TOKEN_LEN));
         let original_292 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
-        assert!(capture_fetched_ticket(&mut store, "astra", &original_292));
+        assert!(capture_fetched_ticket(&mut store, "astra", &original_292, None, None));
         let token_332 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN_332);
-        assert!(!capture_fetched_ticket(&mut store, "astra", &token_332));
+        assert!(!capture_fetched_ticket(&mut store, "astra", &token_332, None, None));
         assert_eq!(
             store.peek_for_model("astra").as_deref(),
             Some(original_292.as_str())
         );
 
         let token_292 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
-        assert!(capture_fetched_ticket(&mut store, "astra", &token_292));
+        assert!(capture_fetched_ticket(&mut store, "astra", &token_292, None, None));
         assert_eq!(store.peek_for_model("astra").as_deref(), Some(token_292.as_str()));
 
         let mut auto = TurnStateStore::default();
-        assert!(capture_fetched_ticket(&mut auto, "astra", &token_332));
+        assert!(capture_fetched_ticket(&mut auto, "astra", &token_332, None, None));
         assert_eq!(auto.bound_len_for("astra"), turn_state::QUALITY_TOKEN_LEN_332);
     }
 
@@ -2356,6 +2513,24 @@ mod tests {
         app.fetch_generation.fetch_add(2, Ordering::SeqCst);
         app.fetch_change_notify.notify_waiters();
         assert!(!waiter.await.unwrap());
+    }
+
+    #[test]
+    fn same_network_keeps_session_placeholder_until_bound() {
+        let settings = Settings {
+            outbound_proxy: "socks5://xmtt1126849-region-DE-sid-{session}-t-120:pass@us.arxlabs.io:3010".into(),
+            outbound_mode: OutboundMode::Manual,
+            network_route_policy: NetworkRoutePolicy::SameNetwork,
+            ..Settings::default()
+        };
+        let template = resolved_business_proxy(&settings, &WarpRuntime::default());
+        assert!(fetch::has_session_placeholder(&template));
+        assert!(fetch::apply_bound_session(&template, None).is_err());
+        assert!(fetch::apply_bound_session(&template, Some("1Z5jzVPs"))
+            .unwrap()
+            .contains("-sid-1Z5jzVPs-t-120"));
+        assert!(business_http_client(&template, None).is_ok());
+        assert!(business_http_client(&template, Some("1Z5jzVPs")).is_ok());
     }
 }
 

@@ -72,6 +72,8 @@ fn patch(settings: &Settings, policy: TokenReusePolicy) -> SettingsPatch {
         models: settings.models.clone(),
         state_miss_policy: settings.state_miss_policy,
         token_reuse_policy: policy,
+        network_route_policy: settings.network_route_policy,
+        forced_model: settings.forced_model.clone(),
     }
 }
 

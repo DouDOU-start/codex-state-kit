@@ -73,6 +73,8 @@ fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
         outbound_mode: settings.outbound_mode,
         warp_http2: settings.warp_http2,
         models: settings.models.clone(),
+        network_route_policy: settings.network_route_policy,
+        forced_model: settings.forced_model.clone(),
     }
 }
 
@@ -114,6 +116,7 @@ async fn upstream_proxy_hot_update_and_failures() {
             upstream: "http://upstream.invalid".into(),
             upstream_proxy: first.clone(),
             outbound_proxy: "http://127.0.0.1:9".into(),
+            network_route_policy: NetworkRoutePolicy::Separate,
             codex_home: crate::settings::home_dir().display().to_string(),
             ..Settings::default()
         };
@@ -339,6 +342,7 @@ async fn verify_response_metrics() {
             App::new(Settings {
                 upstream: format!("http://{}", listener.local_addr().unwrap()),
                 upstream_proxy: String::new(),
+                network_route_policy: NetworkRoutePolicy::Separate,
                 codex_home: crate::settings::home_dir().display().to_string(),
                 ..Settings::default()
             })
@@ -572,6 +576,7 @@ async fn json_error_response_is_not_reported_as_sse() {
         let app = App::new(Settings {
             upstream: "http://upstream.invalid".into(),
             upstream_proxy: proxy,
+            network_route_policy: NetworkRoutePolicy::Separate,
             codex_home: home.path().display().to_string(),
             ..Settings::default()
         })
@@ -598,6 +603,105 @@ async fn json_error_response_is_not_reported_as_sse() {
             b"{}"
         );
         task.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn same_network_sends_business_through_outbound_proxy() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let home = tempfile::tempdir().unwrap();
+        let (proxy, headers, task) =
+            fixed_response_proxy("200 OK", "application/json", b"{\"ok\":true}").await;
+        let app = App::new(Settings {
+            upstream: "http://upstream.invalid".into(),
+            outbound_proxy: proxy.clone(),
+            outbound_mode: OutboundMode::Manual,
+            upstream_proxy: "http://127.0.0.1:9".into(),
+            network_route_policy: NetworkRoutePolicy::SameNetwork,
+            codex_home: home.path().display().to_string(),
+            ..Settings::default()
+        })
+        .unwrap();
+        let mut details = NetworkLogDetails::default();
+        let response = forward_http_with_log(
+            &app,
+            Request::builder()
+                .uri("/responses")
+                .body(Body::empty())
+                .unwrap(),
+            &mut details,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert!(headers
+            .await
+            .unwrap()
+            .contains("http://upstream.invalid/responses"));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(details.route_kind, logs::ROUTE_MANUAL_PROXY);
+        assert_eq!(details.proxy_endpoint.as_deref(), Some(proxy.as_str()));
+        task.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn forced_model_rewrites_downstream_request() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let home = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (body_tx, body_rx) = oneshot::channel::<String>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let headers = read_headers(&mut socket).await;
+            let length = headers
+                .to_ascii_lowercase()
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).await.unwrap();
+            body_tx.send(String::from_utf8(body).unwrap()).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+        let app = App::new(Settings {
+            upstream: format!("http://{addr}"),
+            outbound_mode: OutboundMode::Manual,
+            network_route_policy: NetworkRoutePolicy::Separate,
+            forced_model: "gpt-6-astra".into(),
+            codex_home: home.path().display().to_string(),
+            ..Settings::default()
+        })
+        .unwrap();
+        let mut details = NetworkLogDetails::default();
+        let response = forward_http_with_log(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"gpt-5.4","stream":true}"#))
+                .unwrap(),
+            &mut details,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_rx.await.unwrap();
+        assert!(body.contains("\"model\":\"gpt-6-astra\""), "{body}");
+        assert!(!body.contains("gpt-5.4"), "{body}");
+        assert_eq!(details.model.as_deref(), Some("gpt-6-astra"));
+        server.await.unwrap();
     })
     .await
     .unwrap();

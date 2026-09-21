@@ -57,9 +57,11 @@ openai_base_url = "http://127.0.0.1:8787"
 | `upstream` | 上游地址，默认 `https://chatgpt.com/backend-api/codex` |
 | `codex_home` | Codex 配置目录的完整路径 |
 | `outbound_mode` | `warp` 或 `manual`，新配置默认 `warp` |
-| `outbound_proxy` | 手动代理 URL；切换模式时保留 |
-| `upstream_proxy` | 独立的上游业务转发代理，默认空；例如 `http://127.0.0.1:7897`，保存后对新请求生效 |
+| `outbound_proxy` | 手动代理 URL；切换模式时保留。可把出口写成 `{session}`，打票时自动轮换，拿到稳定 292 后绑定该 session 发业务 |
+| `network_route_policy` | `same_network`（默认，Token 获取与业务发送共用出站代理）或 `separate`（旧策略，业务走 `upstream_proxy`）；旧配置未填写该字段且已设置 `upstream_proxy` 时保持分路 |
+| `upstream_proxy` | 分路模式下的上游业务转发代理，默认空；例如 `http://127.0.0.1:7897`，保存后对新请求生效 |
 | `warp_http2` | 是否优先使用 TCP，默认 `false`；应用支持自动回退 |
 | `token_reuse_policy` | `shared_292`（默认，同账号跨模型复用精确 292 字节票据）或 `per_model`（旧策略，按模型独立）；旧配置未填写该字段时也使用新默认 |
+| `forced_model` | 强制绑定的上游模型 ID，例如 `gpt-6-astra`；填写后下游无论请求什么模型都会改成该值再转发，Token 也按该模型获取。留空保持下游原模型 |
 
 应用设置可能含代理密码，账号和 Token 文件也包含凭据；提交问题报告时不要附上这些文件的原文。

@@ -14,7 +14,25 @@ import {
   startChatgptLogin,
   openWarpTerms as openWarpTermsApi,
 } from "@/lib/api";
-import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy } from "@/types";
+import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy, NetworkRoutePolicy, SettingsPatch } from "@/types";
+
+function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): SettingsPatch {
+  return {
+    proxyListen: status.proxyListen,
+    upstream: status.upstream,
+    codexHome: status.codexHome,
+    outboundProxy: status.outboundProxy,
+    upstreamProxy: status.upstreamProxy,
+    outboundMode: status.outboundMode,
+    warpHttp2: status.warpHttp2,
+    stateMissPolicy: status.stateMissPolicy,
+    tokenReusePolicy: status.tokenReusePolicy,
+    networkRoutePolicy: status.networkRoutePolicy ?? "same_network",
+    forcedModel: status.forcedModel ?? "",
+    models: status.configuredModels,
+    ...overrides,
+  };
+}
 
 function errorMessage(cause: unknown): string {
   if (typeof cause === "string") return cause;
@@ -95,18 +113,7 @@ export function useCodexStateKit() {
 
   const persistSettings = useCallback(async (home: string, outboundProxy: string, current: Status, outboundMode = current.outboundMode, warpHttp2 = current.warpHttp2, upstreamProxy = current.upstreamProxy) => {
     if (home === current.codexHome && outboundProxy === current.outboundProxy && outboundMode === current.outboundMode && warpHttp2 === current.warpHttp2 && upstreamProxy === current.upstreamProxy) return current;
-    return setConfig({
-      proxyListen: current.proxyListen,
-      upstream: current.upstream,
-      codexHome: home,
-      outboundProxy,
-      upstreamProxy,
-      outboundMode,
-      warpHttp2,
-      stateMissPolicy: current.stateMissPolicy,
-      tokenReusePolicy: current.tokenReusePolicy,
-      models: current.configuredModels,
-    });
+    return setConfig(patchFrom(current, { codexHome: home, outboundProxy, upstreamProxy, outboundMode, warpHttp2 }));
   }, []);
 
   const saveSettings = useCallback(async (home: string, outboundProxy: string, outboundMode?: OutboundMode, warpHttp2?: boolean, upstreamProxy?: string) => {
@@ -140,13 +147,7 @@ export function useCodexStateKit() {
     setBusy("save");
     try {
       const latest = await getStatus();
-      const next = await setConfig({
-        proxyListen: latest.proxyListen, upstream: latest.upstream, codexHome: latest.codexHome,
-        outboundProxy: latest.outboundProxy, upstreamProxy: latest.upstreamProxy,
-        outboundMode: latest.outboundMode, warpHttp2: latest.warpHttp2, stateMissPolicy,
-        models: latest.configuredModels,
-        tokenReusePolicy: latest.tokenReusePolicy,
-      });
+      const next = await setConfig(patchFrom(latest, { stateMissPolicy }));
       setStatus(next);
       setBanner({ kind: "ok", text: "State 处理策略已保存。" });
     } catch (cause) {
@@ -160,16 +161,43 @@ export function useCodexStateKit() {
     setBusy("save");
     try {
       const latest = await getStatus();
-      const next = await setConfig({
-        proxyListen: latest.proxyListen, upstream: latest.upstream, codexHome: latest.codexHome,
-        outboundProxy: latest.outboundProxy, upstreamProxy: latest.upstreamProxy,
-        outboundMode: latest.outboundMode, warpHttp2: latest.warpHttp2,
-        stateMissPolicy: latest.stateMissPolicy, models: latest.configuredModels, tokenReusePolicy,
-      });
+      const next = await setConfig(patchFrom(latest, { tokenReusePolicy }));
       setStatus(next);
       setBanner({ kind: "ok", text: tokenReusePolicy === "shared_292"
         ? "已启用跨模型复用 292，同账号共享有效票据。"
         : "已恢复按模型独立，各模型分别获取和复用 Token。" });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const saveForcedModel = useCallback(async (forcedModel: string) => {
+    setBusy("save");
+    try {
+      const latest = await getStatus();
+      const next = await setConfig(patchFrom(latest, { forcedModel: forcedModel.trim() }));
+      setStatus(next);
+      setBanner({ kind: "ok", text: next.forcedModel
+        ? `已强制绑定模型 ${next.forcedModel}，下游请求都会改成这个 ID 再转发。`
+        : "已关闭强制绑定模型，按下游请求的模型 ID 转发。" });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const setNetworkRoutePolicy = useCallback(async (networkRoutePolicy: NetworkRoutePolicy) => {
+    setBusy("save");
+    try {
+      const latest = await getStatus();
+      const next = await setConfig(patchFrom(latest, { networkRoutePolicy }));
+      setStatus(next);
+      setBanner({ kind: "ok", text: networkRoutePolicy === "same_network"
+        ? "已启用同网策略：获取 292 与业务发送走同一条代理。"
+        : "已恢复分路：Token 走获取代理，业务走上游转发代理。" });
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
     } finally {
@@ -333,6 +361,8 @@ export function useCodexStateKit() {
     saveSettings,
     setStateMissPolicy,
     setTokenReusePolicy,
+    setNetworkRoutePolicy,
+    saveForcedModel,
     refreshToken,
     openWarpTerms,
     startLogin,

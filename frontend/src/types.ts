@@ -21,6 +21,7 @@ export interface LogEntry {
   finalOrigin?: string | null;
   routeKind: string;
   proxyEndpoint?: string | null;
+  proxySession?: string | null;
   peerAddr?: string | null;
   httpVersion?: string | null;
   model?: string | null;
@@ -75,10 +76,13 @@ export interface TurnStateView {
   models?: ModelTokenView[];
   boundTokenLen?: number;
   sharedSourceModel?: string | null;
+  boundProxySession?: string | null;
 }
 
 export interface Status {
   tokenReusePolicy: TokenReusePolicy;
+  networkRoutePolicy: NetworkRoutePolicy;
+  forcedModel: string;
   stateMissPolicy: StateMissPolicy;
   configuredModels: string[];
   currentAccountId?: string | null;
@@ -106,6 +110,8 @@ export interface Status {
 
 export interface SettingsPatch {
   tokenReusePolicy: TokenReusePolicy;
+  networkRoutePolicy: NetworkRoutePolicy;
+  forcedModel: string;
   models: string[];
   stateMissPolicy: StateMissPolicy;
   proxyListen: string;
@@ -118,6 +124,7 @@ export interface SettingsPatch {
 }
 
 export type TokenReusePolicy = "shared_292" | "per_model";
+export type NetworkRoutePolicy = "same_network" | "separate";
 export type OutboundMode = "manual" | "warp";
 export type StateMissPolicy = "preserve" | "wait" | "strip" | "passthrough" | "strip_all";
 
