@@ -4,7 +4,7 @@
 
 ## 环境
 
-发布流程会按目标平台下载对应的 WARP 内核：Windows x64、macOS Intel 和 macOS Apple Silicon 分别使用对应二进制文件，不跨平台复用。
+发布流程会按目标平台下载对应的 WARP 与 Mihomo 内核：Windows x64、macOS Intel 和 macOS Apple Silicon 分别使用对应二进制文件，不跨平台复用。
 
 准备 Node.js、Rust stable、C++ 构建工具和 WebView2 等 [Tauri 开发依赖](https://v2.tauri.app/start/prerequisites/)。pnpm 版本以根目录 `package.json` 的 `packageManager` 为准；以下命令使用 Corepack 调用。
 
@@ -79,7 +79,7 @@ target/release/bundle/nsis/
 target/release/bundle/msi/
 ```
 
-构建前自动重新生成图标与前端资源。优先分发安装包；单独分发主程序时必须附带 `warp/` 资源目录。WARP 内核更新步骤见[来源记录](../src-tauri/resources/warp/PROVENANCE.md)。
+构建前自动重新生成图标与前端资源。优先分发安装包；单独分发主程序时必须附带 `warp/` 与 `mihomo/` 资源目录。内核更新步骤见 [WARP 来源记录](../src-tauri/resources/warp/PROVENANCE.md) 与 [Mihomo 来源记录](../src-tauri/resources/mihomo/PROVENANCE.md)。
 
 ## 代码结构
 

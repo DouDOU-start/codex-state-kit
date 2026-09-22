@@ -79,6 +79,8 @@ fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
         token_fetch_paused: settings.token_fetch_paused,
         token_max_age_mins: settings.token_max_age_mins,
         token_prefetch_age_mins: settings.token_prefetch_age_mins,
+        mihomo_subscription: String::new(),
+        mihomo_node: String::new(),
     }
 }
 

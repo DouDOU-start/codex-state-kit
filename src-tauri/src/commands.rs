@@ -29,6 +29,15 @@ pub struct LoginPoll {
 }
 
 #[tauri::command(async)]
+pub async fn probe_outbound_latency(
+    state: State<'_, AppState>,
+    kind: String,
+    proxy: Option<String>,
+) -> CommandResult<codex_state_kit::latency::LatencyReport> {
+    command(state.proxy.probe_latency(&kind, proxy).await)
+}
+
+#[tauri::command(async)]
 pub async fn connect_warp(state: State<'_, AppState>, accept_terms: bool) -> CommandResult<Status> {
     command(state.proxy.connect_warp(accept_terms).await)
 }

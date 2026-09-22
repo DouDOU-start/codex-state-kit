@@ -31,6 +31,7 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 toml_edit = "0.22"
 base64 = "0.22"
+serde_yaml = "0.9"
 url = "2"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }

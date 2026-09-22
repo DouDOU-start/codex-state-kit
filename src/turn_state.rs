@@ -1031,6 +1031,12 @@ pub fn should_stamp_http(method: &str, path: &str) -> bool {
     method.eq_ignore_ascii_case("POST") && path.contains("/responses")
 }
 
+/// 上下文压缩请求保持原样转发，不包装成探测的第二包，也不替换 State。
+pub fn is_context_compaction(path: &str, bytes: &[u8]) -> bool {
+    path.contains("/responses/compact")
+        || request_json(bytes).is_some_and(|value| value.get("compaction_trigger").is_some())
+}
+
 pub fn header_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(HEADER_NAME)
@@ -1536,7 +1542,7 @@ mod tests {
         let mut store = shared_store();
         store.register_model("donor");
         store.register_model("consumer");
-        let token = token_for(now_unix() - 30);
+        let token = token_for(now_unix() - 20);
         assert!(store.capture("donor", &token, "fetch"));
         assert_eq!(store.peek_for_model("consumer").as_deref(), Some(token.as_str()));
         store.register_model("new-model");
@@ -1563,7 +1569,7 @@ mod tests {
     #[test]
     fn shared_292_uses_newest_donor_and_one_refresh_window() {
         let mut store = shared_store();
-        let older = token_for(now_unix() - 2160);
+        let older = token_for(now_unix() - 120);
         store.capture("a", &older, "fetch");
         assert!(store.needs_refresh("b"));
         assert_eq!(store.peek_for_model("b").as_deref(), Some(older.as_str()));
@@ -1882,7 +1888,7 @@ mod tests {
         let mut store = TurnStateStore::default();
         store.register_model("gpt-6-astra");
         store.register_model("o3-pro");
-        let token = token_for(now_unix() - 30);
+        let token = token_for(now_unix() - 10);
         store.capture("gpt-6-astra", &token, "fetch");
 
         let view = store.view();
@@ -1962,6 +1968,15 @@ mod tests {
         assert_eq!(header_token(&headers).as_deref(), Some(token.as_str()));
         assert!(should_stamp_http("POST", "/backend-api/codex/responses"));
         assert!(!should_stamp_http("GET", "/responses"));
+        assert!(is_context_compaction("/responses/compact", b"{}"));
+        assert!(is_context_compaction(
+            "/responses",
+            br#"{"model":"gpt-6-astra","compaction_trigger":"auto"}"#,
+        ));
+        assert!(!is_context_compaction(
+            "/responses",
+            br#"{"model":"gpt-6-astra"}"#,
+        ));
         assert!(injectable_http_token(&token).is_some());
         assert!(injectable_http_token("client-state").is_none());
         assert!(injectable_http_token(&token_for_len(now_unix(), DEGRADED_TOKEN_LEN)).is_none());

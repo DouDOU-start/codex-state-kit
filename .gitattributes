@@ -1,2 +1,3 @@
 # This signed fixture must retain identical bytes on Windows and Unix.
 tools/fixtures/updater-signing-test.txt -text
+*.sh text eol=lf

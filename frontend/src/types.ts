@@ -105,6 +105,9 @@ export interface Status {
   outboundMode: OutboundMode;
   warpHttp2: boolean;
   warp: WarpStatus;
+  mihomoSubscription: string;
+  mihomoNode: string;
+  mihomo: MihomoStatus;
   fetchError?: string | null;
   fetchOkAt?: string | null;
   turnState: TurnStateView;
@@ -130,12 +133,35 @@ export interface SettingsPatch {
   upstreamProxy: string;
   outboundMode: OutboundMode;
   warpHttp2: boolean;
+  mihomoSubscription: string;
+  mihomoNode: string;
 }
 
 export type TokenReusePolicy = "shared_292" | "per_model";
 export type NetworkRoutePolicy = "same_network" | "separate";
-export type OutboundMode = "manual" | "warp";
+export type OutboundMode = "manual" | "warp" | "mihomo";
+export type ProbeKind = "manual" | "warp" | "mihomo";
 export type StateMissPolicy = "preserve" | "wait" | "strip" | "passthrough" | "strip_all";
+
+export interface LatencySample {
+  name: string;
+  delayMs: number | null;
+  error: string | null;
+}
+
+export interface LatencyReport {
+  target: string;
+  samples: LatencySample[];
+}
+
+export interface MihomoStatus {
+  available: boolean;
+  phase: string;
+  proxyUrl: string | null;
+  selected: string | null;
+  nodes: string[];
+  error: string | null;
+}
 
 export interface WarpStatus {
   available: boolean;

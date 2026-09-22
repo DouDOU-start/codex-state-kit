@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import Check from "lucide-react/dist/esm/icons/check.js";
 import Copy from "lucide-react/dist/esm/icons/copy.js";
 import Network from "lucide-react/dist/esm/icons/network.js";
@@ -37,7 +37,16 @@ function effectiveProxyUrl(raw: string): string {
   return value.startsWith("socks5://") ? `socks5h://${value.slice("socks5://".length)}` : value;
 }
 
+function mihomoHop(status: Status): string {
+  const endpoint = status.mihomo?.proxyUrl ? safeNetworkUrl(status.mihomo.proxyUrl) : "订阅节点待连接";
+  const node = status.mihomo?.selected || status.mihomoNode || "未选择节点";
+  return `订阅节点 · ${node} · ${endpoint}`;
+}
+
 function ticketRoute(status: Status): string[] {
+  if (status.outboundMode === "mihomo") {
+    return ["State Kit", mihomoHop(status), safeNetworkUrl(status.upstream, true)];
+  }
   if (status.outboundMode === "warp") {
     const endpoint = status.warp.proxyUrl ? safeNetworkUrl(status.warp.proxyUrl) : "WARP 本地端点待连接";
     const exit = status.warp.exitIp
@@ -55,7 +64,7 @@ function ticketRoute(status: Status): string[] {
 function businessRoute(status: Status): string[] {
   const sameNetwork = (status.networkRoutePolicy ?? "same_network") === "same_network";
   const hop = sameNetwork
-    ? status.outboundMode === "warp"
+    ? status.outboundMode === "warp" || status.outboundMode === "mihomo"
       ? ticketRoute(status)[1]
       : status.outboundProxy
         ? `同网代理 · ${safeNetworkUrl(effectiveProxyUrl(status.outboundProxy))}${status.turnState?.boundProxySession ? ` · session ${status.turnState.boundProxySession}` : ""}`
@@ -333,27 +342,6 @@ function LogTable({ status, entries }: { status: Status; entries: LogEntry[] }) 
   );
 }
 
-function LogSection({
-  title,
-  count,
-  empty,
-  children,
-}: {
-  title: string;
-  count: number;
-  empty: string;
-  children: ReactNode;
-}) {
-  return (
-    <section className="network-log-section" aria-label={`${title}，${count} 条`}>
-      <header className="network-log-section__head">
-        <strong>{title}</strong>
-        <span>{count} 条</span>
-      </header>
-      {count ? children : <p className="network-log-section__empty">{empty}</p>}
-    </section>
-  );
-}
 
 function RouteLine({ icon, label, nodes }: { icon: "ticket" | "business"; label: string; nodes: string[] }) {
   const Icon = icon === "ticket" ? Shield : Network;
@@ -377,6 +365,7 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
   const closeRef = useRef<HTMLButtonElement>(null);
   const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
   const [accountFilter, setAccountFilter] = useState("");
+  const [logView, setLogView] = useState<"business" | "token">("business");
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -460,19 +449,25 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
               {accounts.map((id) => <option key={id} value={id}>{accountLabel(status, id)}</option>)}
             </select>
           </label>
-          <span>业务 {businessEntries.length} · Token 获取 {tokenEntries.length} / 共 {status.logs.length} 条 · 按请求发起时的账号记录</span>
+          <span>共 {status.logs.length} 条 · 按请求发起时的账号记录</span>
+        </div>
+
+        <div className="network-log-view" role="tablist" aria-label="日志类型">
+          <button type="button" role="tab" aria-selected={logView === "business"} onClick={() => setLogView("business")}>
+            业务请求<span>{businessEntries.length}</span>
+          </button>
+          <button type="button" role="tab" aria-selected={logView === "token"} onClick={() => setLogView("token")}>
+            Token 获取<span>{tokenEntries.length}</span>
+          </button>
         </div>
 
         <div className="network-log-table-wrap">
           {entries.length ? (
-            <>
-              <LogSection title="业务请求" count={businessEntries.length} empty="该账号暂无业务请求">
-                <LogTable status={status} entries={businessEntries} />
-              </LogSection>
-              <LogSection title="Token 获取" count={tokenEntries.length} empty="该账号暂无 Token 获取记录">
-                <LogTable status={status} entries={tokenEntries} />
-              </LogSection>
-            </>
+            logView === "business" ? (
+              businessEntries.length ? <LogTable status={status} entries={businessEntries} /> : <p className="network-log-section__empty">该账号暂无业务请求</p>
+            ) : (
+              tokenEntries.length ? <LogTable status={status} entries={tokenEntries} /> : <p className="network-log-section__empty">该账号暂无 Token 获取记录</p>
+            )
           ) : (
             <div className="network-log-dialog__empty">
               <Route size={24} strokeWidth={1.5} />

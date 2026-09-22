@@ -221,6 +221,7 @@ fn codex_user_agent() -> String {
     format!("{CODEX_ORIGINATOR}/{CODEX_IDENTITY_VERSION}{CODEX_USER_AGENT_SUFFIX}")
 }
 
+#[cfg(test)]
 pub(crate) async fn fetch_turn_state_with_log(
     client: &reqwest::Client,
     settings: &Settings,
@@ -261,6 +262,9 @@ pub(crate) async fn fetch_turn_state_with_cookies(
         settings.outbound_mode == OutboundMode::Warp,
         model,
     );
+    if settings.outbound_mode == OutboundMode::Mihomo {
+        details.route_kind = logs::ROUTE_EMBEDDED_MIHOMO.into();
+    }
     let probe = probe_body(model);
     details.account_id = Some(logs::safe_text(&creds.account_id, 128));
     details.account_email = creds.email.as_deref().map(|email| logs::safe_text(email, 254));
@@ -360,16 +364,102 @@ pub(crate) async fn fetch_turn_state_with_cookies(
         details.turn_state_action = "rejected_stale".into();
         bail!("上游返回的 {HEADER_NAME} 已超过 240 秒新鲜窗口");
     }
-    details.turn_state_action = "received".into();
     let mut jar = chatgpt_cookies::CookieJar::from_stored(request_cookies);
     jar.ingest_response_headers(response.headers(), chrono::Utc::now().timestamp());
     let routing_cookies = jar.stored();
-    let previous_response_id = read_probe_response_id(response).await;
+    let outcome = read_probe_outcome(response).await;
+    if !outcome.completed {
+        details.turn_state_action = "rejected_incomplete".into();
+        bail!("探测响应未完整结束");
+    }
+    if outcome.model.as_deref() != Some(model) {
+        details.turn_state_action = "rejected_model".into();
+        bail!("探测返回的模型与请求模型不一致");
+    }
+    details.turn_state_action = "received".into();
     Ok(FetchedTicket {
         token,
-        previous_response_id,
+        previous_response_id: outcome.previous_response_id,
         routing_cookies,
     })
+}
+
+pub(crate) async fn validate_carried_ticket(
+    client: &reqwest::Client,
+    settings: &Settings,
+    creds: &ChatGptCredentials,
+    model: &str,
+    carried_state: &str,
+    request_cookies: &[RoutingCookie],
+    details: &mut NetworkLogDetails,
+) -> Result<()> {
+    let url = responses_url(&settings.upstream);
+    let effective_proxy = outbound_proxy_for_client(&settings.outbound_proxy);
+    *details = logs::token_network_details(
+        &settings.upstream,
+        &effective_proxy,
+        settings.outbound_mode == OutboundMode::Warp,
+        model,
+    );
+    if settings.outbound_mode == OutboundMode::Mihomo {
+        details.route_kind = logs::ROUTE_EMBEDDED_MIHOMO.into();
+    }
+    let probe = probe_body(model);
+    details.account_id = Some(logs::safe_text(&creds.account_id, 128));
+    details.account_email = creds.email.as_deref().map(|email| logs::safe_text(email, 254));
+    let request_started = Instant::now();
+    let mut request = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", creds.access_token))
+        .header("ChatGPT-Account-ID", &creds.account_id)
+        .header(HEADER_NAME, carried_state)
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
+        .header("OpenAI-Beta", "responses=experimental")
+        .header("Connection", "close")
+        .header("session_id", Uuid::new_v4().to_string())
+        .header("originator", CODEX_ORIGINATOR)
+        .header("version", CODEX_IDENTITY_VERSION)
+        .header("User-Agent", codex_user_agent())
+        .json(&probe);
+    if let Some(cookie) = chatgpt_cookies::request_header(
+        request_cookies,
+        chatgpt_cookies::is_chatgpt_https_url(&url),
+    ) {
+        request = request.header(http::header::COOKIE, cookie);
+    }
+    let response = request.send().await.with_context(|| {
+        proxy_auth_hint(&settings.outbound_proxy)
+            .unwrap_or_else(|| "业务出口复验连不上".into())
+    })?;
+    details.response_header_ms = Some(request_started.elapsed().as_millis());
+    details.response_status = Some(response.status().as_u16());
+    if response.status() != reqwest::StatusCode::OK {
+        details.turn_state_action = "rejected_reverify".into();
+        bail!("业务出口拒绝复验请求 ({})", response.status());
+    }
+    let returned = response
+        .headers()
+        .get(HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if returned.as_deref().is_some_and(turn_state::is_degraded_token) {
+        details.turn_state_action = "rejected_degraded".into();
+        bail!("业务出口复验返回降级 turn-state");
+    }
+    let outcome = read_probe_outcome(response).await;
+    if !outcome.completed {
+        details.turn_state_action = "rejected_incomplete".into();
+        bail!("业务出口复验响应未完整结束");
+    }
+    if outcome.model.as_deref() != Some(model) {
+        details.turn_state_action = "rejected_model".into();
+        bail!("业务出口复验返回的模型与请求模型不一致");
+    }
+    details.turn_state_action = "reverified".into();
+    Ok(())
 }
 
 fn is_response_id(id: &str) -> bool {
@@ -401,6 +491,7 @@ fn response_id_from_value(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 pub(crate) fn parse_probe_response_id(body: &str) -> Option<String> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(id) = response_id_from_value(&value) {
@@ -423,21 +514,88 @@ pub(crate) fn parse_probe_response_id(body: &str) -> Option<String> {
     None
 }
 
-async fn read_probe_response_id(response: reqwest::Response) -> Option<String> {
+struct ProbeOutcome {
+    previous_response_id: Option<String>,
+    completed: bool,
+    model: Option<String>,
+}
+
+fn consider_probe_event(outcome: &mut ProbeOutcome, value: &serde_json::Value) {
+    if outcome.previous_response_id.is_none() {
+        outcome.previous_response_id = response_id_from_value(value);
+    }
+    let event_type = value.get("type").and_then(serde_json::Value::as_str);
+    let terminal = matches!(
+        event_type,
+        Some(
+            "response.completed"
+                | "response.done"
+                | "response.failed"
+                | "response.incomplete"
+                | "response.cancelled"
+                | "response.canceled"
+        )
+    );
+    if outcome.model.is_none() || terminal {
+        if let Some(model) = [value.pointer("/response/model"), value.get("model")]
+            .into_iter()
+            .flatten()
+            .find_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            outcome.model = Some(model.to_string());
+        }
+    }
+    if event_type == Some("response.completed") {
+        outcome.completed = true;
+    }
+}
+
+fn inspect_probe_body(body: &str) -> ProbeOutcome {
+    let mut outcome = ProbeOutcome {
+        previous_response_id: None,
+        completed: false,
+        model: None,
+    };
+    for block in body.split("\n\n") {
+        for line in block.lines() {
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                consider_probe_event(&mut outcome, &value);
+            }
+        }
+    }
+    if outcome.completed || outcome.previous_response_id.is_some() || outcome.model.is_some() {
+        return outcome;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+        consider_probe_event(&mut outcome, &value);
+    }
+    outcome
+}
+
+async fn read_probe_outcome(response: reqwest::Response) -> ProbeOutcome {
     use futures_util::StreamExt;
     let mut buf = String::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.ok()?;
+        let Ok(chunk) = chunk else {
+            break;
+        };
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(id) = parse_probe_response_id(&buf) {
-            return Some(id);
-        }
         if buf.len() > PROBE_RESPONSE_ID_LIMIT {
+            buf.truncate(PROBE_RESPONSE_ID_LIMIT);
             break;
         }
     }
-    parse_probe_response_id(&buf)
+    inspect_probe_body(&buf)
 }
 
 #[cfg(test)]
@@ -491,7 +649,10 @@ mod tests {
             .requests
             .lock()
             .expect("capture request")
-            .push(CapturedRequest { headers, body });
+            .push(CapturedRequest {
+                headers,
+                body: body.clone(),
+            });
         let mut headers = HeaderMap::new();
         if let Some(token) = &state.token {
             headers.insert(HEADER_NAME, HeaderValue::from_str(token).unwrap());
@@ -505,7 +666,20 @@ mod tests {
         if let Some(body) = &state.body {
             return (state.status, headers, body.clone()).into_response();
         }
-        (state.status, headers, Json(json!({ "ok": true }))).into_response()
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let payload = serde_json::json!({
+            "type": "response.completed",
+            "response": { "model": model }
+        });
+        (
+            state.status,
+            headers,
+            format!("data: {payload}\n\n"),
+        )
+            .into_response()
     }
 
     async fn serve(
@@ -923,7 +1097,10 @@ mod tests {
         let (upstream, _) = serve_with_body(
             StatusCode::OK,
             Some(expected.clone()),
-            Some("event: response.created\ndata: {\"response\":{\"id\":\"resp_probe\"}}\n\n".into()),
+            Some(
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_probe\",\"model\":\"gpt-6-astra\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_probe\",\"model\":\"gpt-6-astra\"}}\n\n"
+                    .into(),
+            ),
         )
         .await;
         let settings = Settings {
@@ -944,6 +1121,89 @@ mod tests {
         .unwrap();
         assert_eq!(fetched.token, expected);
         assert_eq!(fetched.previous_response_id.as_deref(), Some("resp_probe"));
+    }
+
+    #[tokio::test]
+    async fn rejects_incomplete_or_mismatched_probe_model() {
+        let expected = token_for_len(turn_state::QUALITY_TOKEN_LEN);
+        let cases = [
+            (
+                "data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-6-astra\"}}\n\n",
+                "rejected_incomplete",
+            ),
+            (
+                "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"other-model\"}}\n\n",
+                "rejected_model",
+            ),
+        ];
+        for (body, action) in cases {
+            let (upstream, _) = serve_with_body(
+                StatusCode::OK,
+                Some(expected.clone()),
+                Some(body.into()),
+            )
+            .await;
+            let settings = Settings {
+                upstream,
+                ..Settings::default()
+            };
+            let mut details = NetworkLogDetails::default();
+            fetch_turn_state_with_log(
+                &http_client("").unwrap(),
+                &settings,
+                &creds(),
+                "gpt-6-astra",
+                turn_state::QUALITY_TOKEN_LEN,
+                false,
+                &mut details,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(details.turn_state_action, action);
+        }
+    }
+
+    #[tokio::test]
+    async fn reverify_keeps_carried_ticket_and_rejects_312() {
+        let carried = token_for_len(turn_state::QUALITY_TOKEN_LEN);
+        let (upstream, _) = serve(StatusCode::OK, Some(carried.clone())).await;
+        let settings = Settings {
+            upstream,
+            ..Settings::default()
+        };
+        let mut details = NetworkLogDetails::default();
+        validate_carried_ticket(
+            &http_client("").unwrap(),
+            &settings,
+            &creds(),
+            "gpt-6-astra",
+            &carried,
+            &[],
+            &mut details,
+        )
+        .await
+        .unwrap();
+        assert_eq!(details.turn_state_action, "reverified");
+
+        let degraded = token_for_len(turn_state::DEGRADED_TOKEN_LEN);
+        let (upstream, _) = serve(StatusCode::OK, Some(degraded)).await;
+        let settings = Settings {
+            upstream,
+            ..Settings::default()
+        };
+        let mut details = NetworkLogDetails::default();
+        validate_carried_ticket(
+            &http_client("").unwrap(),
+            &settings,
+            &creds(),
+            "gpt-6-astra",
+            &carried,
+            &[],
+            &mut details,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(details.turn_state_action, "rejected_degraded");
     }
 
     #[tokio::test]

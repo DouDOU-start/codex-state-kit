@@ -38,7 +38,8 @@
       }
     },
     "resources": {
-      "resources/warp/": "warp/"
+      "resources/warp/": "warp/",
+      "resources/mihomo/": "mihomo/"
     },
     "icon": [
       "icons/32x32.png",

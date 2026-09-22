@@ -40,6 +40,13 @@ fn write_login(home: &Path) {
     }).to_string()).unwrap();
 }
 
+fn completed_probe_body(body: &Value) -> Body {
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    Body::from(format!(
+        "data: {{\"type\":\"response.completed\",\"response\":{{\"model\":\"{model}\"}}}}\n\n"
+    ))
+}
+
 fn ticket(age: i64) -> String {
     let mut bytes = vec![7; 219];
     bytes[0] = 0x80;
@@ -78,6 +85,8 @@ fn patch(settings: &Settings, policy: TokenReusePolicy) -> SettingsPatch {
         token_fetch_paused: settings.token_fetch_paused,
         token_max_age_mins: settings.token_max_age_mins,
         token_prefetch_age_mins: settings.token_prefetch_age_mins,
+        mihomo_subscription: String::new(),
+        mihomo_node: String::new(),
     }
 }
 
@@ -109,7 +118,7 @@ async fn one_shared_probe_serves_all_models_until_prefetch() {
                         probes.fetch_add(1, Ordering::Relaxed);
                         Response::builder()
                             .header(turn_state::HEADER_NAME, token)
-                            .body(Body::empty())
+                            .body(completed_probe_body(&body))
                             .unwrap()
                     }
                 }
@@ -213,7 +222,7 @@ async fn manual_refresh_bypasses_pause_and_cooldown() {
                         probes.fetch_add(1, Ordering::Relaxed);
                         Response::builder()
                             .header(turn_state::HEADER_NAME, token)
-                            .body(Body::empty())
+                            .body(completed_probe_body(&body))
                             .unwrap()
                     }
                 }
@@ -298,7 +307,7 @@ async fn pinned_donor_is_the_only_model_that_fetches_shared_292() {
                             .push(body["model"].as_str().unwrap_or("").to_string());
                         Response::builder()
                             .header(turn_state::HEADER_NAME, token)
-                            .body(Body::empty())
+                            .body(completed_probe_body(&body))
                             .unwrap()
                     }
                 }
@@ -446,9 +455,9 @@ async fn policy_hot_switch_preserves_source_cache_and_survives_restart() {
 }
 
 #[tokio::test]
-async fn degraded_business_response_keeps_current_shared_ticket() {
+async fn degraded_business_response_invalidates_current_shared_ticket() {
     if !isolated_child(
-        "proxy::token_reuse_tests::degraded_business_response_keeps_current_shared_ticket",
+        "proxy::token_reuse_tests::degraded_business_response_invalidates_current_shared_ticket",
     ) {
         return;
     }
@@ -461,12 +470,37 @@ async fn degraded_business_response_keeps_current_shared_ticket() {
     .unwrap();
     let fresh = ticket(0);
     app.turn_state.lock().await.capture("a", &fresh, "fetch");
-    app.note_degraded_business_response("a");
+    app.observe_business_response("a", Some(&fresh), true, None, false)
+        .await;
+    assert!(app.turn_state.lock().await.peek_for_model("a").is_none());
+    assert!(app.turn_state.lock().await.needs_refresh("a"));
+    assert!(app.degraded.load(Ordering::Relaxed));
+
+    let echoed = ticket(40);
+    app.turn_state.lock().await.capture("a", &echoed, "fetch");
+    app.degraded.store(false, Ordering::Relaxed);
+    app.observe_business_response("a", Some(&echoed), false, Some("a"), true)
+        .await;
     assert_eq!(
         app.turn_state.lock().await.peek_for_model("a").as_deref(),
-        Some(fresh.as_str())
+        Some(echoed.as_str())
     );
-    assert!(!app.turn_state.lock().await.needs_refresh("a"));
+    assert!(app.turn_state.lock().await.needs_refresh("a"));
+    assert!(!app.degraded.load(Ordering::Relaxed));
+
+    let newer = ticket(1);
+    app.turn_state.lock().await.capture("a", &newer, "fetch");
+    app.observe_business_response("a", Some(&echoed), true, None, false)
+        .await;
+    assert_eq!(
+        app.turn_state.lock().await.peek_for_model("a").as_deref(),
+        Some(newer.as_str())
+    );
+
+    app.observe_business_response("a", Some(&newer), false, Some("other-model"), true)
+        .await;
+    assert!(app.turn_state.lock().await.peek_for_model("a").is_none());
+    assert!(app.turn_state.lock().await.needs_refresh("a"));
 }
 
 #[tokio::test]
@@ -546,7 +580,7 @@ async fn miss_streak_doubles_probe_concurrency_then_resets() {
         let fresh = ticket(0);
         let reply_token = fresh.clone();
         let router =
-            axum::Router::new().fallback(move |_headers: HeaderMap, Json(_body): Json<Value>| {
+            axum::Router::new().fallback(move |_headers: HeaderMap, Json(body): Json<Value>| {
                 let probes = probes_seen.clone();
                 let token = reply_token.clone();
                 async move {
@@ -558,7 +592,7 @@ async fn miss_streak_doubles_probe_concurrency_then_resets() {
                     };
                     Response::builder()
                         .header(turn_state::HEADER_NAME, value)
-                        .body(Body::empty())
+                        .body(completed_probe_body(&body))
                         .unwrap()
                 }
             });

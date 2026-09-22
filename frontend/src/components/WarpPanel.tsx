@@ -2,7 +2,7 @@ import Cloud from "lucide-react/dist/esm/icons/cloud.js";
 import { isTauri } from "@/lib/api";
 import type { WarpStatus } from "@/types";
 
-export function WarpPanel({ status, onTerms }: { status: WarpStatus; onTerms: () => void }) {
+export function WarpPanel({ status, probing, delayText, onProbe, onTerms }: { status: WarpStatus; probing: boolean; delayText: string | null; onProbe: () => void; onTerms: () => void }) {
   const ready = status.phase === "connected";
   const failed = status.phase === "error" || status.phase === "reconnecting";
   const label = !isTauri ? "预览" : ready ? "已就绪" : failed ? "重试中" : "连接中";
@@ -15,6 +15,12 @@ export function WarpPanel({ status, onTerms }: { status: WarpStatus; onTerms: ()
         <span className={`runtime-chip ${ready ? "" : "runtime-chip--idle"}`} role="status"><i />{label}</span>
       </div>
       {isTauri && status.error && !ready ? <p className="warp-error">{status.error}</p> : null}
+      <div className="latency-row">
+        <button type="button" className="token-fetch-toggle" disabled={probing || (isTauri && !ready)} onClick={onProbe}>
+          {probing ? "测试中" : "测延迟"}
+        </button>
+        {delayText ? <span className={delayText.endsWith("ms") ? "latency-row__ok" : "latency-row__bad"}>{delayText}</span> : null}
+      </div>
       <button className="text-button warp-terms" type="button" onClick={onTerms}>Cloudflare 服务条款 ↗</button>
     </div>
   );

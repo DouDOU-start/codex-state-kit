@@ -6,8 +6,10 @@ import type {
   LoginMethod,
   LoginStart,
   LoginStatus,
+  ProbeKind,
   SettingsPatch,
   Status,
+  LatencyReport,
 } from "@/types";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
@@ -57,6 +59,16 @@ const defaultStatus = (): Status => ({
     proxyUrl: null,
     exitIp: null,
     country: null,
+    error: null,
+  },
+  mihomoSubscription: "",
+  mihomoNode: "",
+  mihomo: {
+    available: false,
+    phase: "stopped",
+    proxyUrl: null,
+    selected: null,
+    nodes: [],
     error: null,
   },
   fetchError: null,
@@ -197,6 +209,7 @@ function cloneStatus(): Status {
   return {
     ...mockStatus,
     warp: { ...mockStatus.warp },
+    mihomo: { ...mockStatus.mihomo, nodes: [...mockStatus.mihomo.nodes] },
     accountTraffic: { ...mockStatus.accountTraffic },
     turnState: { ...mockStatus.turnState },
     logs: mockStatus.logs.map((entry) => ({ ...entry })),
@@ -211,7 +224,7 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
   if (isTauri) {
     return invoke<Status>("set_config", { settings });
   }
-  const tokenRouteChanged = settings.outboundMode !== mockStatus.outboundMode || settings.warpHttp2 !== mockStatus.warpHttp2 || settings.outboundProxy !== mockStatus.outboundProxy || settings.codexHome !== mockStatus.codexHome || settings.upstream !== mockStatus.upstream;
+  const tokenRouteChanged = settings.outboundMode !== mockStatus.outboundMode || settings.warpHttp2 !== mockStatus.warpHttp2 || settings.outboundProxy !== mockStatus.outboundProxy || settings.codexHome !== mockStatus.codexHome || settings.upstream !== mockStatus.upstream || settings.mihomoSubscription !== mockStatus.mihomoSubscription || settings.mihomoNode !== mockStatus.mihomoNode;
   if (tokenRouteChanged && (settings.outboundMode === "manual" || settings.warpHttp2 !== mockStatus.warpHttp2)) {
     await stopWarp();
   }
@@ -227,6 +240,18 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
     upstreamProxy: settings.upstreamProxy,
     outboundMode: settings.outboundMode,
     warpHttp2: settings.warpHttp2,
+    mihomoSubscription: settings.mihomoSubscription,
+    mihomoNode: settings.mihomoNode,
+    mihomo: settings.outboundMode === "mihomo"
+      ? {
+          available: true,
+          phase: "connected",
+          proxyUrl: "http://127.0.0.1:52190",
+          selected: settings.mihomoNode || "node-a",
+          nodes: settings.mihomoNode ? [settings.mihomoNode] : ["node-a", "node-b"],
+          error: null,
+        }
+      : { ...mockStatus.mihomo, phase: "stopped", proxyUrl: null, error: null },
     stateMissPolicy: settings.stateMissPolicy,
     tokenReusePolicy: settings.tokenReusePolicy,
     stateFetchModel: settings.stateFetchModel,
@@ -261,7 +286,11 @@ export async function refreshTurnState(): Promise<Status> {
   if (isTauri) {
     return invoke<Status>("refresh_turn_state");
   }
-  const ready = mockStatus.outboundMode === "warp" ? mockStatus.warp.phase === "connected" : Boolean(mockStatus.outboundProxy);
+  const ready = mockStatus.outboundMode === "warp"
+    ? mockStatus.warp.phase === "connected"
+    : mockStatus.outboundMode === "mihomo"
+      ? mockStatus.mihomo.phase === "connected"
+      : Boolean(mockStatus.outboundProxy);
   mockStatus = {
     ...mockStatus,
     fetchError: ready ? null : "出站代理尚未就绪",
@@ -291,6 +320,25 @@ export async function setModelBoundTokenLen(model: string, len: number | null): 
     return invoke<Status>("set_model_bound_token_len", { model, len });
   }
   return cloneStatus();
+}
+
+export async function probeOutboundLatency(kind: ProbeKind, proxy?: string): Promise<LatencyReport> {
+  if (isTauri) return invoke<LatencyReport>("probe_outbound_latency", { kind, proxy: proxy ?? null });
+  await new Promise((resolve) => window.setTimeout(resolve, 500));
+  const target = "https://chatgpt.com/backend-api/codex";
+  if (kind === "mihomo") {
+    const names = mockStatus.mihomo.nodes.length ? mockStatus.mihomo.nodes : ["node-a", "node-b"];
+    return {
+      target,
+      samples: names.map((name, index) => ({
+        name,
+        delayMs: index === names.length - 1 && names.length > 1 ? null : 120 + index * 80,
+        error: index === names.length - 1 && names.length > 1 ? "超时" : null,
+      })),
+    };
+  }
+  if (kind === "manual" && !proxy?.trim() && !mockStatus.outboundProxy.trim()) throw new Error("请先填写代理地址");
+  return { target, samples: [{ name: kind, delayMs: kind === "warp" ? 240 : 128, error: null }] };
 }
 
 export async function connectWarp(acceptTerms: boolean): Promise<Status> {

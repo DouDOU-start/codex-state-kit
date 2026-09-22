@@ -13,8 +13,9 @@ import {
   openUrl,
   startChatgptLogin,
   openWarpTerms as openWarpTermsApi,
+  probeOutboundLatency,
 } from "@/lib/api";
-import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy, NetworkRoutePolicy, SettingsPatch } from "@/types";
+import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy, NetworkRoutePolicy, SettingsPatch, ProbeKind, LatencyReport } from "@/types";
 
 function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): SettingsPatch {
   return {
@@ -25,6 +26,8 @@ function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): Sett
     upstreamProxy: status.upstreamProxy,
     outboundMode: status.outboundMode,
     warpHttp2: status.warpHttp2,
+    mihomoSubscription: status.mihomoSubscription ?? "",
+    mihomoNode: status.mihomoNode ?? "",
     stateMissPolicy: status.stateMissPolicy,
     tokenReusePolicy: status.tokenReusePolicy,
     stateFetchModel: status.stateFetchModel ?? "",
@@ -54,6 +57,8 @@ export function useCodexStateKit() {
   const [banner, setBanner] = useState<Banner | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<"login" | "save" | "refresh" | "warp" | null>(null);
+  const [probing, setProbing] = useState<ProbeKind | null>(null);
+  const [latency, setLatency] = useState<Partial<Record<ProbeKind, LatencyReport>>>({});
   const request = useRef<Promise<void> | null>(null);
   const pollTimer = useRef<number | null>(null);
   const loginRequest = useRef(0);
@@ -120,6 +125,24 @@ export function useCodexStateKit() {
     return setConfig(patchFrom(current, { codexHome: home, outboundProxy, upstreamProxy, outboundMode, warpHttp2 }));
   }, []);
 
+  const saveMihomo = useCallback(async (subscription: string, node: string) => {
+    setBusy("save");
+    try {
+      const latest = await getStatus();
+      const next = await setConfig(patchFrom(latest, {
+        outboundMode: "mihomo",
+        mihomoSubscription: subscription.trim(),
+        mihomoNode: node.trim(),
+      }));
+      setStatus(next);
+      setBanner(null);
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
   const saveSettings = useCallback(async (home: string, outboundProxy: string, outboundMode?: OutboundMode, warpHttp2?: boolean, upstreamProxy?: string) => {
     setBusy("save");
     try {
@@ -145,6 +168,18 @@ export function useCodexStateKit() {
   const openWarpTerms = useCallback(async () => {
     try { await openWarpTermsApi(); }
     catch (cause) { setBanner({ kind: "error", text: errorMessage(cause) }); }
+  }, []);
+
+  const probeLatency = useCallback(async (kind: ProbeKind, proxy?: string) => {
+    setProbing(kind);
+    try {
+      const report = await probeOutboundLatency(kind, proxy);
+      setLatency((current) => ({ ...current, [kind]: report }));
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setProbing(null);
+    }
   }, []);
 
   const setStateMissPolicy = useCallback(async (stateMissPolicy: StateMissPolicy) => {
@@ -393,6 +428,7 @@ export function useCodexStateKit() {
     busy,
     refresh,
     saveSettings,
+    saveMihomo,
     setStateMissPolicy,
     setTokenReusePolicy,
     saveStateFetchModel,
@@ -401,6 +437,9 @@ export function useCodexStateKit() {
     saveForcedModel,
     refetchTurnState,
     openWarpTerms,
+    probing,
+    latency,
+    probeLatency,
     startLogin,
     importRefreshLogin,
     importAccessLogin,

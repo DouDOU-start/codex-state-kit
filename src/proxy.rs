@@ -31,6 +31,7 @@ use crate::settings::{
     TokenReusePolicy,
 };
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
+use crate::mihomo::{MihomoRuntime, MihomoStatus};
 use crate::warp::{WarpRuntime, WarpStatus};
 
 const TOKEN_FETCH_PAUSED_MESSAGE: &str = "已暂停获取 Token";
@@ -268,6 +269,9 @@ pub struct Status {
     pub outbound_mode: OutboundMode,
     pub warp_http2: bool,
     pub warp: WarpStatus,
+    pub mihomo_subscription: String,
+    pub mihomo_node: String,
+    pub mihomo: MihomoStatus,
     pub fetch_error: Option<String>,
     pub fetch_ok_at: Option<String>,
     pub turn_state: TurnStateView,
@@ -291,6 +295,7 @@ pub struct Status {
 
 pub struct App {
     pub warp: WarpRuntime,
+    pub mihomo: MihomoRuntime,
     pub settings: Mutex<Settings>,
     pub logs: Mutex<VecDeque<LogEntry>>,
     traffic: TrafficTracker,
@@ -347,12 +352,21 @@ impl App {
     }
 
     pub fn with_warp(settings: Settings, warp: WarpRuntime) -> Result<Self> {
-        let http = business_http_client(&resolved_business_proxy(&settings, &warp), None)?;
+        Self::with_sidecars(settings, warp, MihomoRuntime::default())
+    }
+
+    pub fn with_sidecars(
+        settings: Settings,
+        warp: WarpRuntime,
+        mihomo: MihomoRuntime,
+    ) -> Result<Self> {
+        let http = business_http_client(&resolved_business_proxy(&settings, &warp, &mihomo), None)?;
         let mut turn_state = TurnStateStore::load();
         turn_state.set_reuse_policy(settings.token_reuse_policy);
         turn_state.set_lifetime(turn_state::MAX_AGE_SECS, turn_state::PREFETCH_AGE_SECS);
         Ok(Self {
             warp,
+            mihomo,
             settings: Mutex::new(settings),
             logs: Mutex::new(VecDeque::with_capacity(80)),
             traffic: TrafficTracker::default(),
@@ -493,11 +507,44 @@ impl App {
         let _ = self.sync_request_identity(Path::new(&home)).await;
     }
 
-    /// 业务回 312 只表示这张响应不合格，不覆盖、不清除池里仍在 240 秒窗口内的凭据包。
-    fn note_degraded_business_response(&self, model: &str) {
+    /// 业务响应只作观测。292 且模型一致时不续票；312 或完整响应模型不符时，
+    /// 仅作废这次注入、且仍在池里的那张票。后到的旧响应不能删掉更新的票。
+    async fn observe_business_response(
+        &self,
+        model: &str,
+        injected_token: Option<&str>,
+        returned_is_degraded: bool,
+        upstream_model: Option<&str>,
+        completed: bool,
+    ) {
+        let model_mismatch = completed
+            && upstream_model.is_some_and(|actual| !actual.is_empty() && actual != model);
+        if !returned_is_degraded && !model_mismatch {
+            return;
+        }
+        let Some(injected_token) = injected_token.map(str::trim).filter(|token| !token.is_empty()) else {
+            return;
+        };
+        let cleared = {
+            let mut store = self.turn_state.lock().await;
+            if store.peek_for_model(model).as_deref() != Some(injected_token) {
+                false
+            } else {
+                store.invalidate_model(model);
+                true
+            }
+        };
+        if !cleared {
+            return;
+        }
         debug_log(&format!(
-            "[degraded] [{model}] 业务响应返回 312，保留当前凭据包"
+            "[degraded] [{model}] 业务响应不合格，作废当前凭据包并等待重采"
         ));
+        self.degraded.store(true, Ordering::Relaxed);
+        *self.degraded_at.lock().await = Some(
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        self.degrade_notify.notify_one();
     }
 
     pub async fn status(&self) -> Status {
@@ -530,6 +577,9 @@ impl App {
             outbound_mode: settings.outbound_mode,
             warp_http2: settings.warp_http2,
             warp: self.warp.status(),
+            mihomo_subscription: settings.mihomo_subscription.clone(),
+            mihomo_node: settings.mihomo_node.clone(),
+            mihomo: self.mihomo.status(),
             fetch_error: self.fetch_error.lock().await.clone(),
             fetch_ok_at: self.fetch_ok_at.lock().await.clone(),
             turn_state: self.turn_state.lock().await.view(),
@@ -668,8 +718,10 @@ impl App {
 
     fn fetch_settings(&self, settings: &Settings) -> Result<Settings> {
         let mut effective = settings.clone();
-        if effective.outbound_mode == OutboundMode::Warp {
-            effective.outbound_proxy = self.warp.proxy_url()?;
+        match effective.outbound_mode {
+            OutboundMode::Warp => effective.outbound_proxy = self.warp.proxy_url()?,
+            OutboundMode::Mihomo => effective.outbound_proxy = self.mihomo.proxy_url()?,
+            OutboundMode::Manual => {}
         }
         if effective.outbound_proxy.trim().is_empty() {
             anyhow::bail!("尚未配置出站代理");
@@ -679,7 +731,7 @@ impl App {
 
     async fn refresh_business_http(&self) -> Result<()> {
         let settings = self.settings.lock().await.clone();
-        let proxy = resolved_business_proxy(&settings, &self.warp);
+        let proxy = resolved_business_proxy(&settings, &self.warp, &self.mihomo);
         let session = self.turn_state.lock().await.bound_proxy_session();
         *self.http.lock().await = business_http_client(&proxy, session.as_deref())?;
         Ok(())
@@ -1048,6 +1100,43 @@ impl App {
         }
         match result {
             Ok(fetched) => {
+                if !settings.same_network() {
+                    let business = resolved_business_proxy(settings, &self.warp, &self.mihomo);
+                    let verify_client = match upstream_http_client(&business) {
+                        Ok(client) => client,
+                        Err(err) => {
+                            details.turn_state_action = "rejected_reverify".into();
+                            self.record_fetch(started, details).await;
+                            return Err(FetchOnceError::probing(
+                                format!("[{model}] 业务出口复验失败: {err:#}"),
+                                FetchRetryClass::Normal,
+                                true,
+                            ));
+                        }
+                    };
+                    let mut verify_settings = fetch_settings.clone();
+                    verify_settings.outbound_proxy = business;
+                    let mut verify_details = NetworkLogDetails::default();
+                    if let Err(err) = fetch::validate_carried_ticket(
+                        &verify_client,
+                        &verify_settings,
+                        creds,
+                        model,
+                        &fetched.token,
+                        &fetched.routing_cookies,
+                        &mut verify_details,
+                    )
+                    .await
+                    {
+                        details.turn_state_action = "rejected_reverify".into();
+                        self.record_fetch(started, details).await;
+                        return Err(FetchOnceError::probing(
+                            format!("[{model}] 业务出口复验未通过: {err:#}"),
+                            FetchRetryClass::Normal,
+                            true,
+                        ));
+                    }
+                }
                 let token = fetched.token;
                 if self.fetch_generation.load(Ordering::SeqCst) != generation {
                     details.turn_state_action = "discarded_stale_config".into();
@@ -1496,8 +1585,8 @@ impl ProxyHandle {
             self.settings_change.lock().await
         };
         let old = self.app.settings.lock().await.clone();
-        let next_business = resolved_business_proxy(&next, &self.app.warp);
-        let next_http = if resolved_business_proxy(&old, &self.app.warp) != next_business {
+        let next_business = resolved_business_proxy(&next, &self.app.warp, &self.app.mihomo);
+        let next_http = if resolved_business_proxy(&old, &self.app.warp, &self.app.mihomo) != next_business {
             Some(business_http_client(&next_business, None)?)
         } else {
             None
@@ -1514,7 +1603,9 @@ impl ProxyHandle {
             || old.outbound_mode != next.outbound_mode
             || old.warp_http2 != next.warp_http2
             || old.upstream != next.upstream
-            || old.codex_home != next.codex_home;
+            || old.codex_home != next.codex_home
+            || old.mihomo_subscription != next.mihomo_subscription
+            || old.mihomo_node != next.mihomo_node;
         let reuse_changed = old.token_reuse_policy != next.token_reuse_policy;
         let fetch_changed = route_changed || reuse_changed;
         let mut fetch_transition_guard = None;
@@ -1532,8 +1623,11 @@ impl ProxyHandle {
             *self.app.fetch_ok_at.lock().await = None;
             self.app.degraded.store(false, Ordering::Relaxed);
             *self.app.degraded_at.lock().await = None;
-            if route_changed && (next.outbound_mode == OutboundMode::Manual || old.warp_http2 != next.warp_http2) {
+            if route_changed && next.outbound_mode != OutboundMode::Warp {
                 self.app.warp.stop().await;
+            }
+            if route_changed && next.outbound_mode != OutboundMode::Mihomo {
+                self.app.mihomo.stop().await;
             }
         }
         {
@@ -1603,6 +1697,14 @@ impl ProxyHandle {
             }
             self.app.model_notify.notify_one();
         }
+        if next.outbound_mode == OutboundMode::Mihomo
+            && (route_changed || self.app.mihomo.status().phase != "connected")
+        {
+            if let Err(err) = self.app.mihomo.start(&next).await {
+                eprintln!("mihomo: {err:#}");
+            }
+            let _ = self.app.refresh_business_http().await;
+        }
         self.app.warp_wake.notify_one();
         Ok(self.managed_status().await)
     }
@@ -1621,12 +1723,51 @@ impl ProxyHandle {
                 } else {
                     self.app.warp.check_health().await;
                 }
+            } else if mode == OutboundMode::Mihomo {
+                let phase = self.app.mihomo.status().phase;
+                if matches!(phase.as_str(), "stopped" | "error") {
+                    let settings = self.app.settings.lock().await.clone();
+                    if let Err(err) = self.app.mihomo.start(&settings).await {
+                        eprintln!("mihomo: {err:#}");
+                        wait = Duration::from_secs(60);
+                    } else {
+                        let _ = self.app.refresh_business_http().await;
+                    }
+                }
             }
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {},
                 _ = self.app.warp_wake.notified() => {},
             }
         }
+    }
+
+    pub async fn probe_latency(
+        &self,
+        kind: &str,
+        proxy: Option<String>,
+    ) -> Result<crate::latency::LatencyReport> {
+        let settings = self.app.settings.lock().await.clone();
+        let target = crate::latency::probe_target(&settings.upstream)?;
+        let samples = match kind {
+            "warp" => {
+                let result = match self.app.warp.proxy_url() {
+                    Ok(endpoint) => crate::latency::probe_through_proxy(&endpoint, &target).await,
+                    Err(err) => Err(err),
+                };
+                vec![crate::latency::sample_from_result("warp", result)]
+            }
+            "manual" => {
+                let raw = proxy.filter(|value| !value.trim().is_empty()).unwrap_or(settings.outbound_proxy);
+                vec![crate::latency::sample_from_result(
+                    "manual",
+                    crate::latency::probe_through_proxy(&raw, &target).await,
+                )]
+            }
+            "mihomo" => self.app.mihomo.probe_delays(&target).await?,
+            _ => anyhow::bail!("未知的检测对象"),
+        };
+        Ok(crate::latency::LatencyReport { target, samples })
     }
 
     pub async fn connect_warp(&self, accept_terms: bool) -> Result<Status> {
@@ -1790,6 +1931,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                     }),
                 );
             }
+            let injected_token = details.injected_token.clone();
             let entry = LogEntry::new(
                 method.as_str(),
                 &path,
@@ -1811,6 +1953,8 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 diag_first_token: false,
                 diag_finished: false,
                 last_diag_chunks: 0,
+                injected_token,
+                mismatch_noted: false,
             };
             let (parts, body) = resp.into_parts();
             let stream = futures_util::stream::unfold(
@@ -1894,6 +2038,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                     }
                     if tracker.finished {
                         tracker.activity.take();
+                        tracker.note_model_mismatch().await;
                     }
                     // No read-ahead or buffering for forwarding. Only publish metric changes
                     // and the final result; response bytes are passed through unchanged.
@@ -1941,6 +2086,8 @@ struct ResponseLogTracker {
     diag_first_token: bool,
     diag_finished: bool,
     last_diag_chunks: u64,
+    injected_token: Option<String>,
+    mismatch_noted: bool,
 }
 
 impl ResponseLogTracker {
@@ -1968,6 +2115,25 @@ impl ResponseLogTracker {
 
     async fn publish(&self) {
         replace_network_log(&self.app, self.entry.clone()).await;
+    }
+
+    async fn note_model_mismatch(&mut self) {
+        if self.mismatch_noted || !self.metrics.completed() {
+            return;
+        }
+        let Some(requested) = self.entry.model.clone() else {
+            return;
+        };
+        let Some(upstream) = self.metrics.upstream_response_model().map(str::to_owned) else {
+            return;
+        };
+        if upstream == requested {
+            return;
+        }
+        self.mismatch_noted = true;
+        self.app
+            .observe_business_response(&requested, self.injected_token.as_deref(), false, Some(&upstream), true)
+            .await;
     }
 
     fn emit_diag_progress(&mut self) {
@@ -2074,24 +2240,28 @@ impl Drop for ResponseLogTracker {
     }
 }
 
-fn resolved_business_proxy(settings: &Settings, warp: &WarpRuntime) -> String {
+fn resolved_business_proxy(
+    settings: &Settings,
+    warp: &WarpRuntime,
+    mihomo: &MihomoRuntime,
+) -> String {
     if !settings.same_network() {
         return settings.upstream_proxy.clone();
     }
-    if settings.outbound_mode == OutboundMode::Warp {
-        warp.proxy_url().unwrap_or_default()
-    } else {
-        settings.outbound_proxy.clone()
+    match settings.outbound_mode {
+        OutboundMode::Warp => warp.proxy_url().unwrap_or_default(),
+        OutboundMode::Mihomo => mihomo.proxy_url().unwrap_or_default(),
+        OutboundMode::Manual => settings.outbound_proxy.clone(),
     }
 }
 
 fn business_network_details(settings: &Settings, upstream: &str, proxy: &str) -> NetworkLogDetails {
     let mut details = logs::network_details(upstream, proxy);
     if settings.same_network() && !proxy.trim().is_empty() {
-        details.route_kind = if settings.outbound_mode == OutboundMode::Warp {
-            logs::ROUTE_EMBEDDED_WARP.into()
-        } else {
-            logs::ROUTE_MANUAL_PROXY.into()
+        details.route_kind = match settings.outbound_mode {
+            OutboundMode::Warp => logs::ROUTE_EMBEDDED_WARP.into(),
+            OutboundMode::Mihomo => logs::ROUTE_EMBEDDED_MIHOMO.into(),
+            OutboundMode::Manual => logs::ROUTE_MANUAL_PROXY.into(),
         };
     }
     details
@@ -2220,7 +2390,7 @@ async fn forward_http_tracked(
 ) -> Result<Response> {
     let (upstream, home, upstream_proxy, cached_http, state_miss_policy, request_settings) = {
         let settings = app.settings.lock().await;
-        let business_proxy = resolved_business_proxy(&settings, &app.warp);
+        let business_proxy = resolved_business_proxy(&settings, &app.warp, &app.mihomo);
         (
             settings.upstream.clone(),
             settings.codex_home.clone(),
@@ -2243,6 +2413,19 @@ async fn forward_http_tracked(
             })
         );
     }
+    if request_settings.same_network()
+        && request_settings.outbound_mode == OutboundMode::Mihomo
+        && upstream_proxy.trim().is_empty()
+    {
+        anyhow::bail!(
+            "{}",
+            app.mihomo
+                .proxy_url()
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "订阅节点正在连接，请稍候。".into())
+        );
+    }
     details.state_policy = Some(state_miss_policy);
     let (mut parts, body) = req.into_parts();
     let target = join_upstream(&upstream, &parts.uri)?;
@@ -2254,7 +2437,8 @@ async fn forward_http_tracked(
         .context("read body")?;
     details.body_bytes = bytes.len();
 
-    let should_stamp = turn_state::should_stamp_http(parts.method.as_str(), path);
+    let compacting = turn_state::is_context_compaction(path, &bytes);
+    let should_stamp = turn_state::should_stamp_http(parts.method.as_str(), path) && !compacting;
     let content_encoding = parts
         .headers
         .get("content-encoding")
@@ -2474,7 +2658,11 @@ async fn forward_http_tracked(
             }
         }
     } else {
-        details.turn_state_action = "not_applicable".into();
+        details.turn_state_action = if compacting {
+            "compaction_passthrough".into()
+        } else {
+            "not_applicable".into()
+        };
         if state_miss_policy == StateMissPolicy::StripAll {
             parts.headers.remove(turn_state::HEADER_NAME);
             details.turn_state_action = "removed_all_policy".into();
@@ -2516,6 +2704,7 @@ async fn forward_http_tracked(
             }),
         );
     }
+    details.injected_token = injected_token.clone();
     if injected_token.is_some() {
         let chatgpt_host = chatgpt_cookies::is_chatgpt_https_url(&target);
         if !routing_cookies.is_empty() || chatgpt_host {
@@ -2598,7 +2787,14 @@ async fn forward_http_tracked(
     if let Some(model) =
         degraded_response_model(request_model.as_deref(), upstream_turn_state.as_deref())
     {
-        app.note_degraded_business_response(model);
+        app.observe_business_response(
+            model,
+            injected_token.as_deref(),
+            true,
+            None,
+            false,
+        )
+        .await;
     }
     let injected_len = injected_token.as_ref().map(|t| t.len());
     let upstream_ts_len = upstream_turn_state.as_ref().map(|t| t.len());
@@ -2881,14 +3077,20 @@ mod tests {
             .peek_for_model("gpt-6-astra")
             .as_deref()
             == Some(current_ticket.as_str()));
-        app.note_degraded_business_response("gpt-6-astra");
+        app.observe_business_response(
+            "gpt-6-astra",
+            Some(&current_ticket),
+            true,
+            None,
+            false,
+        )
+        .await;
         assert!(app
             .turn_state
             .lock()
             .await
             .peek_for_model("gpt-6-astra")
-            .as_deref()
-            == Some(current_ticket.as_str()));
+            .is_none());
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -3070,7 +3272,7 @@ mod tests {
             network_route_policy: NetworkRoutePolicy::SameNetwork,
             ..Settings::default()
         };
-        let template = resolved_business_proxy(&settings, &WarpRuntime::default());
+        let template = resolved_business_proxy(&settings, &WarpRuntime::default(), &MihomoRuntime::default());
         assert!(fetch::has_session_placeholder(&template));
         assert!(fetch::apply_bound_session(&template, None).is_err());
         assert!(fetch::apply_bound_session(&template, Some("1Z5jzVPs"))
@@ -3170,7 +3372,9 @@ mod tests {
                 probe_send.send(headers).unwrap();
                 Response::builder()
                     .header(turn_state::HEADER_NAME, token)
-                    .body(Body::empty())
+                    .body(Body::from(
+                        "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6-astra\"}}\n\n",
+                    ))
                     .unwrap()
             }
         });
@@ -3426,7 +3630,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let entry = app.logs.lock().await.back().unwrap().clone();
+        let entry = app.logs.lock().await.back().unwrap().snapshot();
         assert_eq!(entry.error_kind.as_deref(), Some("stream_idle"));
         assert_eq!(entry.stream_state, "error");
         server.abort();

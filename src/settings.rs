@@ -9,6 +9,7 @@ pub enum OutboundMode {
     #[default]
     Manual,
     Warp,
+    Mihomo,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +68,12 @@ pub struct Settings {
     pub token_max_age_mins: u32,
     #[serde(default = "default_token_prefetch_age_mins")]
     pub token_prefetch_age_mins: u32,
+    /// Clash / Mihomo 订阅 URL、本地文件，或分享链接正文。
+    #[serde(default)]
+    pub mihomo_subscription: String,
+    /// 固定使用的节点名。空字符串表示连上后用订阅里的第一个。
+    #[serde(default)]
+    pub mihomo_node: String,
 }
 
 impl Default for Settings {
@@ -88,6 +95,8 @@ impl Default for Settings {
             token_fetch_paused: false,
             token_max_age_mins: default_token_max_age_mins(),
             token_prefetch_age_mins: default_token_prefetch_age_mins(),
+            mihomo_subscription: String::new(),
+            mihomo_node: String::new(),
         }
     }
 }
@@ -133,6 +142,14 @@ fn default_token_max_age_mins() -> u32 {
 
 fn default_token_prefetch_age_mins() -> u32 {
     DEFAULT_TOKEN_PREFETCH_AGE_MINS
+}
+
+fn normalize_mihomo_text(raw: &str, max_len: usize, label: &str) -> Result<String> {
+    let value = raw.trim();
+    if value.len() > max_len {
+        bail!("{label}过长");
+    }
+    Ok(value.to_string())
 }
 
 fn normalize_token_lifetime(max_age_mins: u32, prefetch_age_mins: u32) -> Result<(u32, u32)> {
@@ -188,6 +205,10 @@ pub struct SettingsPatch {
     pub token_max_age_mins: u32,
     #[serde(default = "default_token_prefetch_age_mins")]
     pub token_prefetch_age_mins: u32,
+    #[serde(default)]
+    pub mihomo_subscription: String,
+    #[serde(default)]
+    pub mihomo_node: String,
 }
 
 impl SettingsPatch {
@@ -211,6 +232,8 @@ impl SettingsPatch {
             token_fetch_paused: self.token_fetch_paused,
             token_max_age_mins: lifetime.0,
             token_prefetch_age_mins: lifetime.1,
+            mihomo_subscription: normalize_mihomo_text(&self.mihomo_subscription, 8192, "订阅地址")?,
+            mihomo_node: normalize_mihomo_text(&self.mihomo_node, 128, "节点名")?,
         };
         if settings.proxy_listen.is_empty()
             || settings.upstream.is_empty()
@@ -437,6 +460,8 @@ mod tests {
             token_fetch_paused: false,
             token_max_age_mins: DEFAULT_TOKEN_MAX_AGE_MINS,
             token_prefetch_age_mins: DEFAULT_TOKEN_PREFETCH_AGE_MINS,
+            mihomo_subscription: String::new(),
+            mihomo_node: String::new(),
         }
         .into_settings()
         .unwrap();

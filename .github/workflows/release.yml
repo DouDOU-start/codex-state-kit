@@ -140,6 +140,15 @@ jobs:
         if: matrix.warp_platform == 'macos'
         run: bash ./tools/prepare-warp.sh "${{ matrix.warp_arch }}"
 
+      - name: 准备 Mihomo 内核（Windows）
+        if: matrix.warp_platform == 'windows'
+        shell: pwsh
+        run: ./tools/prepare-mihomo.ps1
+
+      - name: 准备 Mihomo 内核（macOS）
+        if: matrix.warp_platform == 'macos'
+        run: bash ./tools/prepare-mihomo.sh "${{ matrix.warp_arch }}"
+
       - name: 安装前端依赖
         run: corepack pnpm install --frozen-lockfile
 

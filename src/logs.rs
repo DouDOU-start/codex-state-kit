@@ -11,6 +11,7 @@ use url::Url;
 pub const ROUTE_DEFAULT_SYSTEM: &str = "default_system";
 pub const ROUTE_EXPLICIT_PROXY: &str = "explicit_proxy";
 pub const ROUTE_EMBEDDED_WARP: &str = "embedded_warp";
+pub const ROUTE_EMBEDDED_MIHOMO: &str = "embedded_mihomo";
 pub const ROUTE_MANUAL_PROXY: &str = "manual_proxy";
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_LOGS: usize = 80;
@@ -283,6 +284,8 @@ pub struct NetworkLogDetails {
     pub diag: Option<crate::diag::Request>,
     pub token_fp: Option<String>,
     pub cookie_names: Vec<String>,
+    /// 本次请求实际注入的票据。只用于响应观测，不进入日志。
+    pub injected_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
