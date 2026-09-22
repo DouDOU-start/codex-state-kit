@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import Check from "lucide-react/dist/esm/icons/check.js";
 import Copy from "lucide-react/dist/esm/icons/copy.js";
 import Network from "lucide-react/dist/esm/icons/network.js";
@@ -91,6 +91,8 @@ function stateLabel(entry: LogEntry): string {
     case "replaced_after_wait": return `等待后已替换${length}`;
     case "injected": return `已补上 State${length}`;
     case "injected_after_wait": return `等待后已补上 State${length}`;
+    case "header_only": return `同轮续跑，只改请求头${length}`;
+    case "header_only_after_wait": return `等待后同轮续跑，只改请求头${length}`;
     case "removed_by_policy": return "按策略剥离 State";
     case "removed_all_policy": return "全部剥离策略，未携带 State";
     case "preserved_by_policy": return `不替换，原样转发${length}`;
@@ -179,6 +181,10 @@ function filteredLogs(status: Status, account: string): LogEntry[] {
   return account ? status.logs.filter((entry) => entry.accountId === account) : [];
 }
 
+function isTokenFetch(entry: LogEntry): boolean {
+  return entry.flow === "token_fetch";
+}
+
 function policyLabel(entry: LogEntry): string {
   switch (entry.statePolicy) {
     case "preserve": return "无票保留";
@@ -247,12 +253,8 @@ function streamLabel(entry: LogEntry): string | null {
   }
 }
 
-function logExport(status: Status, account: string): string {
-  const routeLines = [
-    `Token 获取: ${ticketRoute(status).join(" -> ")}`,
-    `业务请求: ${businessRoute(status).join(" -> ")}`,
-  ];
-  const entries = filteredLogs(status, account).map((entry) => [
+function formatLogEntry(status: Status, entry: LogEntry): string {
+  return [
     `[${entry.ts}] ${requestLabel(entry)} -> ${entry.status} (response_header=${entry.responseHeaderMs ?? entry.ms}ms total=${entry.inProgress ? "pending" : `${entry.ms}ms`})`,
     `  account=${accountLabel(status, entry.accountId, entry.accountEmail)}`,
     `  model=${entry.model || "unknown"} transport=${transportLabel(entry.transport)} route=${routeLabel(entry)}`,
@@ -261,8 +263,96 @@ function logExport(status: Status, account: string): string {
     `  responseHeaderMs=${entry.responseHeaderMs ?? "unknown"} responseEncoding=${entry.responseContentEncoding ?? "unknown"} firstTokenMs=${entry.firstTokenMs ?? "unknown"} totalMs=${entry.inProgress ? "pending" : entry.ms} outputTokens=${entry.outputTokens ?? "unknown"} tokensPerSecond=${entry.tokensPerSecond?.toFixed(1) ?? "unknown"} inProgress=${Boolean(entry.inProgress)}`,
     `  policy=${policyLabel(entry)} state=${stateLabel(entry)} returnedState=${entry.returnedTurnStateLen || 0} body=${formatBytes(entry.bodyBytes)} encoding=${entry.contentEncoding || "none"} error=${entry.errorKind || "none"}`,
     `  stream_state=${entry.streamState || "not_tracked"} first_chunk_ms=${entry.firstChunkMs ?? "none"} last_chunk_ms=${entry.lastChunkMs ?? "none"} total_ms=${entry.streamTotalMs ?? "none"} chunks=${entry.streamChunks || 0} bytes=${entry.streamBytes || 0} max_idle_ms=${entry.maxIdleMs ?? "none"} current_idle_ms=${entry.currentIdleMs ?? "none"}`,
-  ].join("\n"));
-  return [...routeLines, `账号筛选: ${account ? accountLabel(status, account) : "暂无账号"}`, "", ...entries].join("\n");
+  ].join("\n");
+}
+
+function logExport(status: Status, account: string): string {
+  const entries = [...filteredLogs(status, account)].reverse();
+  const business = entries.filter((entry) => !isTokenFetch(entry));
+  const tokenFetch = entries.filter(isTokenFetch);
+  return [
+    `Token 获取: ${ticketRoute(status).join(" -> ")}`,
+    `业务请求: ${businessRoute(status).join(" -> ")}`,
+    `账号筛选: ${account ? accountLabel(status, account) : "暂无账号"}`,
+    "",
+    `## 业务请求 (${business.length})`,
+    ...(business.length ? business.map((entry) => formatLogEntry(status, entry)) : ["(无)"]),
+    "",
+    `## Token 获取 (${tokenFetch.length})`,
+    ...(tokenFetch.length ? tokenFetch.map((entry) => formatLogEntry(status, entry)) : ["(无)"]),
+  ].join("\n");
+}
+
+function LogTable({ status, entries }: { status: Status; entries: LogEntry[] }) {
+  return (
+    <table className="network-log-table">
+      <thead>
+        <tr>
+          <th scope="col">时间</th>
+          <th scope="col">请求</th>
+          <th scope="col">结果 / 性能</th>
+          <th scope="col">网络路径</th>
+          <th scope="col">Turn-State</th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.map((entry) => (
+          <tr key={entry.id}>
+            <td className="network-log-table__time" title={entry.ts}>{displayTime(entry.ts)}</td>
+            <td>
+              <strong>{requestLabel(entry)}</strong>
+              <small title={accountLabel(status, entry.accountId, entry.accountEmail)}>账号 {accountLabel(status, entry.accountId, entry.accountEmail)}{entry.accountId && entry.accountId === status.currentAccountId ? " · 当前" : ""}</small>
+              <small>{isTokenFetch(entry) ? `${entry.method} ${entry.path} · ` : ""}请求模型：{entry.model || "未识别"} · {transportLabel(entry.transport)}</small>
+              <ResponseModel entry={entry} />
+            </td>
+            <td>
+              <span className={`network-log-status${entry.status >= 400 || entry.errorKind ? " network-log-status--error" : ""}`}>{entry.status}{entry.inProgress ? " · 进行中" : ""}</span>
+              {!isTokenFetch(entry) ? (
+                <>
+                  <small title="从请求进入代理到首个非空文本、工具参数或图片输出事件；不包含响应头、心跳与预置事件。">首字 {formatDuration(entry.firstTokenMs)} · {speedLabel(entry)}</small>
+                  <small title="总耗时统计至响应体结束；tok/s = 上游输出 token 数 ÷（总耗时 − 首字延迟）。">总耗时 {entry.inProgress ? "进行中" : formatDuration(entry.ms)}{entry.outputTokens != null ? ` · ${entry.outputTokens} tokens` : ""}</small>
+                </>
+              ) : null}
+              <small>{entry.httpVersion || "HTTP"} · 响应头 {formatDuration(entry.responseHeaderMs ?? (isTokenFetch(entry) ? entry.ms : null))}{entry.errorKind ? ` · ${errorKindLabel(entry.errorKind)}` : ""}</small>
+              {entry.responseContentEncoding && entry.responseContentEncoding !== "none" && <small>响应编码 {entry.responseContentEncoding}</small>}
+              {streamLabel(entry) ? <small>{streamLabel(entry)}</small> : null}
+            </td>
+            <td>
+              <span>{routeLabel(entry)}</span>
+              <small>{connectionLabel(entry)}</small>
+            </td>
+            <td>
+              <span>{stateLabel(entry)}</span>
+              {entry.statePolicy && <small>策略：{policyLabel(entry)}</small>}
+              <small>{returnedStateLabel(entry)} · {formatBytes(entry.bodyBytes)} · {entry.contentEncoding || "none"}</small>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function LogSection({
+  title,
+  count,
+  empty,
+  children,
+}: {
+  title: string;
+  count: number;
+  empty: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="network-log-section" aria-label={`${title}，${count} 条`}>
+      <header className="network-log-section__head">
+        <strong>{title}</strong>
+        <span>{count} 条</span>
+      </header>
+      {count ? children : <p className="network-log-section__empty">{empty}</p>}
+    </section>
+  );
 }
 
 function RouteLine({ icon, label, nodes }: { icon: "ticket" | "business"; label: string; nodes: string[] }) {
@@ -321,6 +411,8 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
   };
 
   const entries = [...filteredLogs(status, selectedAccount)].reverse();
+  const businessEntries = entries.filter((entry) => !isTokenFetch(entry));
+  const tokenEntries = entries.filter(isTokenFetch);
   return (
     <dialog
       ref={dialogRef}
@@ -368,61 +460,24 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
               {accounts.map((id) => <option key={id} value={id}>{accountLabel(status, id)}</option>)}
             </select>
           </label>
-          <span>{entries.length} / {status.logs.length} 条 · 按请求发起时的账号记录</span>
+          <span>业务 {businessEntries.length} · Token 获取 {tokenEntries.length} / 共 {status.logs.length} 条 · 按请求发起时的账号记录</span>
         </div>
 
         <div className="network-log-table-wrap">
           {entries.length ? (
-            <table className="network-log-table">
-              <thead>
-                <tr>
-                  <th scope="col">时间</th>
-                  <th scope="col">请求</th>
-                  <th scope="col">结果 / 性能</th>
-                  <th scope="col">网络路径</th>
-                  <th scope="col">Turn-State</th>
-                </tr>
-              </thead>
-              <tbody>
-                {entries.map((entry) => (
-                  <tr key={entry.id}>
-                    <td className="network-log-table__time" title={entry.ts}>{displayTime(entry.ts)}</td>
-                    <td>
-                      <strong>{requestLabel(entry)}</strong>
-                      <small title={accountLabel(status, entry.accountId, entry.accountEmail)}>账号 {accountLabel(status, entry.accountId, entry.accountEmail)}{entry.accountId && entry.accountId === status.currentAccountId ? " · 当前" : ""}</small>
-                      <small>{entry.flow === "token_fetch" ? `${entry.method} ${entry.path} · ` : ""}请求模型：{entry.model || "未识别"} · {transportLabel(entry.transport)}</small>
-                      <ResponseModel entry={entry} />
-                    </td>
-                    <td>
-                      <span className={`network-log-status${entry.status >= 400 || entry.errorKind ? " network-log-status--error" : ""}`}>{entry.status}{entry.inProgress ? " · 进行中" : ""}</span>
-                      {entry.flow !== "token_fetch" ? (
-                        <>
-                          <small title="从请求进入代理到首个非空文本、工具参数或图片输出事件；不包含响应头、心跳与预置事件。">首字 {formatDuration(entry.firstTokenMs)} · {speedLabel(entry)}</small>
-                          <small title="总耗时统计至响应体结束；tok/s = 上游输出 token 数 ÷（总耗时 − 首字延迟）。">总耗时 {entry.inProgress ? "进行中" : formatDuration(entry.ms)}{entry.outputTokens != null ? ` · ${entry.outputTokens} tokens` : ""}</small>
-                        </>
-                      ) : null}
-                      <small>{entry.httpVersion || "HTTP"} · 响应头 {formatDuration(entry.responseHeaderMs ?? (entry.flow === "token_fetch" ? entry.ms : null))}{entry.errorKind ? ` · ${errorKindLabel(entry.errorKind)}` : ""}</small>
-                      {entry.responseContentEncoding && entry.responseContentEncoding !== "none" && <small>响应编码 {entry.responseContentEncoding}</small>}
-                      {streamLabel(entry) ? <small>{streamLabel(entry)}</small> : null}
-                    </td>
-                    <td>
-                      <span>{routeLabel(entry)}</span>
-                      <small>{connectionLabel(entry)}</small>
-                    </td>
-                    <td>
-                      <span>{stateLabel(entry)}</span>
-                      {entry.statePolicy && <small>策略：{policyLabel(entry)}</small>}
-                      <small>{returnedStateLabel(entry)} · {formatBytes(entry.bodyBytes)} · {entry.contentEncoding || "none"}</small>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <>
+              <LogSection title="业务请求" count={businessEntries.length} empty="该账号暂无业务请求">
+                <LogTable status={status} entries={businessEntries} />
+              </LogSection>
+              <LogSection title="Token 获取" count={tokenEntries.length} empty="该账号暂无 Token 获取记录">
+                <LogTable status={status} entries={tokenEntries} />
+              </LogSection>
+            </>
           ) : (
             <div className="network-log-dialog__empty">
               <Route size={24} strokeWidth={1.5} />
               <strong>{status.logs.length ? "该账号暂无请求记录" : "等待第一条请求"}</strong>
-              <p>Token 获取和 Codex 业务请求会记录在这里。</p>
+              <p>业务请求和 Token 获取会分开列在这里。</p>
             </div>
           )}
         </div>

@@ -3,7 +3,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, Version};
 use axum::response::{IntoResponse, Response};
-use futures_util::StreamExt;
+use futures_util::{future::join_all, StreamExt};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
@@ -87,6 +87,8 @@ enum FetchRetryClass {
 struct FetchOnceError {
     message: String,
     retry: FetchRetryClass,
+    escalate: bool,
+    returned_len: Option<usize>,
 }
 
 impl FetchOnceError {
@@ -94,8 +96,47 @@ impl FetchOnceError {
         Self {
             message: message.into(),
             retry,
+            escalate: false,
+            returned_len: None,
         }
     }
+
+    fn probing(message: impl Into<String>, retry: FetchRetryClass, escalate: bool) -> Self {
+        Self {
+            message: message.into(),
+            retry,
+            escalate,
+            returned_len: None,
+        }
+    }
+
+    fn with_len(mut self, len: Option<usize>) -> Self {
+        self.returned_len = len;
+        self
+    }
+}
+
+fn retry_priority(class: FetchRetryClass) -> u8 {
+    match class {
+        FetchRetryClass::Auth => 0,
+        FetchRetryClass::Stale => 1,
+        FetchRetryClass::Deferred => 2,
+        FetchRetryClass::Backoff => 3,
+        FetchRetryClass::Forbidden => 4,
+        FetchRetryClass::Normal => 5,
+    }
+}
+
+fn burst_key_for(store: &TurnStateStore, model: &str) -> String {
+    if store.shares_292_for(model) {
+        "shared_292".into()
+    } else {
+        model.to_string()
+    }
+}
+
+fn fetch_failure_escalates(details: &NetworkLogDetails) -> bool {
+    !matches!(details.response_status, Some(401 | 429 | 503))
 }
 
 impl std::fmt::Display for FetchOnceError {
@@ -241,6 +282,7 @@ pub struct App {
     fetch_gate: Mutex<()>,
     fetch_next_allowed_at: Mutex<Instant>,
     fetch_model_next_allowed_at: Mutex<HashMap<String, Instant>>,
+    fetch_burst_misses: Mutex<HashMap<String, u32>>,
     fetch_generation: AtomicU64,
     fetch_change_notify: Notify,
     fetch_transition: Mutex<()>,
@@ -302,6 +344,7 @@ impl App {
             fetch_gate: Mutex::new(()),
             fetch_next_allowed_at: Mutex::new(Instant::now()),
             fetch_model_next_allowed_at: Mutex::new(HashMap::new()),
+            fetch_burst_misses: Mutex::new(HashMap::new()),
             fetch_generation: AtomicU64::new(0),
             fetch_change_notify: Notify::new(),
             fetch_transition: Mutex::new(()),
@@ -415,6 +458,7 @@ impl App {
             *self.fetch_error.lock().await = None;
             *self.fetch_ok_at.lock().await = None;
             self.reset_fetch_schedule().await;
+            self.reset_fetch_burst().await;
             self.fetch_change_notify.notify_waiters();
             self.model_notify.notify_one();
         }
@@ -634,6 +678,36 @@ impl App {
         self.fetch_model_next_allowed_at.lock().await.clear();
     }
 
+    async fn reset_fetch_burst(&self) {
+        self.fetch_burst_misses.lock().await.clear();
+    }
+
+    async fn current_burst(&self, key: &str) -> usize {
+        let misses = self
+            .fetch_burst_misses
+            .lock()
+            .await
+            .get(key)
+            .copied()
+            .unwrap_or(0);
+        fetch::fetch_burst_concurrency(misses)
+    }
+
+    async fn note_burst_success(&self, key: &str) {
+        self.fetch_burst_misses.lock().await.remove(key);
+    }
+
+    async fn note_burst_miss(&self, key: &str) {
+        let mut misses = self.fetch_burst_misses.lock().await;
+        let next = misses
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .min(fetch::MAX_FETCH_BURST.ilog2());
+        misses.insert(key.to_string(), next);
+    }
+
     async fn defer_fetch_failure(&self, model: &str, class: FetchRetryClass) {
         if matches!(class, FetchRetryClass::Stale | FetchRetryClass::Deferred) {
             return;
@@ -789,166 +863,223 @@ impl App {
                 FetchRetryClass::Stale,
             ));
         }
-        for attempt in 1..=fetch::CONNECT_ATTEMPTS {
-            if !self.wait_for_fetch_slot(generation).await {
-                let message = format!("[{model}] 配置已变化，取消旧线路票据请求");
-                return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
-            }
-            if only_if_needed && self.settings.lock().await.token_fetch_paused {
-                return Err(FetchOnceError::new(
-                    TOKEN_FETCH_PAUSED_MESSAGE,
-                    FetchRetryClass::Deferred,
-                ));
-            }
-            if !fetch_account_is_current(&settings, &creds.account_id) {
-                return Err(FetchOnceError::new(format!("[{model}] 登录账号已变化，取消旧账号票据请求"), FetchRetryClass::Stale));
-            }
-            // Recheck after waiting for the global slot: a manual refresh or a
-            // previous queued donor may already have refreshed the shared pool.
-            if only_if_needed {
-                let store = self.turn_state.lock().await;
-                if !store.needs_refresh(model) {
-                    if let Some(token) = store.peek_for_model(model) {
-                        return Ok(token);
-                    }
-                }
-            }
-            let (probe_proxy, probe_session) = fetch::resolve_probe_proxy(&settings.outbound_proxy);
-            let mut fetch_settings = settings.clone();
-            fetch_settings.outbound_proxy = probe_proxy;
-            let client = match fetch::http_client(&fetch_settings.outbound_proxy) {
-                Ok(client) => client,
-                Err(err) => {
-                    let message = format!("{err:#}");
-                    self.defer_fetch_failure(model, FetchRetryClass::Backoff)
-                        .await;
-                    *self.fetch_error.lock().await = Some(message.clone());
-                    return Err(FetchOnceError::new(message, FetchRetryClass::Backoff));
-                }
-            };
-            let started = Instant::now();
-            let mut details = NetworkLogDetails::default();
-            let request_cookies = self.turn_state.lock().await.bound_routing_cookies();
-            let result = fetch::fetch_turn_state_with_cookies(
-                &client,
-                &fetch_settings,
-                &creds,
-                model,
-                target_len,
-                allow_auto_quality,
-                &request_cookies,
-                &mut details,
-            )
-            .await;
-            details.proxy_session = probe_session.clone();
-
-            if !fetch_account_is_current(&settings, &creds.account_id) {
-                details.turn_state_action = "discarded_stale_account".into();
-                self.record_fetch(started, details).await;
-                return Err(FetchOnceError::new(format!("[{model}] 登录账号已变化，丢弃旧账号票据结果"), FetchRetryClass::Stale));
-            }
-            match result {
-                Ok(fetched) => {
-                    let token = fetched.token;
-                    if self.fetch_generation.load(Ordering::SeqCst) != generation {
-                        details.turn_state_action = "discarded_stale_config".into();
-                        self.record_fetch(started, details).await;
-                        let message = format!("[{model}] 配置已变化，丢弃旧线路返回的票据");
-                        return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
-                    }
-                    let ready = {
-                        let mut store = self.turn_state.lock().await;
-                        if self.fetch_generation.load(Ordering::SeqCst) != generation
-                            || !store.is_bound_to_account(&creds.account_id)
-                        {
-                            None
-                        } else {
-                            store.record_distribution(
-                                model,
-                                vec![turn_state::TokenLenCount {
-                                    len: token.len(),
-                                    count: 1,
-                                }],
-                            );
-                            Some(capture_fetched_ticket(
-                                &mut store,
-                                model,
-                                &token,
-                                probe_session.as_deref(),
-                                fetched.previous_response_id.as_deref(),
-                                &fetched.routing_cookies,
-                            ))
-                        }
-                    };
-                    let Some(ready) = ready else {
-                        details.turn_state_action = "discarded_stale_config".into();
-                        self.record_fetch(started, details).await;
-                        let message = format!("[{model}] 配置已变化，丢弃旧线路返回的票据");
-                        return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
-                    };
-                    self.defer_next_fetch(fetch::CHECK_INTERVAL).await;
-                    if !ready {
-                        self.defer_fetch_failure(model, FetchRetryClass::Normal)
-                            .await;
-                        details.turn_state_action = "pooled_unmatched".into();
-                        self.record_fetch(started, details).await;
-                        let message = format!(
-                            "[{model}] 采到 {} 字节票据，但未匹配请求开始时的目标长度 {target_len}",
-                            token.len()
-                        );
-                        *self.fetch_error.lock().await = Some(message.clone());
-                        return Err(FetchOnceError::new(message, FetchRetryClass::Normal));
-                    }
-                    details.turn_state_action = "captured".into();
-                    details.token_fp = Some(diag::token_fp(&token));
-                    details.cookie_names = chatgpt_cookies::cookie_names(&fetched.routing_cookies);
-                    self.record_fetch(started, details).await;
-                    if let Err(err) = self.refresh_business_http().await {
-                        eprintln!("[{model}] 绑定出口 session 后刷新业务代理失败: {err:#}");
-                    }
-                    self.clear_model_fetch_delay(model).await;
-                    *self.fetch_error.lock().await = None;
-                    *self.fetch_ok_at.lock().await = Some(
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    );
+        if !self.wait_for_fetch_slot(generation).await {
+            let message = format!("[{model}] 配置已变化，取消旧线路票据请求");
+            return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
+        }
+        if only_if_needed && self.settings.lock().await.token_fetch_paused {
+            return Err(FetchOnceError::new(
+                TOKEN_FETCH_PAUSED_MESSAGE,
+                FetchRetryClass::Deferred,
+            ));
+        }
+        if !fetch_account_is_current(&settings, &creds.account_id) {
+            return Err(FetchOnceError::new(format!("[{model}] 登录账号已变化，取消旧账号票据请求"), FetchRetryClass::Stale));
+        }
+        if only_if_needed {
+            let store = self.turn_state.lock().await;
+            if !store.needs_refresh(model) {
+                if let Some(token) = store.peek_for_model(model) {
                     return Ok(token);
-                }
-                Err(err) => {
-                    if self.fetch_generation.load(Ordering::SeqCst) != generation {
-                        details.turn_state_action = "discarded_stale_config".into();
-                        self.record_fetch(started, details).await;
-                        let message = format!("[{model}] 配置已变化，忽略旧线路请求错误");
-                        return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
-                    }
-                    let error_kind = details.error_kind.clone();
-                    let retry_class = classify_fetch_failure(&details);
-                    if let Some(len) = details.returned_turn_state_len {
-                        self.turn_state.lock().await.record_distribution(
-                            model,
-                            vec![turn_state::TokenLenCount { len, count: 1 }],
-                        );
-                    }
-                    self.record_fetch(started, details).await;
-                    let message = format!("{err:#}");
-                    eprintln!("[{model}] turn-state fetch failed: {message}");
-                    *self.fetch_error.lock().await = Some(message.clone());
-
-                    let connect = error_kind.as_deref() == Some("connect");
-                    if connect && attempt < fetch::CONNECT_ATTEMPTS {
-                        self.defer_next_fetch(fetch::CONNECT_RETRY_INTERVAL).await;
-                        continue;
-                    }
-                    let final_class = if connect {
-                        FetchRetryClass::Backoff
-                    } else {
-                        retry_class
-                    };
-                    self.defer_fetch_failure(model, final_class).await;
-                    return Err(FetchOnceError::new(message, final_class));
                 }
             }
         }
-        unreachable!("connect retry loop always returns")
+        let burst_key = {
+            let store = self.turn_state.lock().await;
+            burst_key_for(&store, model)
+        };
+        let concurrency = self.current_burst(&burst_key).await;
+        debug_log(&format!(
+            "[{model}] 本波 {concurrency} 并发探测，目标长度 {target_len}"
+        ));
+        let outcomes = join_all((0..concurrency).map(|_| {
+            self.run_single_probe(
+                model,
+                &settings,
+                &creds,
+                target_len,
+                allow_auto_quality,
+                generation,
+            )
+        }))
+        .await;
+        if let Some(token) = outcomes.iter().find_map(|item| item.as_ref().ok()).cloned() {
+            self.note_burst_success(&burst_key).await;
+            self.defer_next_fetch(fetch::CHECK_INTERVAL).await;
+            self.clear_model_fetch_delay(model).await;
+            if let Err(err) = self.refresh_business_http().await {
+                eprintln!("[{model}] 绑定出口 session 后刷新业务代理失败: {err:#}");
+            }
+            *self.fetch_error.lock().await = None;
+            *self.fetch_ok_at.lock().await = Some(
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            );
+            return Ok(token);
+        }
+        let mut lens: HashMap<usize, u32> = HashMap::new();
+        let mut first_err: Option<FetchOnceError> = None;
+        let mut escalate = false;
+        for outcome in outcomes {
+            let Err(err) = outcome else { continue };
+            escalate |= err.escalate;
+            if let Some(len) = err.returned_len {
+                *lens.entry(len).or_insert(0) += 1;
+            }
+            if first_err
+                .as_ref()
+                .is_none_or(|seen| retry_priority(err.retry) < retry_priority(seen.retry))
+            {
+                first_err = Some(err);
+            }
+        }
+        if !lens.is_empty() {
+            let distribution = lens
+                .into_iter()
+                .map(|(len, count)| turn_state::TokenLenCount { len, count })
+                .collect();
+            self.turn_state
+                .lock()
+                .await
+                .record_distribution(model, distribution);
+        }
+        let err = first_err.unwrap_or_else(|| {
+            FetchOnceError::new(format!("[{model}] 本波探测未返回结果"), FetchRetryClass::Normal)
+        });
+        if escalate && err.retry != FetchRetryClass::Auth {
+            self.note_burst_miss(&burst_key).await;
+        }
+        self.defer_fetch_failure(model, err.retry).await;
+        *self.fetch_error.lock().await = Some(err.message.clone());
+        Err(err)
+    }
+
+    async fn run_single_probe(
+        &self,
+        model: &str,
+        settings: &Settings,
+        creds: &login::ChatGptCredentials,
+        target_len: usize,
+        allow_auto_quality: bool,
+        generation: u64,
+    ) -> std::result::Result<String, FetchOnceError> {
+        if self.fetch_generation.load(Ordering::SeqCst) != generation {
+            return Err(FetchOnceError::new(
+                format!("[{model}] 配置已变化，取消旧线路票据请求"),
+                FetchRetryClass::Stale,
+            ));
+        }
+        if !fetch_account_is_current(settings, &creds.account_id) {
+            return Err(FetchOnceError::new(
+                format!("[{model}] 登录账号已变化，取消旧账号票据请求"),
+                FetchRetryClass::Stale,
+            ));
+        }
+        let (probe_proxy, probe_session) = fetch::resolve_probe_proxy(&settings.outbound_proxy);
+        let mut fetch_settings = settings.clone();
+        fetch_settings.outbound_proxy = probe_proxy;
+        let client = match fetch::http_client(&fetch_settings.outbound_proxy) {
+            Ok(client) => client,
+            Err(err) => {
+                let message = format!("{err:#}");
+                return Err(FetchOnceError::probing(message, FetchRetryClass::Backoff, true));
+            }
+        };
+        let started = Instant::now();
+        let mut details = NetworkLogDetails::default();
+        let request_cookies = self.turn_state.lock().await.bound_routing_cookies();
+        let result = fetch::fetch_turn_state_with_cookies(
+            &client,
+            &fetch_settings,
+            creds,
+            model,
+            target_len,
+            allow_auto_quality,
+            &request_cookies,
+            &mut details,
+        )
+        .await;
+        details.proxy_session = probe_session.clone();
+
+        if !fetch_account_is_current(settings, &creds.account_id) {
+            details.turn_state_action = "discarded_stale_account".into();
+            self.record_fetch(started, details).await;
+            return Err(FetchOnceError::new(
+                format!("[{model}] 登录账号已变化，丢弃旧账号票据结果"),
+                FetchRetryClass::Stale,
+            ));
+        }
+        match result {
+            Ok(fetched) => {
+                let token = fetched.token;
+                if self.fetch_generation.load(Ordering::SeqCst) != generation {
+                    details.turn_state_action = "discarded_stale_config".into();
+                    self.record_fetch(started, details).await;
+                    return Err(FetchOnceError::new(
+                        format!("[{model}] 配置已变化，丢弃旧线路返回的票据"),
+                        FetchRetryClass::Stale,
+                    ));
+                }
+                let ready = {
+                    let mut store = self.turn_state.lock().await;
+                    if self.fetch_generation.load(Ordering::SeqCst) != generation
+                        || !store.is_bound_to_account(&creds.account_id)
+                    {
+                        None
+                    } else {
+                        Some(capture_fetched_ticket(
+                            &mut store,
+                            model,
+                            &token,
+                            probe_session.as_deref(),
+                            fetched.previous_response_id.as_deref(),
+                            &fetched.routing_cookies,
+                        ))
+                    }
+                };
+                let Some(ready) = ready else {
+                    details.turn_state_action = "discarded_stale_config".into();
+                    self.record_fetch(started, details).await;
+                    return Err(FetchOnceError::new(
+                        format!("[{model}] 配置已变化，丢弃旧线路返回的票据"),
+                        FetchRetryClass::Stale,
+                    ));
+                };
+                if !ready {
+                    details.turn_state_action = "pooled_unmatched".into();
+                    self.record_fetch(started, details).await;
+                    return Err(FetchOnceError::probing(
+                        format!(
+                            "[{model}] 采到 {} 字节票据，但未匹配请求开始时的目标长度 {target_len}",
+                            token.len()
+                        ),
+                        FetchRetryClass::Normal,
+                        true,
+                    ));
+                }
+                details.turn_state_action = "captured".into();
+                details.token_fp = Some(diag::token_fp(&token));
+                details.cookie_names = chatgpt_cookies::cookie_names(&fetched.routing_cookies);
+                self.record_fetch(started, details).await;
+                Ok(token)
+            }
+            Err(err) => {
+                if self.fetch_generation.load(Ordering::SeqCst) != generation {
+                    details.turn_state_action = "discarded_stale_config".into();
+                    self.record_fetch(started, details).await;
+                    return Err(FetchOnceError::new(
+                        format!("[{model}] 配置已变化，忽略旧线路请求错误"),
+                        FetchRetryClass::Stale,
+                    ));
+                }
+                let retry_class = classify_fetch_failure(&details);
+                let escalate = fetch_failure_escalates(&details);
+                let returned_len = details.returned_turn_state_len;
+                self.record_fetch(started, details).await;
+                let message = format!("{err:#}");
+                eprintln!("[{model}] turn-state fetch failed: {message}");
+                Err(FetchOnceError::probing(message, retry_class, escalate).with_len(returned_len))
+            }
+        }
     }
 
     async fn refresh_if_needed(&self) -> Duration {
@@ -1019,18 +1150,25 @@ impl App {
         };
         let model = selected.as_str();
         let bound_len = self.turn_state.lock().await.bound_len_for(model);
-        *self.fetch_error.lock().await = Some(format!(
-            "正在单发获取 {} 的 {} Token（第 {} 轮）…",
-            model, bound_len, round
-        ));
+        let burst = {
+            let store = self.turn_state.lock().await;
+            let key = burst_key_for(&store, model);
+            drop(store);
+            self.current_burst(&key).await
+        };
+        *self.fetch_error.lock().await = Some(if burst > 1 {
+            format!("正在以 {burst} 并发获取 {model} 的 {bound_len} Token（第 {round} 轮）…")
+        } else {
+            format!("正在获取 {model} 的 {bound_len} Token（第 {round} 轮）…")
+        });
         debug_log(&format!(
-            "[{}] 需要新 token，第 {} 轮单发获取，目标长度 {}",
-            model, round, bound_len
+            "[{}] 需要新 token，第 {} 轮 {} 并发获取，目标长度 {}",
+            model, round, burst, bound_len
         ));
 
         match self.fetch_once_inner(model, true).await {
             Ok(token) => {
-                debug_log(&format!("✅ [{}] 单发命中 {} 字节票据", model, token.len()));
+                debug_log(&format!("✅ [{}] 命中 {} 字节票据", model, token.len()));
                 let remaining = {
                     let store = self.turn_state.lock().await;
                     store
@@ -1046,7 +1184,7 @@ impl App {
             }
             Err(err) => {
                 let message = format!("{err:#}");
-                eprintln!("[{}] 单发未命中: {message}", model);
+                eprintln!("[{}] 本波未命中: {message}", model);
                 if err.retry != FetchRetryClass::Stale {
                     *self.fetch_error.lock().await = Some(message.clone());
                 }
@@ -1366,6 +1504,7 @@ impl ProxyHandle {
             if route_changed {
                 self.app.reset_fetch_schedule().await;
             }
+            self.app.reset_fetch_burst().await;
             self.app.fetch_change_notify.notify_waiters();
             drop(fetch_change_guard.take());
             drop(fetch_transition_guard.take());
@@ -2171,7 +2310,8 @@ async fn forward_http_tracked(
             details.turn_state_len = parts.headers.get(turn_state::HEADER_NAME)
                 .and_then(|value| value.to_str().ok()).map(str::trim).filter(|value| !value.is_empty()).map(str::len);
         } else {
-            // 探针当作每轮第一包。下游请求一律带上规范票据，并包装成同轮第二包。
+            // 探针当作每轮第一包。新一轮首包补上规范票据并包装成同轮第二包；
+            // 同轮续跑只改请求头，保留客户端 body（含 previous_response_id）。
             let mut token = {
                 let store = app.turn_state.lock().await;
                 if request_account_matches && effective_account.as_deref().is_some_and(|id| store.is_bound_to_account(id)) {
@@ -2198,9 +2338,10 @@ async fn forward_http_tracked(
             }
             if let Some(token) = token {
                 turn_state::apply_http_header(&mut parts.headers, &token);
-                // 同轮续跑且客户端已自带 State：只换请求头，不改 body，
-                // 避免去掉 previous_response_id、也不把请求改写成探针第二包。
-                let header_only = same_turn && client_already_has;
+                // 同轮续跑（带 previous_response_id 或 tool output）只换请求头。
+                // 客户端往往不回带 State；若仍包装第二包会丢掉 previous_response_id，
+                // 子代理多步后续跑会空转推理。
+                let header_only = same_turn;
                 if !header_only {
                     match turn_state::wrap_as_second_packet(&bytes, content_encoding.as_deref(), &token)
                     {
@@ -2213,13 +2354,19 @@ async fn forward_http_tracked(
                         }
                     }
                 }
-                details.turn_state_action = match (client_already_has, waited, header_only) {
-                    (true, true, true) => "header_only_after_wait".into(),
-                    (true, false, true) => "header_only".into(),
-                    (true, true, false) => "replaced_after_wait".into(),
-                    (true, false, false) => "replaced".into(),
-                    (false, true, _) => "injected_after_wait".into(),
-                    (false, false, _) => "injected".into(),
+                details.turn_state_action = if header_only {
+                    if waited {
+                        "header_only_after_wait".into()
+                    } else {
+                        "header_only".into()
+                    }
+                } else {
+                    match (client_already_has, waited) {
+                        (true, true) => "replaced_after_wait".into(),
+                        (true, false) => "replaced".into(),
+                        (false, true) => "injected_after_wait".into(),
+                        (false, false) => "injected".into(),
+                    }
                 };
                 details.turn_state_len = Some(token.len());
                 eprintln!(
@@ -2566,8 +2713,9 @@ mod tests {
         );
         assert_eq!(fetch_retry_delay(FetchRetryClass::Stale), fetch::RETRY_INTERVAL);
         assert!(fetch::RETRY_INTERVAL >= Duration::from_secs(6));
-        assert_eq!(fetch::CONNECT_ATTEMPTS, 4);
-        assert!(fetch::CONNECT_RETRY_INTERVAL >= Duration::from_secs(6));
+        assert_eq!(fetch::MAX_FETCH_BURST, 16);
+        assert_eq!(fetch::fetch_burst_concurrency(0), 1);
+        assert_eq!(fetch::fetch_burst_concurrency(4), 16);
     }
 
     #[tokio::test]

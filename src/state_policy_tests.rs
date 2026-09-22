@@ -124,18 +124,22 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
             assert_eq!(log.turn_state_action, action);
             assert_eq!(log.state_policy, Some(policy));
         }
-        for (policy, action) in [(Preserve, "injected"), (Wait, "injected"), (Strip, "injected")] {
+        for (policy, action) in [(Preserve, "header_only"), (Wait, "header_only"), (Strip, "header_only")] {
             app.settings.lock().await.state_miss_policy = policy;
             app.turn_state.lock().await.invalidate_all();
             assert!(app.turn_state.lock().await.capture("policy-model", &fresh, "test"));
             let response = proxy_http(app.clone(), follow_up_request(false)).await;
             assert_eq!(response.status(), StatusCode::OK, "{policy:?}");
             axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            let (headers, body) = received.recv().await.unwrap();
             assert_eq!(
-                received.recv().await.unwrap().0.get(turn_state::HEADER_NAME).and_then(|v| v.to_str().ok()),
+                headers.get(turn_state::HEADER_NAME).and_then(|v| v.to_str().ok()),
                 Some(fresh.as_str()),
                 "{policy:?}"
             );
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value.get("previous_response_id").and_then(|v| v.as_str()), Some("resp_1"), "{policy:?}");
+            assert!(value.get("client_metadata").is_none(), "{policy:?}");
             assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, action);
         }
         app.settings.lock().await.state_miss_policy = Preserve;
@@ -150,13 +154,24 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
         let (headers, body) = received.recv().await.unwrap();
         assert_eq!(headers.get(turn_state::HEADER_NAME).and_then(|v| v.to_str().ok()), Some(fresh.as_str()));
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(value.get("previous_response_id").is_none());
-        assert_eq!(
-            value.pointer("/client_metadata/x-codex-turn-state").and_then(|v| v.as_str()),
-            Some(fresh.as_str())
-        );
+        assert_eq!(value.get("previous_response_id").and_then(|v| v.as_str()), Some("resp_client"));
+        assert!(value.get("client_metadata").is_none());
+        assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, "header_only");
 
-        // 同轮且客户端已带 State：只换请求头，保留 previous_response_id，不改 body。
+        let response = proxy_http(app.clone(), request_body(
+            false,
+            r#"{"model":"policy-model","input":[{"type":"function_call_output","call_id":"c1","output":"ok"}]}"#,
+        )).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let (headers, body) = received.recv().await.unwrap();
+        assert_eq!(headers.get(turn_state::HEADER_NAME).and_then(|v| v.to_str().ok()), Some(fresh.as_str()));
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["input"][0]["type"], "function_call_output");
+        assert!(value.get("client_metadata").is_none());
+        assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, "header_only");
+
+        // 同轮且客户端已带 State：同样只换请求头，保留 previous_response_id。
         let response = proxy_http(app.clone(), follow_up_request(true)).await;
         assert_eq!(response.status(), StatusCode::OK);
         axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
@@ -275,8 +290,12 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
         app.turn_state.lock().await.capture("policy-model", &fresh, "test");
         let response = pending.await.unwrap();
         axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-        assert_eq!(received.recv().await.unwrap().0[turn_state::HEADER_NAME], fresh);
-        assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, "injected_after_wait");
+        let (headers, body) = received.recv().await.unwrap();
+        assert_eq!(headers[turn_state::HEADER_NAME], fresh);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value.get("previous_response_id").and_then(|v| v.as_str()), Some("resp_1"));
+        assert!(value.get("client_metadata").is_none());
+        assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, "header_only_after_wait");
 
         app.turn_state.lock().await.invalidate_all();
         let pending = tokio::spawn(proxy_http(app.clone(), follow_up_request(true)));

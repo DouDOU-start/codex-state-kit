@@ -16,7 +16,7 @@ fn responses_url(upstream: &str) -> String {
 
 /// 有可用 292 token 时的巡检间隔
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(30);
-/// 单发未命中目标长度后的重试间隔
+/// 未命中目标长度后的重试间隔
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(6);
 pub const ERROR_BACKOFF: Duration = Duration::from_secs(30);
 /// A 403 can be tied to one model or one rotating exit rather than invalid login.
@@ -24,6 +24,12 @@ pub const FORBIDDEN_BACKOFF: Duration = Duration::from_secs(30);
 pub const AUTH_BACKOFF: Duration = Duration::from_secs(300);
 pub const CONNECT_ATTEMPTS: usize = 4;
 pub const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(6);
+/// 连续打不到时，下一波并发按 1→2→4→8→16 加倍。
+pub const MAX_FETCH_BURST: usize = 16;
+
+pub fn fetch_burst_concurrency(miss_streak: u32) -> usize {
+    1usize << miss_streak.min(MAX_FETCH_BURST.ilog2())
+}
 
 const CODEX_IDENTITY_VERSION: &str = "0.153.4";
 const CODEX_ORIGINATOR: &str = "codex-tui";
@@ -999,5 +1005,16 @@ mod tests {
         assert!(cookie.contains("__oailb=route1"));
         assert!(cookie.contains("__cflb=edge1"));
         assert!(!cookie.contains("session"));
+    }
+
+    #[test]
+    fn burst_doubles_after_each_miss_until_16() {
+        assert_eq!(fetch_burst_concurrency(0), 1);
+        assert_eq!(fetch_burst_concurrency(1), 2);
+        assert_eq!(fetch_burst_concurrency(2), 4);
+        assert_eq!(fetch_burst_concurrency(3), 8);
+        assert_eq!(fetch_burst_concurrency(4), 16);
+        assert_eq!(fetch_burst_concurrency(9), 16);
+        assert_eq!(MAX_FETCH_BURST, 16);
     }
 }

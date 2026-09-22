@@ -460,3 +460,74 @@ async fn shared_ticket_unblocks_waiter_and_policy_change_cancels_wait() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn miss_streak_doubles_probe_concurrency_then_resets() {
+    if !isolated_child("proxy::token_reuse_tests::miss_streak_doubles_probe_concurrency_then_resets") {
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let home = tempfile::tempdir().unwrap();
+        write_login(home.path());
+        let probes = Arc::new(AtomicU32::new(0));
+        let probes_seen = probes.clone();
+        let fresh = ticket(0);
+        let reply_token = fresh.clone();
+        let router =
+            axum::Router::new().fallback(move |_headers: HeaderMap, Json(_body): Json<Value>| {
+                let probes = probes_seen.clone();
+                let token = reply_token.clone();
+                async move {
+                    let n = probes.fetch_add(1, Ordering::Relaxed) + 1;
+                    let value = if n <= 3 {
+                        "x".repeat(312)
+                    } else {
+                        token
+                    };
+                    Response::builder()
+                        .header(turn_state::HEADER_NAME, value)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let app = Arc::new(
+            App::new(Settings {
+                upstream: endpoint.clone(),
+                outbound_proxy: endpoint,
+                outbound_mode: OutboundMode::Manual,
+                codex_home: home.path().display().to_string(),
+                models: vec!["a".into()],
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        let _ = app.refresh_if_needed().await;
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+        app.reset_fetch_schedule().await;
+        let _ = app.refresh_if_needed().await;
+        assert_eq!(probes.load(Ordering::Relaxed), 3);
+        app.reset_fetch_schedule().await;
+        assert_eq!(app.refresh_if_needed().await, fetch::CHECK_INTERVAL);
+        assert_eq!(probes.load(Ordering::Relaxed), 7);
+        assert_eq!(
+            app.turn_state.lock().await.peek_for_model("a").as_deref(),
+            Some(fresh.as_str())
+        );
+        app.turn_state.lock().await.invalidate_all();
+        app.reset_fetch_schedule().await;
+        assert_eq!(app.refresh_if_needed().await, fetch::CHECK_INTERVAL);
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            8,
+            "successful capture must reset burst to 1"
+        );
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
