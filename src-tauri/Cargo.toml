@@ -1,6 +1,6 @@
 [package]
 name = "codex-state-kit-desktop"
-version = "0.0.7"
+version = "0.0.8"
 description = "Desktop manager for the Codex reverse proxy"
 edition = "2021"
 rust-version = "1.85"
