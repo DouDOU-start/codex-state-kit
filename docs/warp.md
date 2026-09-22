@@ -39,7 +39,7 @@ socks5h://user:password@proxy.example.com:1080
 socks5://xmtt1126849-region-DE-sid-{session}-t-120:password@us.arxlabs.io:3010
 ```
 
-Kit 每次打票都会生成新的 session。拿到稳定 292 后，把该 session 绑在票据上，同网策略下的业务请求继续走同一条出口，直到票据过期、312 失效或你改了代理地址。日志和状态只显示 session，不会回显密码。
+Kit 每次打票都会生成新的 session。拿到稳定 292 后，把该 session 绑在票据上，同网策略下的业务请求继续走同一条出口，直到票据过期或你改了代理地址。日志和状态只显示 session，不会回显密码。
 
 切换到 WARP 会保留手动地址。旧配置已设置代理时继续使用原模式；没有代理且未保存模式的旧配置迁移为 WARP。
 

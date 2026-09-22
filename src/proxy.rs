@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, Version};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde::Serialize;
+use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -17,6 +18,8 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::attach::{self, is_attached};
+use crate::chatgpt_cookies::{self, RoutingCookie};
+use crate::diag;
 use crate::fetch;
 use crate::login::{self, has_chatgpt_login};
 use crate::logs::{self, LogEntry, NetworkLogDetails, StreamLifecycle};
@@ -29,6 +32,28 @@ use crate::settings::{
 };
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
 use crate::warp::{WarpRuntime, WarpStatus};
+
+const TOKEN_FETCH_PAUSED_MESSAGE: &str = "已暂停获取 Token";
+const TOKEN_MANUAL_REFRESH_MESSAGE: &str = "正在重新获取 Token…";
+/// 已有数据块后，上游再静默这么久就切断，让 Codex 能报错重试。
+const SSE_IDLE_AFTER_CHUNK: Duration = Duration::from_secs(90);
+/// 响应头已到但还没有任何正文时，多等一会儿，避免误杀长思考。
+const SSE_IDLE_BEFORE_CHUNK: Duration = Duration::from_secs(180);
+const SSE_IDLE_TIMEOUT_EVENT: &[u8] = b"data: {\"type\":\"response.incomplete\"}\n\n";
+
+fn business_stream_idle_timeout(chunks: u64) -> Duration {
+    #[cfg(test)]
+    if let Ok(ms) = std::env::var("CSK_SSE_IDLE_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            return Duration::from_millis(ms.max(1));
+        }
+    }
+    if chunks == 0 {
+        SSE_IDLE_BEFORE_CHUNK
+    } else {
+        SSE_IDLE_AFTER_CHUNK
+    }
+}
 
 fn debug_log(msg: &str) {
     eprintln!("{}", msg);
@@ -128,8 +153,16 @@ fn capture_fetched_ticket(
     token: &str,
     proxy_session: Option<&str>,
     previous_response_id: Option<&str>,
+    routing_cookies: &[RoutingCookie],
 ) -> bool {
-    if !store.capture_with_session(model, token, "fetch", proxy_session, previous_response_id) {
+    if !store.capture_with_session(
+        model,
+        token,
+        "fetch",
+        proxy_session,
+        previous_response_id,
+        routing_cookies,
+    ) {
         return false;
     }
     token.trim().len() == store.bound_len_for(model)
@@ -187,6 +220,10 @@ pub struct Status {
     pub network_route_policy: NetworkRoutePolicy,
     pub forced_model: String,
     pub configured_models: Vec<String>,
+    pub token_fetch_paused: bool,
+    pub token_max_age_mins: u32,
+    pub token_prefetch_age_mins: u32,
+    pub diag_log_path: String,
 }
 
 pub struct App {
@@ -217,6 +254,8 @@ pub struct App {
     model_notify: Notify,
     /// 是否已注册 settings.models 中的种子模型
     seeds_registered: AtomicBool,
+    #[cfg(test)]
+    oauth_token_url: std::sync::Mutex<Option<String>>,
 }
 
 /// Callers hold fetch_transition while this guard is alive. Dropping a request
@@ -247,6 +286,7 @@ impl App {
         let http = business_http_client(&resolved_business_proxy(&settings, &warp), None)?;
         let mut turn_state = TurnStateStore::load();
         turn_state.set_reuse_policy(settings.token_reuse_policy);
+        turn_state.set_lifetime(turn_state::MAX_AGE_SECS, turn_state::PREFETCH_AGE_SECS);
         Ok(Self {
             warp,
             settings: Mutex::new(settings),
@@ -273,7 +313,69 @@ impl App {
             warp_wake: Notify::new(),
             model_notify: Notify::new(),
             seeds_registered: AtomicBool::new(false),
+            #[cfg(test)]
+            oauth_token_url: std::sync::Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_oauth_token_url(&self, url: impl Into<String>) {
+        *self.oauth_token_url.lock().expect("oauth url") = Some(url.into());
+    }
+
+    fn oauth_refresh_url(&self) -> Option<String> {
+        #[cfg(test)]
+        {
+            return self.oauth_token_url.lock().expect("oauth url").clone();
+        }
+        #[cfg(not(test))]
+        Some(login::oauth_token_endpoint().to_string())
+    }
+
+    async fn refresh_credentials_for_fetch(
+        &self,
+        settings: &Settings,
+        model: &str,
+    ) -> std::result::Result<login::ChatGptCredentials, FetchOnceError> {
+        let home = Path::new(&settings.codex_home);
+        let creds = match login::chatgpt_credentials(home) {
+            Ok(creds) => creds,
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.defer_fetch_failure(model, FetchRetryClass::Auth)
+                    .await;
+                *self.fetch_error.lock().await = Some(message.clone());
+                return Err(FetchOnceError::new(message, FetchRetryClass::Auth));
+            }
+        };
+        // 写死禁用：打票前不再用 RT 换新 AT/RT，直接用当前登录文件里的凭证。
+        const REFRESH_CREDENTIALS_BEFORE_FETCH: bool = false;
+        if !REFRESH_CREDENTIALS_BEFORE_FETCH || !creds.refreshable {
+            return Ok(creds);
+        }
+        let Some(token_url) = self.oauth_refresh_url() else {
+            return Ok(creds);
+        };
+        let client = match login::token_import_http_client() {
+            Ok(client) => client,
+            Err(err) => {
+                let message = format!("[{model}] 打票前刷新登录凭证失败: {err:#}");
+                self.defer_fetch_failure(model, FetchRetryClass::Auth)
+                    .await;
+                *self.fetch_error.lock().await = Some(message.clone());
+                return Err(FetchOnceError::new(message, FetchRetryClass::Auth));
+            }
+        };
+        match login::refresh_session_credentials(home, &client, &token_url).await {
+            Ok(creds) => Ok(creds),
+            Err(err) => {
+                let message = format!("[{model}] 打票前刷新登录凭证失败: {err:#}");
+                self.defer_fetch_failure(model, FetchRetryClass::Auth)
+                    .await;
+                *self.fetch_error.lock().await = Some(message.clone());
+                Err(FetchOnceError::new(message, FetchRetryClass::Auth))
+            }
+        }
     }
 
     async fn sync_request_identity(
@@ -325,45 +427,11 @@ impl App {
         let _ = self.sync_request_identity(Path::new(&home)).await;
     }
 
-    async fn handle_degraded_response(
-        &self,
-        model: &str,
-        creds: &login::ChatGptCredentials,
-        request_account_matches: bool,
-        injected_token: Option<&str>,
-    ) -> bool {
-        let Some(injected_token) = injected_token.map(str::trim).filter(|value| !value.is_empty())
-        else {
-            return false;
-        };
-        let mut shared = false;
-        let invalidated = {
-            let mut store = self.turn_state.lock().await;
-            let current_matches = store.peek_for_model(model).as_deref() == Some(injected_token);
-            if request_account_matches
-                && current_matches
-                && store.is_bound_to_account(&creds.account_id)
-            {
-                shared = store.shares_292_for(model);
-                store.invalidate_model(model);
-                true
-            } else {
-                false
-            }
-        };
-        if invalidated {
-            if shared {
-                self.fetch_model_next_allowed_at.lock().await.clear();
-            } else {
-                self.clear_model_fetch_delay(model).await;
-            }
-            let scope = if shared { "共享 292 票据" } else { "该模型票据" };
-            *self.fetch_error.lock().await =
-                Some(format!("[{model}] 业务响应返回 312，已清除{scope}并重新获取"));
-            self.model_notify.notify_one();
-            debug_log(&format!("[degraded] [{model}] 业务响应返回 312，清除{scope}并唤醒获取"));
-        }
-        invalidated
+    /// 业务回 312 只表示这张响应不合格，不覆盖、不清除池里仍在 240 秒窗口内的凭据包。
+    fn note_degraded_business_response(&self, model: &str) {
+        debug_log(&format!(
+            "[degraded] [{model}] 业务响应返回 312，保留当前凭据包"
+        ));
     }
 
     pub async fn status(&self) -> Status {
@@ -410,11 +478,20 @@ impl App {
             network_route_policy: settings.network_route_policy,
             forced_model: settings.forced_model,
             configured_models: settings.models,
+            token_fetch_paused: settings.token_fetch_paused,
+            token_max_age_mins: settings.token_max_age_mins,
+            token_prefetch_age_mins: settings.token_prefetch_age_mins,
+            diag_log_path: diag::path().display().to_string(),
         }
     }
 
     pub async fn refresh_turn_state(&self) -> Result<Status> {
         self.sync_logged_in_account().await;
+        // A click is a one-shot probe: drop cooldown and ignore the pause flag
+        // used by the background loop. fetch_once already skips only_if_needed.
+        self.reset_fetch_schedule().await;
+        *self.fetch_error.lock().await = Some(TOKEN_MANUAL_REFRESH_MESSAGE.into());
+        self.fetch_change_notify.notify_waiters();
         let settings = self.settings.lock().await.clone();
         let mut models = settings.models.clone();
         if models.is_empty() {
@@ -460,6 +537,13 @@ impl App {
                 return Err(err.into());
             }
         }
+        {
+            let mut error = self.fetch_error.lock().await;
+            if error.as_deref() == Some(TOKEN_MANUAL_REFRESH_MESSAGE) {
+                *error = None;
+            }
+        }
+        self.fetch_change_notify.notify_waiters();
         Ok(self.status().await)
     }
 
@@ -626,6 +710,12 @@ impl App {
                 FetchRetryClass::Normal,
             ));
         }
+        if only_if_needed && self.settings.lock().await.token_fetch_paused {
+            return Err(FetchOnceError::new(
+                TOKEN_FETCH_PAUSED_MESSAGE,
+                FetchRetryClass::Deferred,
+            ));
+        }
         let model_wait = self.model_fetch_wait(model).await;
         if !model_wait.is_zero() {
             return Err(FetchOnceError::new(
@@ -687,10 +777,28 @@ impl App {
                 }
             }
         }
+        let creds = self.refresh_credentials_for_fetch(&settings, model).await?;
+        if !self
+            .turn_state
+            .lock()
+            .await
+            .is_bound_to_account(&creds.account_id)
+        {
+            return Err(FetchOnceError::new(
+                format!("[{model}] 登录账号与票据池绑定账号不一致"),
+                FetchRetryClass::Stale,
+            ));
+        }
         for attempt in 1..=fetch::CONNECT_ATTEMPTS {
             if !self.wait_for_fetch_slot(generation).await {
                 let message = format!("[{model}] 配置已变化，取消旧线路票据请求");
                 return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
+            }
+            if only_if_needed && self.settings.lock().await.token_fetch_paused {
+                return Err(FetchOnceError::new(
+                    TOKEN_FETCH_PAUSED_MESSAGE,
+                    FetchRetryClass::Deferred,
+                ));
             }
             if !fetch_account_is_current(&settings, &creds.account_id) {
                 return Err(FetchOnceError::new(format!("[{model}] 登录账号已变化，取消旧账号票据请求"), FetchRetryClass::Stale));
@@ -720,13 +828,15 @@ impl App {
             };
             let started = Instant::now();
             let mut details = NetworkLogDetails::default();
-            let result = fetch::fetch_turn_state_with_log(
+            let request_cookies = self.turn_state.lock().await.bound_routing_cookies();
+            let result = fetch::fetch_turn_state_with_cookies(
                 &client,
                 &fetch_settings,
                 &creds,
                 model,
                 target_len,
                 allow_auto_quality,
+                &request_cookies,
                 &mut details,
             )
             .await;
@@ -766,6 +876,7 @@ impl App {
                                 &token,
                                 probe_session.as_deref(),
                                 fetched.previous_response_id.as_deref(),
+                                &fetched.routing_cookies,
                             ))
                         }
                     };
@@ -775,7 +886,7 @@ impl App {
                         let message = format!("[{model}] 配置已变化，丢弃旧线路返回的票据");
                         return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
                     };
-                    self.defer_next_fetch(fetch::RETRY_INTERVAL).await;
+                    self.defer_next_fetch(fetch::CHECK_INTERVAL).await;
                     if !ready {
                         self.defer_fetch_failure(model, FetchRetryClass::Normal)
                             .await;
@@ -789,6 +900,8 @@ impl App {
                         return Err(FetchOnceError::new(message, FetchRetryClass::Normal));
                     }
                     details.turn_state_action = "captured".into();
+                    details.token_fp = Some(diag::token_fp(&token));
+                    details.cookie_names = chatgpt_cookies::cookie_names(&fetched.routing_cookies);
                     self.record_fetch(started, details).await;
                     if let Err(err) = self.refresh_business_http().await {
                         eprintln!("[{model}] 绑定出口 session 后刷新业务代理失败: {err:#}");
@@ -840,6 +953,10 @@ impl App {
 
     async fn refresh_if_needed(&self) -> Duration {
         let saved = self.settings.lock().await.clone();
+        if saved.token_fetch_paused {
+            *self.fetch_error.lock().await = Some(TOKEN_FETCH_PAUSED_MESSAGE.into());
+            return fetch::CHECK_INTERVAL;
+        }
         let settings = match self.fetch_settings(&saved) {
             Ok(settings) => settings,
             Err(err) => {
@@ -947,6 +1064,38 @@ impl App {
         started: Instant,
         details: NetworkLogDetails,
     ) {
+        if let Some(req) = &details.diag {
+            diag::emit(
+                "finish",
+                Some(req),
+                json!({
+                    "status": status,
+                    "error": details.error_kind,
+                    "headerMs": details.response_header_ms,
+                    "peer": details.peer_addr,
+                    "http": details.http_version,
+                }),
+            );
+        } else if details.flow == "token_fetch" {
+            diag::emit(
+                "token_fetch",
+                None,
+                json!({
+                    "action": details.turn_state_action,
+                    "model": details.model,
+                    "session": details.proxy_session,
+                    "status": details.response_status.unwrap_or(status),
+                    "returnedStateLen": details.returned_turn_state_len,
+                    "routeKind": details.route_kind,
+                    "peer": details.peer_addr,
+                    "http": details.http_version,
+                    "headerMs": details.response_header_ms,
+                    "error": details.error_kind,
+                    "tokenFp": details.token_fp,
+                    "cookies": details.cookie_names,
+                }),
+            );
+        }
         let entry = LogEntry::new(method, path, status, started, details);
         let mut logs = self.logs.lock().await;
         logs::push(&mut logs, entry);
@@ -1203,7 +1352,9 @@ impl ProxyHandle {
         {
             let mut settings = self.app.settings.lock().await;
             *settings = next.clone();
-            self.app.turn_state.lock().await.set_reuse_policy(next.token_reuse_policy);
+            let mut store = self.app.turn_state.lock().await;
+            store.set_reuse_policy(next.token_reuse_policy);
+            store.set_lifetime(turn_state::MAX_AGE_SECS, turn_state::PREFETCH_AGE_SECS);
             if let Some(http) = next_http {
                 *self.app.http.lock().await = http;
             }
@@ -1235,6 +1386,22 @@ impl ProxyHandle {
             }
         } else if fetch_changed {
             self.start_fetch_loop().await;
+        }
+        if old.token_fetch_paused != next.token_fetch_paused {
+            self.app.fetch_change_notify.notify_waiters();
+            self.app.model_notify.notify_one();
+            if next.token_fetch_paused {
+                *self.app.fetch_error.lock().await = Some(TOKEN_FETCH_PAUSED_MESSAGE.into());
+            } else if self.app.fetch_error.lock().await.as_deref() == Some(TOKEN_FETCH_PAUSED_MESSAGE)
+            {
+                *self.app.fetch_error.lock().await = None;
+            }
+        }
+        if old.token_max_age_mins != next.token_max_age_mins
+            || old.token_prefetch_age_mins != next.token_prefetch_age_mins
+        {
+            self.app.fetch_change_notify.notify_waiters();
+            self.app.model_notify.notify_one();
         }
         if old.forced_model != next.forced_model {
             if let Some(model) = next.forced_model() {
@@ -1414,6 +1581,21 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok());
             let lifecycle = details.stream_lifecycle.clone();
+            let diag_req = details.diag.clone();
+            if let Some(req) = &diag_req {
+                diag::emit(
+                    "headers",
+                    Some(req),
+                    json!({
+                        "status": resp.status().as_u16(),
+                        "headerMs": details.response_header_ms,
+                        "peer": details.peer_addr,
+                        "http": details.http_version,
+                        "returnedStateLen": details.returned_turn_state_len,
+                        "transport": details.transport,
+                    }),
+                );
+            }
             let entry = LogEntry::new(
                 method.as_str(),
                 &path,
@@ -1431,6 +1613,10 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 remaining_bytes,
                 activity,
                 lifecycle,
+                diag: diag_req,
+                diag_first_token: false,
+                diag_finished: false,
+                last_diag_chunks: 0,
             };
             let (parts, body) = resp.into_parts();
             let stream = futures_util::stream::unfold(
@@ -1439,7 +1625,37 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                     if tracker.finished {
                         return None;
                     }
-                    let next = stream.next().await;
+                    let chunks = tracker
+                        .lifecycle
+                        .as_ref()
+                        .map(|lifecycle| lifecycle.snapshot().stream_chunks)
+                        .unwrap_or(0);
+                    let next = match tokio::time::timeout(business_stream_idle_timeout(chunks), stream.next())
+                        .await
+                    {
+                        Ok(next) => next,
+                        Err(_) => {
+                            if let Some(lifecycle) = &tracker.lifecycle {
+                                lifecycle.error();
+                            }
+                            tracker.entry.error_kind = Some("stream_idle".into());
+                            tracker.finished = true;
+                            if is_sse {
+                                let idle = Bytes::from_static(SSE_IDLE_TIMEOUT_EVENT);
+                                tracker.metrics.observe(
+                                    idle.as_ref(),
+                                    tracker.started.elapsed().as_millis(),
+                                    true,
+                                );
+                                Some(Ok(idle))
+                            } else {
+                                Some(Err(axum::Error::new(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "上游响应静默超时",
+                                ))))
+                            }
+                        }
+                    };
                     match &next {
                         Some(Ok(bytes)) => {
                             if let Some(lifecycle) = &tracker.lifecycle {
@@ -1496,6 +1712,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                         tracker.refresh();
                         tracker.publish().await;
                     }
+                    tracker.emit_diag_progress();
                     next.map(|item| (item, (stream, tracker)))
                 },
             );
@@ -1526,6 +1743,10 @@ struct ResponseLogTracker {
     remaining_bytes: Option<u64>,
     activity: Option<RequestActivity>,
     lifecycle: Option<Arc<StreamLifecycle>>,
+    diag: Option<diag::Request>,
+    diag_first_token: bool,
+    diag_finished: bool,
+    last_diag_chunks: u64,
 }
 
 impl ResponseLogTracker {
@@ -1553,6 +1774,63 @@ impl ResponseLogTracker {
 
     async fn publish(&self) {
         replace_network_log(&self.app, self.entry.clone()).await;
+    }
+
+    fn emit_diag_progress(&mut self) {
+        if self.diag.is_none() {
+            return;
+        }
+        if !self.diag_first_token && self.metrics.first_token_ms().is_some() {
+            self.diag_first_token = true;
+            self.emit_diag("first_token");
+        }
+        let chunks = self
+            .lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.snapshot().stream_chunks)
+            .unwrap_or(self.entry.stream_chunks);
+        if chunks > 0
+            && chunks != self.last_diag_chunks
+            && (chunks <= 8 || chunks % 20 == 0)
+        {
+            self.last_diag_chunks = chunks;
+            self.emit_diag("chunk");
+        }
+        if self.finished && !self.diag_finished {
+            self.diag_finished = true;
+            self.emit_diag("finish");
+        }
+    }
+
+    fn emit_diag(&self, stage: &str) {
+        let Some(req) = &self.diag else {
+            return;
+        };
+        let stream = self
+            .lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.snapshot());
+        diag::emit(
+            stage,
+            Some(req),
+            json!({
+                "status": self.entry.status,
+                "streamState": stream.as_ref().map(|snapshot| snapshot.state).unwrap_or("not_tracked"),
+                "chunks": stream.as_ref().map(|snapshot| snapshot.stream_chunks).unwrap_or(self.entry.stream_chunks),
+                "bytes": stream.as_ref().map(|snapshot| snapshot.stream_bytes).unwrap_or(self.entry.stream_bytes),
+                "firstTokenMs": self.entry.first_token_ms,
+                "firstChunkMs": stream.as_ref().and_then(|snapshot| snapshot.first_chunk_ms),
+                "lastChunkMs": stream.as_ref().and_then(|snapshot| snapshot.last_chunk_ms),
+                "currentIdleMs": stream.as_ref().and_then(|snapshot| snapshot.current_idle_ms),
+                "maxIdleMs": stream.as_ref().and_then(|snapshot| snapshot.max_idle_ms),
+                "error": self.entry.error_kind,
+                "events": self.metrics.sse_event_summary(),
+                "inProgress": !self.finished,
+                "peer": self.entry.peer_addr,
+                "http": self.entry.http_version,
+                "returnedStateLen": self.entry.returned_turn_state_len,
+            }),
+        );
     }
 }
 
@@ -1585,6 +1863,10 @@ impl Drop for ResponseLogTracker {
             }
             self.finished = true;
             self.refresh();
+        }
+        if !self.diag_finished {
+            self.diag_finished = true;
+            self.emit_diag("finish");
         }
         // A disconnected client drops the body without polling EOF. Preserve that
         // partial request too, without continuing to read the upstream response.
@@ -1723,6 +2005,9 @@ async fn wait_for_request_state(
                 }
             }
         }
+        if current.token_fetch_paused {
+            return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_fetch_paused", "已暂停获取 Token，当前没有可用凭证；请求未转发"));
+        }
         // Poll also observes login files changed outside Kit. No locks are held
         // while sleeping and no task is spawned that could outlive the client.
         tokio::select! {
@@ -1842,6 +2127,8 @@ async fn forward_http_tracked(
     let request_model = should_stamp
         .then(|| turn_state::extract_model_from_body(&bytes))
         .flatten();
+    let same_turn = should_stamp && turn_state::is_same_turn_follow_up(&bytes);
+    let mut client_had_state = false;
     let mut injected_token: Option<String> = None;
     if should_stamp {
         details.model = request_model
@@ -1875,6 +2162,7 @@ async fn forward_http_tracked(
 
         let client_already_has = turn_state::has_http_turn_state(&parts.headers)
             || turn_state::has_body_turn_state(&bytes);
+        client_had_state = client_already_has;
         if state_miss_policy == StateMissPolicy::StripAll {
             parts.headers.remove(turn_state::HEADER_NAME);
             details.turn_state_action = "removed_all_policy".into();
@@ -1910,28 +2198,42 @@ async fn forward_http_tracked(
             }
             if let Some(token) = token {
                 turn_state::apply_http_header(&mut parts.headers, &token);
-                match turn_state::wrap_as_second_packet(&bytes, content_encoding.as_deref(), &token)
-                {
-                    Ok(wrapped) => {
-                        bytes = wrapped.into();
-                        details.body_bytes = bytes.len();
-                    }
-                    Err(err) => {
-                        eprintln!("[stamp] 包装同轮第二包失败，仅写入请求头: {err}");
+                // 同轮续跑且客户端已自带 State：只换请求头，不改 body，
+                // 避免去掉 previous_response_id、也不把请求改写成探针第二包。
+                let header_only = same_turn && client_already_has;
+                if !header_only {
+                    match turn_state::wrap_as_second_packet(&bytes, content_encoding.as_deref(), &token)
+                    {
+                        Ok(wrapped) => {
+                            bytes = wrapped.into();
+                            details.body_bytes = bytes.len();
+                        }
+                        Err(err) => {
+                            eprintln!("[stamp] 包装同轮第二包失败，仅写入请求头: {err}");
+                        }
                     }
                 }
-                details.turn_state_action = match (client_already_has, waited) {
-                    (true, true) => "replaced_after_wait".into(),
-                    (true, false) => "replaced".into(),
-                    (false, true) => "injected_after_wait".into(),
-                    (false, false) => "injected".into(),
+                details.turn_state_action = match (client_already_has, waited, header_only) {
+                    (true, true, true) => "header_only_after_wait".into(),
+                    (true, false, true) => "header_only".into(),
+                    (true, true, false) => "replaced_after_wait".into(),
+                    (true, false, false) => "replaced".into(),
+                    (false, true, _) => "injected_after_wait".into(),
+                    (false, false, _) => "injected".into(),
                 };
                 details.turn_state_len = Some(token.len());
                 eprintln!(
-                    "[stamp] {} turn_state → token len={} model={:?} 到 {} {}",
-                    if client_already_has { "替换" } else { "补上" },
+                    "[stamp] {} turn_state → token len={} model={:?} body={} 到 {} {}",
+                    if header_only {
+                        "只改请求头"
+                    } else if client_already_has {
+                        "替换"
+                    } else {
+                        "补上"
+                    },
                     token.len(),
                     request_model,
+                    if header_only { "原样" } else { "包装第二包" },
                     parts.method,
                     path
                 );
@@ -1976,11 +2278,52 @@ async fn forward_http_tracked(
             details.turn_state_action = "removed_all_policy".into();
         }
     }
-    let bound_session = {
+    let (bound_session, routing_cookies) = {
         let store = app.turn_state.lock().await;
-        store.proxy_session_for_token(injected_token.as_deref())
+        (
+            store.proxy_session_for_token(injected_token.as_deref()),
+            injected_token
+                .as_deref()
+                .map(|token| store.routing_cookies_for_token(Some(token)))
+                .unwrap_or_default(),
+        )
     };
     details.proxy_session = bound_session.clone();
+    details.diag = Some(diag::Request {
+        id: diag::next_id(),
+        flow: details.flow.clone(),
+        model: details.model.clone(),
+        same_turn,
+        client_had_state,
+        token_fp: injected_token.as_deref().map(diag::token_fp),
+        token_age_secs: injected_token.as_deref().and_then(diag::token_age_secs),
+        cookies: chatgpt_cookies::cookie_names(&routing_cookies),
+        turn_state_action: details.turn_state_action.clone(),
+        route_kind: details.route_kind.clone(),
+        proxy_session: bound_session.clone(),
+    });
+    if let Some(req) = &details.diag {
+        diag::emit(
+            "request",
+            Some(req),
+            json!({
+                "method": parts.method.as_str(),
+                "path": path,
+                "bodyBytes": details.body_bytes,
+                "injectedLen": injected_token.as_ref().map(|token| token.len()),
+            }),
+        );
+    }
+    if injected_token.is_some() {
+        let chatgpt_host = chatgpt_cookies::is_chatgpt_https_url(&target);
+        if !routing_cookies.is_empty() || chatgpt_host {
+            chatgpt_cookies::apply_to_headers(&mut parts.headers, &routing_cookies, chatgpt_host);
+            let names = chatgpt_cookies::cookie_names(&routing_cookies);
+            if !names.is_empty() {
+                debug_log(&format!("[stamp] 回放线路 cookie {}", names.join(",")));
+            }
+        }
+    }
     let http = if fetch::has_session_placeholder(&upstream_proxy) {
         let resolved = fetch::apply_bound_session(&upstream_proxy, bound_session.as_deref())?;
         details.proxy_endpoint = Some(logs::endpoint_origin(&resolved));
@@ -2050,17 +2393,10 @@ async fn forward_http_tracked(
     // 记录上游响应详情，方便排查 token 失效
     let upstream_turn_state = turn_state::header_token(upstream_resp.headers());
     details.returned_turn_state_len = upstream_turn_state.as_ref().map(|token| token.len());
-    if let (Some(model), Some((creds, _))) = (
-        degraded_response_model(request_model.as_deref(), upstream_turn_state.as_deref()),
-        request_identity.as_ref(),
-    ) {
-        app.handle_degraded_response(
-            model,
-            creds,
-            request_account_matches,
-            injected_token.as_deref(),
-        )
-        .await;
+    if let Some(model) =
+        degraded_response_model(request_model.as_deref(), upstream_turn_state.as_deref())
+    {
+        app.note_degraded_business_response(model);
     }
     let injected_len = injected_token.as_ref().map(|t| t.len());
     let upstream_ts_len = upstream_turn_state.as_ref().map(|t| t.len());
@@ -2321,27 +2657,21 @@ mod tests {
             store.register_model("gpt-6-astra");
             assert!(store.capture("gpt-6-astra", &current_ticket, "test"));
         }
-        assert!(!app
-            .handle_degraded_response("gpt-6-astra", &creds, true, None)
-            .await);
-        assert!(!app
-            .handle_degraded_response("gpt-6-astra", &creds, true, Some("stale-ticket"))
-            .await);
         assert!(app
             .turn_state
             .lock()
             .await
             .peek_for_model("gpt-6-astra")
-            .is_some());
-        assert!(app
-            .handle_degraded_response("gpt-6-astra", &creds, true, Some(&current_ticket))
-            .await);
+            .as_deref()
+            == Some(current_ticket.as_str()));
+        app.note_degraded_business_response("gpt-6-astra");
         assert!(app
             .turn_state
             .lock()
             .await
             .peek_for_model("gpt-6-astra")
-            .is_none());
+            .as_deref()
+            == Some(current_ticket.as_str()));
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2473,20 +2803,20 @@ mod tests {
         let mut store = TurnStateStore::default();
         store.set_model_bound_len("astra", Some(turn_state::QUALITY_TOKEN_LEN));
         let original_292 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
-        assert!(capture_fetched_ticket(&mut store, "astra", &original_292, None, None));
+        assert!(capture_fetched_ticket(&mut store, "astra", &original_292, None, None, &[]));
         let token_332 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN_332);
-        assert!(!capture_fetched_ticket(&mut store, "astra", &token_332, None, None));
+        assert!(!capture_fetched_ticket(&mut store, "astra", &token_332, None, None, &[]));
         assert_eq!(
             store.peek_for_model("astra").as_deref(),
             Some(original_292.as_str())
         );
 
         let token_292 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
-        assert!(capture_fetched_ticket(&mut store, "astra", &token_292, None, None));
+        assert!(capture_fetched_ticket(&mut store, "astra", &token_292, None, None, &[]));
         assert_eq!(store.peek_for_model("astra").as_deref(), Some(token_292.as_str()));
 
         let mut auto = TurnStateStore::default();
-        assert!(capture_fetched_ticket(&mut auto, "astra", &token_332, None, None));
+        assert!(capture_fetched_ticket(&mut auto, "astra", &token_332, None, None, &[]));
         assert_eq!(auto.bound_len_for("astra"), turn_state::QUALITY_TOKEN_LEN_332);
     }
 
@@ -2531,6 +2861,358 @@ mod tests {
             .contains("-sid-1Z5jzVPs-t-120"));
         assert!(business_http_client(&template, None).is_ok());
         assert!(business_http_client(&template, Some("1Z5jzVPs")).is_ok());
+    }
+
+    fn test_login_jwt(account: &str, email: &str) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({ "chatgpt_account_id": account, "email": email }).to_string(),
+        );
+        format!("{header}.{payload}.sig")
+    }
+
+    #[tokio::test]
+    async fn fetch_once_does_not_refresh_login_before_probing_state() {
+        if std::env::var_os("CSK_FETCH_REFRESH_TEST_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "proxy::tests::fetch_once_does_not_refresh_login_before_probing_state",
+                    "--nocapture",
+                ])
+                .env("CSK_FETCH_REFRESH_TEST_CHILD", "1")
+                .env("HOME", dir.path())
+                .env("USERPROFILE", dir.path())
+                .env("APPDATA", dir.path())
+                .env("LOCALAPPDATA", dir.path())
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("ALL_PROXY")
+                .env_remove("http_proxy")
+                .env_remove("https_proxy")
+                .env_remove("all_proxy")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let old_access = test_login_jwt("probe-acct", "old@example.com");
+        let new_access = test_login_jwt("probe-acct", "new@example.com");
+        std::fs::write(
+            login::kit_auth_path(home.path()),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": old_access,
+                    "access_token": old_access,
+                    "refresh_token": "probe-refresh",
+                    "account_id": "probe-acct"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (oauth_send, mut oauth_requests) = tokio::sync::mpsc::channel::<serde_json::Value>(2);
+        let oauth_access = new_access.clone();
+        let oauth_app = axum::Router::new().route(
+            "/oauth/token",
+            axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let oauth_send = oauth_send.clone();
+                let oauth_access = oauth_access.clone();
+                async move {
+                    oauth_send.send(payload).await.unwrap();
+                    axum::Json(serde_json::json!({
+                        "access_token": oauth_access,
+                        "refresh_token": "rotated-probe-refresh"
+                    }))
+                }
+            }),
+        );
+        let oauth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oauth_url = format!("http://{}/oauth/token", oauth_listener.local_addr().unwrap());
+        let oauth_server = tokio::spawn(async move {
+            axum::serve(oauth_listener, oauth_app).await.unwrap();
+        });
+
+        let fresh = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
+        let (probe_send, mut probe_headers) = tokio::sync::mpsc::unbounded_channel::<HeaderMap>();
+        let reply_token = fresh.clone();
+        let probe_app = axum::Router::new().fallback(move |headers: HeaderMap| {
+            let probe_send = probe_send.clone();
+            let token = reply_token.clone();
+            async move {
+                probe_send.send(headers).unwrap();
+                Response::builder()
+                    .header(turn_state::HEADER_NAME, token)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        });
+        let probe_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", probe_listener.local_addr().unwrap());
+        let probe_server = tokio::spawn(async move {
+            axum::serve(probe_listener, probe_app).await.unwrap();
+        });
+
+        let app = App::new(Settings {
+            upstream: endpoint.clone(),
+            outbound_proxy: endpoint,
+            outbound_mode: OutboundMode::Manual,
+            codex_home: home.path().display().to_string(),
+            models: vec!["gpt-6-astra".into()],
+            ..Settings::default()
+        })
+        .unwrap();
+        app.set_oauth_token_url(oauth_url);
+        app.sync_logged_in_account().await;
+        let token = app.fetch_once("gpt-6-astra").await.unwrap();
+        assert_eq!(token, fresh);
+
+        assert!(oauth_requests.try_recv().is_err());
+        let headers = probe_headers.recv().await.unwrap();
+        assert_eq!(
+            headers[header::AUTHORIZATION],
+            format!("Bearer {old_access}")
+        );
+
+        let kit: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(login::kit_auth_path(home.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kit["tokens"]["access_token"], old_access);
+        assert_eq!(kit["tokens"]["refresh_token"], "probe-refresh");
+
+        let cached = app.fetch_once_inner("gpt-6-astra", true).await.unwrap();
+        assert_eq!(cached, fresh);
+        assert!(oauth_requests.try_recv().is_err());
+
+        oauth_server.abort();
+        probe_server.abort();
+    }
+
+    #[tokio::test]
+    async fn injected_ticket_replays_routing_cookies_and_drops_session() {
+        if std::env::var_os("CSK_COOKIE_TEST_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "proxy::tests::injected_ticket_replays_routing_cookies_and_drops_session",
+                    "--nocapture",
+                ])
+                .env("CSK_COOKIE_TEST_CHILD", "1")
+                .env("HOME", dir.path())
+                .env("USERPROFILE", dir.path())
+                .env("APPDATA", dir.path())
+                .env("LOCALAPPDATA", dir.path())
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("ALL_PROXY")
+                .env_remove("http_proxy")
+                .env_remove("https_proxy")
+                .env_remove("all_proxy")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            login::kit_auth_path(home.path()),
+            serde_json::json!({
+                "auth_mode":"chatgpt",
+                "tokens":{
+                    "access_token":"cookie-access",
+                    "refresh_token":"cookie-refresh",
+                    "account_id":"account-a"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<HeaderMap>();
+        let upstream = axum::Router::new().fallback(move |headers: HeaderMap| {
+            let sent = sent.clone();
+            async move {
+                sent.send(headers).unwrap();
+                "ok"
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = Arc::new(
+            App::new(Settings {
+                token_reuse_policy: TokenReusePolicy::PerModel,
+                network_route_policy: NetworkRoutePolicy::Separate,
+                upstream: format!("http://{}", listener.local_addr().unwrap()),
+                codex_home: home.path().display().to_string(),
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        app.sync_logged_in_account().await;
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let fresh = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
+        assert!(app.turn_state.lock().await.capture_with_session(
+            "policy-model",
+            &fresh,
+            "test",
+            None,
+            None,
+            &[RoutingCookie {
+                name: "__oailb".into(),
+                value: "route1".into(),
+                expires_unix: None,
+            }],
+        ));
+        let response = proxy_http(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header("chatgpt-account-id", "account-a")
+                .header(header::COOKIE, "session=old; chatgpt_session=nope")
+                .body(Body::from(r#"{"model":"policy-model"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let headers = received.recv().await.unwrap();
+        let cookie = headers[header::COOKIE].to_str().unwrap();
+        assert!(cookie.contains("__oailb=route1"));
+        assert!(!cookie.contains("session"));
+        assert_eq!(headers[turn_state::HEADER_NAME], fresh);
+        server.abort();
+    }
+
+    #[test]
+    fn idle_timeout_is_longer_before_the_first_chunk() {
+        assert_eq!(business_stream_idle_timeout(0), Duration::from_secs(180));
+        assert_eq!(business_stream_idle_timeout(2), Duration::from_secs(90));
+    }
+
+    #[tokio::test]
+    async fn idle_sse_stream_is_cut_so_the_client_can_retry() {
+        if std::env::var_os("CSK_IDLE_STREAM_TEST_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "proxy::tests::idle_sse_stream_is_cut_so_the_client_can_retry",
+                    "--nocapture",
+                ])
+                .env("CSK_IDLE_STREAM_TEST_CHILD", "1")
+                .env("CSK_SSE_IDLE_MS", "80")
+                .env("HOME", dir.path())
+                .env("USERPROFILE", dir.path())
+                .env("APPDATA", dir.path())
+                .env("LOCALAPPDATA", dir.path())
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("ALL_PROXY")
+                .env_remove("http_proxy")
+                .env_remove("https_proxy")
+                .env_remove("all_proxy")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            login::kit_auth_path(home.path()),
+            serde_json::json!({
+                "auth_mode":"chatgpt",
+                "tokens":{
+                    "access_token":"idle-access",
+                    "refresh_token":"idle-refresh",
+                    "account_id":"account-a"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let upstream = axum::Router::new().fallback(|| async {
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Body::from_stream(
+                    futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(Bytes::from_static(
+                            b"data: {\"type\":\"response.created\"}\n\n",
+                        ))
+                    })
+                    .chain(futures_util::stream::pending()),
+                ),
+            )
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = Arc::new(
+            App::new(Settings {
+                network_route_policy: NetworkRoutePolicy::Separate,
+                upstream: format!("http://{}", listener.local_addr().unwrap()),
+                codex_home: home.path().display().to_string(),
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        app.sync_logged_in_account().await;
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let response = proxy_http(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header("accept", "text/event-stream")
+                .header("chatgpt-account-id", "account-a")
+                .body(Body::from(r#"{"model":"policy-model"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("response.incomplete"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let entry = app.logs.lock().await.back().cloned();
+                if entry.as_ref().is_some_and(|entry| !entry.in_progress) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let entry = app.logs.lock().await.back().unwrap().clone();
+        assert_eq!(entry.error_kind.as_deref(), Some("stream_idle"));
+        assert_eq!(entry.stream_state, "error");
+        server.abort();
     }
 }
 

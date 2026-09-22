@@ -90,7 +90,14 @@ svg { flex-shrink: 0; }
 .token-card__head small { margin-top: 4px; color: #637c96; font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
 .token-card__meta { margin: 6px 0 0; color: var(--text-soft); font-size: 10px; }
 .token-card__meta--warn { color: var(--red); width: 100%; }
+.token-card__actions { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .token-card__badge { display: inline-flex; align-items: center; gap: 6px; padding: 7px 9px; border: 1px solid #ffffffc0; border-radius: 7px; background: #ffffff60; color: #708299; font-size: 10px; white-space: nowrap; }
+.token-fetch-toggle { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 0 10px; border: 1px solid #c5d4e4; border-radius: 7px; background: #ffffffd0; color: var(--accent-strong); font-size: 11px; font-weight: 600; cursor: pointer; }
+.token-fetch-toggle:not(:disabled):hover { background: #fff; border-color: #9bb6d2; }
+.token-fetch-toggle:disabled { opacity: .55; cursor: default; }
+.token-fetch-toggle svg.is-spinning { animation: spin .75s linear infinite; }
+.token-fetch-toggle--paused { color: var(--warm); border-color: #e2cfb4; background: var(--warm-soft); }
+.token-fetch-toggle--paused:not(:disabled):hover { background: #fbf3e8; }
 .account-traffic { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 18px; padding: 15px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .account-traffic__heading { display: flex; align-items: center; gap: 10px; color: var(--accent); }
 .account-traffic__heading h2 { margin: 0; color: var(--text); font-size: 12px; font-weight: 600; }
@@ -221,6 +228,7 @@ svg { flex-shrink: 0; }
 .network-log-dialog__mark { display: grid; width: 34px; height: 34px; flex: 0 0 34px; place-items: center; border: 1px solid #cfdeec; border-radius: 7px; color: var(--accent-strong); background: #edf4fb; }
 .network-log-dialog__title h2 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: 0; }
 .network-log-dialog__title p { margin: 3px 0 0; color: var(--muted); font-size: 10px; }
+.network-log-diag-path { word-break: break-all; }
 .network-log-dialog__actions { display: flex; align-items: center; gap: 7px; }
 .network-log-copy { min-height: 31px; padding: 0 10px; font-size: 10px; }
 .network-log-close { display: grid; width: 31px; height: 31px; place-items: center; border: 1px solid #dfe6ed; border-radius: 7px; color: var(--muted); background: #f7f9fb; cursor: pointer; }

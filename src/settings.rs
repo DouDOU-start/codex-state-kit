@@ -58,6 +58,12 @@ pub struct Settings {
     pub token_reuse_policy: TokenReusePolicy,
     pub network_route_policy: NetworkRoutePolicy,
     pub forced_model: String,
+    #[serde(default)]
+    pub token_fetch_paused: bool,
+    #[serde(default = "default_token_max_age_mins")]
+    pub token_max_age_mins: u32,
+    #[serde(default = "default_token_prefetch_age_mins")]
+    pub token_prefetch_age_mins: u32,
 }
 
 impl Default for Settings {
@@ -75,6 +81,9 @@ impl Default for Settings {
             token_reuse_policy: TokenReusePolicy::default(),
             network_route_policy: NetworkRoutePolicy::default(),
             forced_model: String::new(),
+            token_fetch_paused: false,
+            token_max_age_mins: default_token_max_age_mins(),
+            token_prefetch_age_mins: default_token_prefetch_age_mins(),
         }
     }
 }
@@ -88,6 +97,32 @@ impl Settings {
         let model = self.forced_model.trim();
         (!model.is_empty()).then_some(model)
     }
+
+    pub fn token_max_age_secs(&self) -> i64 {
+        i64::from(self.token_max_age_mins) * 60
+    }
+
+    pub fn token_prefetch_age_secs(&self) -> i64 {
+        i64::from(self.token_prefetch_age_mins) * 60
+    }
+}
+
+pub const DEFAULT_TOKEN_MAX_AGE_MINS: u32 = 40;
+pub const DEFAULT_TOKEN_PREFETCH_AGE_MINS: u32 = 35;
+
+fn default_token_max_age_mins() -> u32 {
+    DEFAULT_TOKEN_MAX_AGE_MINS
+}
+
+fn default_token_prefetch_age_mins() -> u32 {
+    DEFAULT_TOKEN_PREFETCH_AGE_MINS
+}
+
+fn normalize_token_lifetime(max_age_mins: u32, prefetch_age_mins: u32) -> Result<(u32, u32)> {
+    if prefetch_age_mins >= max_age_mins {
+        bail!("预取时间必须早于过期时间");
+    }
+    Ok((max_age_mins, prefetch_age_mins))
 }
 
 /// 开发环境用 8788，打包版用 8787，互不冲突
@@ -128,11 +163,18 @@ pub struct SettingsPatch {
     pub network_route_policy: NetworkRoutePolicy,
     #[serde(default)]
     pub forced_model: String,
+    #[serde(default)]
+    pub token_fetch_paused: bool,
+    #[serde(default = "default_token_max_age_mins")]
+    pub token_max_age_mins: u32,
+    #[serde(default = "default_token_prefetch_age_mins")]
+    pub token_prefetch_age_mins: u32,
 }
 
 impl SettingsPatch {
     pub fn into_settings(self) -> Result<Settings> {
         let models = self.models;
+        let lifetime = normalize_token_lifetime(self.token_max_age_mins, self.token_prefetch_age_mins)?;
         let settings = Settings {
             proxy_listen: self.proxy_listen.trim().to_string(),
             upstream: self.upstream.trim().to_string(),
@@ -146,6 +188,9 @@ impl SettingsPatch {
             token_reuse_policy: self.token_reuse_policy,
             network_route_policy: self.network_route_policy,
             forced_model: normalize_forced_model(&self.forced_model)?,
+            token_fetch_paused: self.token_fetch_paused,
+            token_max_age_mins: lifetime.0,
+            token_prefetch_age_mins: lifetime.1,
         };
         if settings.proxy_listen.is_empty()
             || settings.upstream.is_empty()
@@ -364,6 +409,9 @@ mod tests {
             models: vec![],
             network_route_policy: NetworkRoutePolicy::SameNetwork,
             forced_model: String::new(),
+            token_fetch_paused: false,
+            token_max_age_mins: DEFAULT_TOKEN_MAX_AGE_MINS,
+            token_prefetch_age_mins: DEFAULT_TOKEN_PREFETCH_AGE_MINS,
         }
         .into_settings()
         .unwrap();
@@ -463,5 +511,70 @@ mod tests {
         assert_eq!(saved.outbound_mode, OutboundMode::Warp);
         assert_eq!(saved.outbound_proxy, "socks5://localhost:1080");
         assert!(serde_json::from_str::<OutboundMode>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn token_fetch_paused_defaults_and_round_trips() {
+        assert!(!Settings::default().token_fetch_paused);
+        assert!(!settings_from_json("{}").unwrap().token_fetch_paused);
+        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
+            "tokenFetchPaused":true
+        }))
+        .unwrap();
+        let settings = patch.into_settings().unwrap();
+        assert!(settings.token_fetch_paused);
+        let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(loaded.token_fetch_paused);
+        let omitted: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test"
+        }))
+        .unwrap();
+        assert!(!omitted.token_fetch_paused);
+    }
+
+    #[test]
+    fn token_lifetime_defaults_and_rejects_invalid_windows() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.token_max_age_mins, 40);
+        assert_eq!(defaults.token_prefetch_age_mins, 35);
+        assert_eq!(defaults.token_max_age_secs(), 2400);
+        assert_eq!(defaults.token_prefetch_age_secs(), 2100);
+        let omitted = settings_from_json("{}").unwrap();
+        assert_eq!(omitted.token_max_age_mins, 40);
+        assert_eq!(omitted.token_prefetch_age_mins, 35);
+        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
+            "tokenMaxAgeMins":20, "tokenPrefetchAgeMins":10
+        }))
+        .unwrap();
+        let settings = patch.into_settings().unwrap();
+        assert_eq!(settings.token_max_age_mins, 20);
+        assert_eq!(settings.token_prefetch_age_mins, 10);
+        let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.token_max_age_mins, 20);
+        assert_eq!(loaded.token_prefetch_age_mins, 10);
+        let equal: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
+            "tokenMaxAgeMins":20, "tokenPrefetchAgeMins":20
+        }))
+        .unwrap();
+        assert!(equal.into_settings().unwrap_err().to_string().contains("预取时间必须早于过期时间"));
+        let short: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
+            "tokenMaxAgeMins":3, "tokenPrefetchAgeMins":1
+        }))
+        .unwrap();
+        let short_settings = short.into_settings().unwrap();
+        assert_eq!(short_settings.token_max_age_mins, 3);
+        assert_eq!(short_settings.token_prefetch_age_mins, 1);
+        let long: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
+            "tokenMaxAgeMins":240, "tokenPrefetchAgeMins":200
+        }))
+        .unwrap();
+        let long_settings = long.into_settings().unwrap();
+        assert_eq!(long_settings.token_max_age_mins, 240);
+        assert_eq!(long_settings.token_prefetch_age_mins, 200);
     }
 }

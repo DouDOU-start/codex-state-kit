@@ -1,4 +1,6 @@
 pub mod attach;
+pub mod chatgpt_cookies;
+pub mod diag;
 pub mod fetch;
 pub mod login;
 pub mod browser_login;

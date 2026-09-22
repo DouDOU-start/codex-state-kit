@@ -27,6 +27,9 @@ function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): Sett
     warpHttp2: status.warpHttp2,
     stateMissPolicy: status.stateMissPolicy,
     tokenReusePolicy: status.tokenReusePolicy,
+    tokenFetchPaused: status.tokenFetchPaused ?? false,
+    tokenMaxAgeMins: status.tokenMaxAgeMins ?? 40,
+    tokenPrefetchAgeMins: status.tokenPrefetchAgeMins ?? 35,
     networkRoutePolicy: status.networkRoutePolicy ?? "same_network",
     forcedModel: status.forcedModel ?? "",
     models: status.configuredModels,
@@ -173,6 +176,22 @@ export function useCodexStateKit() {
     }
   }, []);
 
+  const setTokenFetchPaused = useCallback(async (tokenFetchPaused: boolean) => {
+    setBusy("save");
+    try {
+      const latest = await getStatus();
+      const next = await setConfig(patchFrom(latest, { tokenFetchPaused }));
+      setStatus(next);
+      setBanner({ kind: "ok", text: tokenFetchPaused
+        ? "已暂停获取 Token，后台不再打票。已缓存的 Token 仍可注入。"
+        : "已继续获取 Token。" });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
   const saveForcedModel = useCallback(async (forcedModel: string) => {
     setBusy("save");
     try {
@@ -205,14 +224,12 @@ export function useCodexStateKit() {
     }
   }, []);
 
-  const refreshToken = useCallback(async (home: string, outboundProxy: string) => {
+  const refetchTurnState = useCallback(async () => {
     setBusy("refresh");
     try {
-      const latest = status ?? (await getStatus());
-      await persistSettings(home, outboundProxy, latest);
       const next = await refreshTurnState();
       setStatus(next);
-      setBanner({ kind: "ok", text: "已通过出站代理刷新 turn-state。" });
+      setBanner({ kind: "ok", text: "已重新获取 Token。" });
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
       try {
@@ -223,7 +240,7 @@ export function useCodexStateKit() {
     } finally {
       setBusy(null);
     }
-  }, [persistSettings, status]);
+  }, []);
 
   const startLogin = useCallback(async (home: string, method: LoginMethod) => {
     setBusy("login");
@@ -361,9 +378,10 @@ export function useCodexStateKit() {
     saveSettings,
     setStateMissPolicy,
     setTokenReusePolicy,
+    setTokenFetchPaused,
     setNetworkRoutePolicy,
     saveForcedModel,
-    refreshToken,
+    refetchTurnState,
     openWarpTerms,
     startLogin,
     importRefreshLogin,

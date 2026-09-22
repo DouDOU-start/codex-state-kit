@@ -280,6 +280,9 @@ pub struct NetworkLogDetails {
     pub tokens_per_second: Option<f64>,
     pub in_progress: bool,
     pub stream_lifecycle: Option<Arc<StreamLifecycle>>,
+    pub diag: Option<crate::diag::Request>,
+    pub token_fp: Option<String>,
+    pub cookie_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -530,6 +533,7 @@ pub struct ResponseMetrics {
     is_sse: bool,
     completed: bool,
     pub error_kind: Option<&'static str>,
+    sse_events: Vec<(String, u32)>,
 }
 
 // Decode only the statistics side channel. The proxy forwards original bytes.
@@ -715,10 +719,48 @@ impl ResponseMetrics {
         self.completed
     }
 
+    pub fn sse_event_summary(&self) -> Option<String> {
+        if self.sse_events.is_empty() {
+            return None;
+        }
+        Some(
+            self.sse_events
+                .iter()
+                .map(|(name, count)| {
+                    if *count == 1 {
+                        name.clone()
+                    } else {
+                        format!("{name}×{count}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+
+    fn record_sse_event_type(&mut self, event_type: &str) {
+        let name = safe_text(event_type, 80);
+        if name.is_empty() {
+            return;
+        }
+        if self.sse_events.last().is_some_and(|(last, _)| last == &name) {
+            if let Some((_, count)) = self.sse_events.last_mut() {
+                *count = count.saturating_add(1);
+            }
+            return;
+        }
+        if self.sse_events.len() < 40 {
+            self.sse_events.push((name, 1));
+        }
+    }
+
     fn observe_event(&mut self, event: &[u8], elapsed_ms: u128) {
         let Ok(json) = serde_json::from_slice::<serde_json::Value>(event) else {
             return;
         };
+        if let Some(event_type) = json.get("type").and_then(serde_json::Value::as_str) {
+            self.record_sse_event_type(event_type);
+        }
         let terminal = matches!(
             json.get("type").and_then(serde_json::Value::as_str),
             Some("response.completed" | "response.done" | "response.failed"
@@ -960,6 +1002,31 @@ mod tests {
             assert_eq!(metrics.upstream_response_model(), None);
             assert_eq!(metrics.error_kind, None);
         }
+    }
+
+    #[test]
+    fn sse_event_summary_collapses_repeats_and_skips_payloads() {
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(b"data: {\"type\":\"response.created\"}\n\n", 1, true);
+        metrics.observe(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"a\"}\n\n",
+            2,
+            true,
+        );
+        metrics.observe(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"secret-payload\"}\n\n",
+            3,
+            true,
+        );
+        metrics.observe(b"data: {\"type\":\"response.completed\"}\n\n", 4, true);
+        assert_eq!(
+            metrics.sse_event_summary().as_deref(),
+            Some("response.created, response.output_text.delta×2, response.completed")
+        );
+        assert!(!metrics
+            .sse_event_summary()
+            .unwrap()
+            .contains("secret-payload"));
     }
 
     #[test]

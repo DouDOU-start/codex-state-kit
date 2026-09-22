@@ -74,6 +74,9 @@ fn patch(settings: &Settings, policy: TokenReusePolicy) -> SettingsPatch {
         token_reuse_policy: policy,
         network_route_policy: settings.network_route_policy,
         forced_model: settings.forced_model.clone(),
+        token_fetch_paused: settings.token_fetch_paused,
+        token_max_age_mins: settings.token_max_age_mins,
+        token_prefetch_age_mins: settings.token_prefetch_age_mins,
     }
 }
 
@@ -167,11 +170,11 @@ async fn one_shared_probe_serves_all_models_until_prefetch() {
         app.reset_fetch_schedule().await;
         app.refresh_turn_state().await.unwrap();
         assert_eq!(probes.load(Ordering::Relaxed), 2);
-        // At 36 minutes, one new donor refreshes all twelve models together.
+        // 满 30 秒后仍可注入，但会再采一张共享票。
         {
             let mut store = app.turn_state.lock().await;
             store.invalidate_all();
-            let aging = ticket(2160);
+            let aging = ticket(200);
             store.capture("a", &aging, "fetch");
             assert_eq!(store.peek_for_model("b"), Some(aging));
         }
@@ -180,6 +183,83 @@ async fn one_shared_probe_serves_all_models_until_prefetch() {
         assert_eq!(probes.load(Ordering::Relaxed), 3);
         assert_eq!(app.refresh_if_needed().await, fetch::CHECK_INTERVAL);
         assert_eq!(probes.load(Ordering::Relaxed), 3);
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn manual_refresh_bypasses_pause_and_cooldown() {
+    if !isolated_child("proxy::token_reuse_tests::manual_refresh_bypasses_pause_and_cooldown") {
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let home = tempfile::tempdir().unwrap();
+        write_login(home.path());
+        let probes = Arc::new(AtomicU32::new(0));
+        let probes_seen = probes.clone();
+        let fresh = ticket(0);
+        let reply_token = fresh.clone();
+        let router =
+            axum::Router::new().fallback(move |_headers: HeaderMap, Json(body): Json<Value>| {
+                let probes = probes_seen.clone();
+                let token = reply_token.clone();
+                async move {
+                    if body["test_business"] == true {
+                        Response::new(Body::from("ok"))
+                    } else {
+                        probes.fetch_add(1, Ordering::Relaxed);
+                        Response::builder()
+                            .header(turn_state::HEADER_NAME, token)
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                }
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let app = Arc::new(
+            App::new(Settings {
+                upstream: endpoint.clone(),
+                outbound_proxy: endpoint,
+                outbound_mode: OutboundMode::Manual,
+                codex_home: home.path().display().to_string(),
+                models: vec!["a".into()],
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        assert_eq!(app.refresh_if_needed().await, fetch::CHECK_INTERVAL);
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+
+        app.settings.lock().await.token_fetch_paused = true;
+        app.defer_next_fetch(Duration::from_secs(600)).await;
+        app.fetch_model_next_allowed_at
+            .lock()
+            .await
+            .insert("a".into(), Instant::now() + Duration::from_secs(600));
+
+        assert_eq!(app.refresh_if_needed().await, fetch::CHECK_INTERVAL);
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            1,
+            "paused background loop must not probe"
+        );
+        let err = app.fetch_once("a").await.unwrap_err();
+        assert_eq!(err.retry, FetchRetryClass::Deferred);
+
+        let status = app.refresh_turn_state().await.unwrap();
+        assert_eq!(probes.load(Ordering::Relaxed), 2);
+        assert_eq!(status.turn_state.status, "active");
+        assert_ne!(
+            status.fetch_error.as_deref(),
+            Some(TOKEN_MANUAL_REFRESH_MESSAGE)
+        );
+        assert!(app.settings.lock().await.token_fetch_paused);
         server.abort();
     })
     .await
@@ -294,9 +374,9 @@ async fn policy_hot_switch_preserves_source_cache_and_survives_restart() {
 }
 
 #[tokio::test]
-async fn late_degraded_shared_response_cannot_clear_new_ticket() {
+async fn degraded_business_response_keeps_current_shared_ticket() {
     if !isolated_child(
-        "proxy::token_reuse_tests::late_degraded_shared_response_cannot_clear_new_ticket",
+        "proxy::token_reuse_tests::degraded_business_response_keeps_current_shared_ticket",
     ) {
         return;
     }
@@ -307,35 +387,14 @@ async fn late_degraded_shared_response_cannot_clear_new_ticket() {
         ..Settings::default()
     })
     .unwrap();
-    let (creds, _) = app.sync_request_identity(home.path()).await.unwrap();
-    let old = ticket(60);
     let fresh = ticket(0);
-    app.turn_state.lock().await.capture("a", &old, "fetch");
-    app.turn_state.lock().await.capture("b", &fresh, "fetch");
-    assert!(
-        !app.handle_degraded_response("consumer", &creds, true, Some(&old))
-            .await
-    );
-    assert!(
-        !app.handle_degraded_response("consumer", &creds, false, Some(&fresh))
-            .await
-    );
+    app.turn_state.lock().await.capture("a", &fresh, "fetch");
+    app.note_degraded_business_response("a");
     assert_eq!(
-        app.turn_state
-            .lock()
-            .await
-            .peek_for_model("consumer")
-            .as_deref(),
+        app.turn_state.lock().await.peek_for_model("a").as_deref(),
         Some(fresh.as_str())
     );
-    assert!(
-        app.handle_degraded_response("consumer", &creds, true, Some(&fresh))
-            .await
-    );
-    for model in ["a", "b", "consumer"] {
-        assert!(app.turn_state.lock().await.peek_for_model(model).is_none());
-        assert!(app.turn_state.lock().await.needs_refresh(model));
-    }
+    assert!(!app.turn_state.lock().await.needs_refresh("a"));
 }
 
 #[tokio::test]

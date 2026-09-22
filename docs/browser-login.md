@@ -28,7 +28,7 @@
 - RT 换票请求禁止跟随 HTTP 重定向，错误信息不会回显提交的 Token。
 - RT/AT 输入框使用密码类型；提交后清空成功导入的 Token，不写入应用日志。
 
-登录文件采用 Codex 原生结构，包含 `auth_mode`、`tokens` 和 `last_refresh`。浏览器、授权码和 RT 使用可刷新 ChatGPT 登录模式；AT 使用 Codex 的 `chatgptAuthTokens` 外部 Token 模式。Codex 刷新同一账号并写回更新的 `last_refresh` 后，Kit 会把轮换后的 AT/RT 同步回独立登录文件；不同账号的凭据不会被合并。
+登录文件采用 Codex 原生结构，包含 `auth_mode`、`tokens` 和 `last_refresh`。浏览器、授权码和 RT 使用可刷新 ChatGPT 登录模式；AT 使用 Codex 的 `chatgptAuthTokens` 外部 Token 模式。Codex 刷新同一账号并写回更新的 `last_refresh` 后，Kit 会把轮换后的 AT/RT 同步回独立登录文件；不同账号的凭据不会被合并。打新票不会先换票，直接用当前登录文件里的 AT。外部 AT 模式不能换票。
 
 ## 验证范围
 

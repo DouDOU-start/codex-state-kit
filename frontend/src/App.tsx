@@ -10,6 +10,9 @@ import Terminal from "lucide-react/dist/esm/icons/terminal.js";
 import CircleCheck from "lucide-react/dist/esm/icons/circle-check.js";
 import Radio from "lucide-react/dist/esm/icons/radio.js";
 import Cloud from "lucide-react/dist/esm/icons/cloud.js";
+import Pause from "lucide-react/dist/esm/icons/pause.js";
+import Play from "lucide-react/dist/esm/icons/play.js";
+import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import { AppShell } from "@/components/AppShell";
 import { NetworkLogDialog } from "@/components/NetworkLogDialog";
 import { WarpPanel } from "@/components/WarpPanel";
@@ -27,7 +30,8 @@ function chipClass(status: Status) {
   return status.proxyOk ? "runtime-chip" : "runtime-chip runtime-chip--down";
 }
 
-function tokenChip(view?: TurnStateView | null) {
+function tokenChip(view?: TurnStateView | null, paused = false) {
+  if (paused && view?.status !== "active") return { label: "已暂停获取", className: "runtime-chip runtime-chip--idle" };
   if (!view || view.status === "empty") return { label: "等待 Token", className: "runtime-chip runtime-chip--idle" };
   if (view.status === "idle") return { label: "等待请求", className: "runtime-chip runtime-chip--idle" };
   if (view.status === "active") return { label: "Token 可用", className: "runtime-chip" };
@@ -72,7 +76,7 @@ const STATE_POLICY_OPTIONS: Array<{
     value: "wait",
     label: "无票等待",
     summary: "等有效票再发送",
-    tooltip: "缺少规范票据时持续等待，再写入并包装成同轮第二包。请求身份冲突时立即报错，不转发。客户端取消，或账号、线路、策略变化时终止。",
+    tooltip: "缺少规范票据时持续等待，再写入并包装成同轮第二包。请求账号与当前登录不同时立即报错，不转发。同一账号的旧 Access Token 仍会覆盖后继续。客户端取消，或账号、线路、策略变化时终止。",
   },
   {
     value: "strip",
@@ -94,8 +98,23 @@ const STATE_POLICY_OPTIONS: Array<{
   },
 ];
 
-function tokenCopy(view?: TurnStateView | null, fetchError?: string | null, reusePolicy: TokenReusePolicy = "shared_292") {
+function tokenCopy(view?: TurnStateView | null, fetchError?: string | null, reusePolicy: TokenReusePolicy = "shared_292", paused = false) {
   const bound = view?.boundTokenLen ?? 292;
+  if (paused) {
+    if (view?.status === "active") {
+      const summary = modelSummary(view);
+      return {
+        title: reusePolicy === "shared_292" && bound === 292 ? "292 Token 正在跨模型复用" : `${bound} Token 正在复用`,
+        body: summary ? `已暂停后台获取 · ${summary}` : "已暂停后台获取，已缓存的 Token 仍可注入。",
+        loading: false,
+      };
+    }
+    return {
+      title: `已暂停获取 ${bound} Token`,
+      body: "后台不再打票。已缓存的 Token 仍可注入，需要时再点继续获取。",
+      loading: false,
+    };
+  }
   if (fetchError && (!view || (view.status !== "active" && view.status !== "idle"))) {
     return {
       title: `正在获取 ${bound} Token…`,
@@ -138,7 +157,7 @@ function tokenCopy(view?: TurnStateView | null, fetchError?: string | null, reus
   }
   return {
     title: "等待刷新 Token",
-    body: "Token 已超过 35 分钟，正在通过出站代理预取新 Token。",
+    body: "凭据包已超过 240 秒，正在后台再采一张。",
     loading: true,
   };
 }
@@ -200,12 +219,14 @@ export default function App() {
         : null,
   ].filter(Boolean).join(" · ");
   const turn = fwd.status.turnState;
-  const token = tokenChip(turn);
+  const fetchPaused = Boolean(fwd.status.tokenFetchPaused);
+  const token = tokenChip(turn, fetchPaused);
   const degrade = degradeChip(fwd.status);
   const copy = tokenCopy(
     turn,
     fwd.status.fetchError ?? (fwd.status.outboundMode === "warp" ? fwd.status.warp.error : null),
     fwd.status.tokenReusePolicy,
+    fetchPaused,
   );
   const age = formatAge(turn?.ageSecs);
   const sourceLabel =
@@ -302,7 +323,30 @@ export default function App() {
               {meta ? <p className="token-card__meta">{meta}</p> : null}
             </div>
           </div>
-          <span className="token-card__badge"><Radio size={14} /> {fwd.status.proxyOk ? `自动管理 · 绑定 ${turn?.boundTokenLen ?? 292}` : "等待代理启动"}</span>
+          <div className="token-card__actions">
+            <button
+              type="button"
+              className="token-fetch-toggle"
+              disabled={fwd.busy !== null}
+              title="立即重新获取 Token，绕过后台冷却；暂停自动获取时也可点一次"
+              onClick={() => void fwd.refetchTurnState()}
+            >
+              <RefreshCw size={13} className={fwd.busy === "refresh" ? "is-spinning" : undefined} />
+              {fwd.busy === "refresh" ? "正在获取" : "重新获取"}
+            </button>
+            <button
+              type="button"
+              className={`token-fetch-toggle${fetchPaused ? " token-fetch-toggle--paused" : ""}`}
+              aria-pressed={fetchPaused}
+              disabled={fwd.busy !== null}
+              title={fetchPaused ? "继续后台获取 Token" : "暂停后台打票，已缓存的 Token 仍可注入"}
+              onClick={() => void fwd.setTokenFetchPaused(!fetchPaused)}
+            >
+              {fetchPaused ? <Play size={13} /> : <Pause size={13} />}
+              {fetchPaused ? "继续获取" : "暂停获取"}
+            </button>
+            <span className="token-card__badge"><Radio size={14} /> {fetchPaused ? `已暂停 · 绑定 ${turn?.boundTokenLen ?? 292}` : fwd.status.proxyOk ? `自动管理 · 绑定 ${turn?.boundTokenLen ?? 292}` : "等待代理启动"}</span>
+          </div>
           <div className="token-reuse-policy" role="group" aria-labelledby="token-reuse-policy-label">
             <div className="token-reuse-policy__heading">
               <strong id="token-reuse-policy-label">Token 复用策略</strong>
@@ -322,7 +366,7 @@ export default function App() {
                 <span><strong>按模型独立 <small>旧策略</small></strong><span>各模型分别获取，只复用各自的 Token</span></span>
               </label>
             </div>
-            <p>共享票满 35 分钟预取，超过 40 分钟停用；332 及其他绑定长度仍按模型独立。跨模型效果以实际请求为准，可随时切回旧策略。</p>
+            <p>292 与线路 Cookie 成套保存、成套注入。采到后 30 秒再采下一张，超过 240 秒停止注入。332 及其他绑定长度仍按模型独立。跨模型效果以实际请求为准，可随时切回旧策略。</p>
           </div>
           {turn?.models && turn.models.length > 0 ? (
             <div className="token-models">
@@ -419,7 +463,7 @@ export default function App() {
           <div className="banner banner--error" role="alert">
             <span>
               <TriangleAlert size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
-              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}，正在通过出站代理重新采集 {turn?.boundTokenLen ?? 292} token…
+              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}，{fetchPaused ? "已暂停获取，继续获取后才会重新打票。" : `正在通过出站代理重新采集 ${turn?.boundTokenLen ?? 292} token…`}
             </span>
           </div>
         ) : null}

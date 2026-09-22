@@ -31,7 +31,7 @@ Turn-State 列同时记录请求开始时的策略（无票保留、无票等待
 
 没有可识别的可见输出、usage、有效生成时间，或发生流错误/客户端中断时，相应指标显示「—」。非流式 JSON 可以读取 usage，但不推算首字和 tok/s。zstd、gzip、deflate 响应会在统计旁路增量解压，原始压缩字节和响应头仍原样转发，不改变上游请求。未知编码、叠加编码或解压失败时跳过内容统计。SSE 单个事件或非流式 JSON 的统计读取上限为 128 KiB，zstd 解码窗口上限为 8 MiB；超过事件上限会跳过该事件/响应的内容统计，但继续原样转发。结果/性能列单独标明响应压缩编码；Turn-State 列的编码描述请求体，两者可能不同。
 
-Token 获取只需要响应头中的 state，拿到响应头后就结束探测，因此仍显示响应头耗时，不等待模型生成。HTTP 200 后的流异常通过 `response_body`、`response_failed`、`response_incomplete` 或 `client_cancelled` 标记，避免只看状态码误判请求已成功完成。
+Token 获取只需要响应头中的 state，拿到响应头后就结束探测，因此仍显示响应头耗时，不等待模型生成。HTTP 200 后的流异常通过 `response_body`、`response_failed`、`response_incomplete`、`stream_idle` 或 `client_cancelled` 标记，避免只看状态码误判请求已成功完成。业务 SSE 在已有数据块后静默约 90 秒、或响应头后一直没有正文约 180 秒时，会写入 `response.incomplete` 并断开，让 Codex 结束本轮并可以重试。
 
 部分上游省略 `Content-Type`，此时按请求的 `Accept: text/event-stream` 继续解析 SSE。客户端在收到 `response.completed` 后停止读取属于正常完成，不标记 `client_cancelled`；尚未收到完成事件就断开的请求仍按中断记录。HTTP 200 只代表响应头状态，红色表示该请求还记录了流错误。
 
@@ -44,6 +44,8 @@ Token 获取探针固定使用 HTTP/1.1 新连接。默认跨模型共享 292，
 `TCP peer` 表示本次连接首先到达的网络地址：配置显式 HTTP / SOCKS 代理时通常是代理地址；使用系统默认网络时通常是上游地址或系统代理地址。它不是最终公网出口 IP。
 
 日志最多保留 80 条，只存放在进程内存中，退出应用后清空。为避免并发探测或连续失败淹没业务记录，其中 Token 获取记录最多保留 30 条。点击「复制日志」可复制当前路径摘要和结构化记录。
+
+排查卡住时另有一份落盘诊断日志：用户目录下的 `.codex-state-kit-diag.jsonl`（开发模式为 `.codex-state-kit-dev-diag.jsonl`）。按请求写入 `request` / `headers` / `first_token` / `chunk` / `finish` 和 `token_fetch`，只记票据指纹、线路 cookie 名、是否同轮续跑、SSE 事件类型和流进度，不写票面、cookie 值、请求体或生成文本。超过约 8 MB 会轮换成同名 `.1`。网络日志窗口会显示该路径。
 
 ## 数据边界
 

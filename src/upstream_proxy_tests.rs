@@ -75,6 +75,9 @@ fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
         models: settings.models.clone(),
         network_route_policy: settings.network_route_policy,
         forced_model: settings.forced_model.clone(),
+        token_fetch_paused: settings.token_fetch_paused,
+        token_max_age_mins: settings.token_max_age_mins,
+        token_prefetch_age_mins: settings.token_prefetch_age_mins,
     }
 }
 

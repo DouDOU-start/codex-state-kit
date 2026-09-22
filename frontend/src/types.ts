@@ -81,6 +81,10 @@ export interface TurnStateView {
 
 export interface Status {
   tokenReusePolicy: TokenReusePolicy;
+  tokenFetchPaused?: boolean;
+  tokenMaxAgeMins?: number;
+  tokenPrefetchAgeMins?: number;
+  diagLogPath?: string;
   networkRoutePolicy: NetworkRoutePolicy;
   forcedModel: string;
   stateMissPolicy: StateMissPolicy;
@@ -110,6 +114,9 @@ export interface Status {
 
 export interface SettingsPatch {
   tokenReusePolicy: TokenReusePolicy;
+  tokenFetchPaused?: boolean;
+  tokenMaxAgeMins?: number;
+  tokenPrefetchAgeMins?: number;
   networkRoutePolicy: NetworkRoutePolicy;
   forcedModel: string;
   models: string[];

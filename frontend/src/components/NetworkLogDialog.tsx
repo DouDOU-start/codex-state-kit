@@ -207,6 +207,23 @@ function ResponseModel({ entry }: { entry: LogEntry }) {
   );
 }
 
+function errorKindLabel(kind: string): string {
+  switch (kind) {
+    case "stream_idle":
+      return "流静默超时";
+    case "client_cancelled":
+      return "下游已取消";
+    case "response_body":
+      return "响应体中断";
+    case "response_failed":
+      return "上游失败";
+    case "response_incomplete":
+      return "上游未完成";
+    default:
+      return kind;
+  }
+}
+
 function streamLabel(entry: LogEntry): string | null {
   const metrics = [
     entry.firstChunkMs != null ? `首块 ${formatDuration(entry.firstChunkMs)}` : null,
@@ -222,7 +239,7 @@ function streamLabel(entry: LogEntry): string | null {
     case "completed":
       return `流已完成${entry.streamTotalMs != null ? ` · 总计 ${formatDuration(entry.streamTotalMs)}` : ""}${metrics ? ` · ${metrics}` : ""}`;
     case "error":
-      return `流读取错误${entry.streamTotalMs != null ? ` · ${formatDuration(entry.streamTotalMs)}` : ""}${metrics ? ` · ${metrics}` : ""}`;
+      return `${entry.errorKind === "stream_idle" ? "流静默超时，已断开" : "流读取错误"}${entry.streamTotalMs != null ? ` · ${formatDuration(entry.streamTotalMs)}` : ""}${metrics ? ` · ${metrics}` : ""}`;
     case "cancelled":
       return `下游已取消${entry.streamTotalMs != null ? ` · ${formatDuration(entry.streamTotalMs)}` : ""}${metrics ? ` · ${metrics}` : ""}`;
     default:
@@ -320,6 +337,7 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
             <div>
               <h2 id="network-log-title">网络路由日志</h2>
               <p>{isTauri ? `${status.logs.length} 条请求记录 · 自动实时更新` : `${status.logs.length} 条示例记录 · 非实际连接`}</p>
+              {status.diagLogPath ? <p className="network-log-diag-path">诊断日志：{status.diagLogPath}</p> : null}
             </div>
           </div>
           <div className="network-log-dialog__actions">
@@ -383,7 +401,7 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
                           <small title="总耗时统计至响应体结束；tok/s = 上游输出 token 数 ÷（总耗时 − 首字延迟）。">总耗时 {entry.inProgress ? "进行中" : formatDuration(entry.ms)}{entry.outputTokens != null ? ` · ${entry.outputTokens} tokens` : ""}</small>
                         </>
                       ) : null}
-                      <small>{entry.httpVersion || "HTTP"} · 响应头 {formatDuration(entry.responseHeaderMs ?? (entry.flow === "token_fetch" ? entry.ms : null))}{entry.errorKind ? ` · ${entry.errorKind}` : ""}</small>
+                      <small>{entry.httpVersion || "HTTP"} · 响应头 {formatDuration(entry.responseHeaderMs ?? (entry.flow === "token_fetch" ? entry.ms : null))}{entry.errorKind ? ` · ${errorKindLabel(entry.errorKind)}` : ""}</small>
                       {entry.responseContentEncoding && entry.responseContentEncoding !== "none" && <small>响应编码 {entry.responseContentEncoding}</small>}
                       {streamLabel(entry) ? <small>{streamLabel(entry)}</small> : null}
                     </td>

@@ -6,13 +6,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+use crate::chatgpt_cookies::{self, RoutingCookie};
 use crate::settings::TokenReusePolicy;
 
 pub const HEADER_NAME: &str = "x-codex-turn-state";
-/// Token 有效期：40 分钟
-pub const MAX_AGE_SECS: i64 = 2400;
-/// 提前获取阈值：35 分钟时开始预取下一个 token
-pub const PREFETCH_AGE_SECS: i64 = 2100;
+/// 凭据包新鲜窗口：240 秒后不再注入。
+pub const MAX_AGE_SECS: i64 = 240;
+/// 采到 292 后暂停这么久再采下一张，持续刷新凭据包。
+pub const PREFETCH_AGE_SECS: i64 = 30;
 /// 与探针校验一致，允许小幅服务端时钟偏移。
 pub(crate) const MAX_FUTURE_SKEW_SECS: i64 = 300;
 /// 模型活跃窗口：60 分钟内有请求则视为活跃，持续预取
@@ -45,6 +46,9 @@ pub struct TurnState {
     /// 探针第一包返回的 response.id，用来把下游请求包装成同轮第二包。
     #[serde(default)]
     pub previous_response_id: String,
+    /// 打到该票据时上游下发的 Cloudflare / 线路 cookie；业务转发回放到同一边缘。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routing_cookies: Vec<RoutingCookie>,
 }
 
 /// 单种 token 长度的计数
@@ -155,6 +159,9 @@ pub struct TurnStateStore {
     distributions: HashMap<String, Vec<TokenLenCount>>,
     /// 当前 Token 池所属的 ChatGPT account_id
     account_id: Option<String>,
+    /// 来自应用设置，不写入票据文件。
+    max_age_secs: i64,
+    prefetch_age_secs: i64,
 }
 
 impl Default for TurnStateStore {
@@ -169,6 +176,8 @@ impl Default for TurnStateStore {
             model_bound_lens: HashMap::new(),
             distributions: HashMap::new(),
             account_id: None,
+            max_age_secs: MAX_AGE_SECS,
+            prefetch_age_secs: PREFETCH_AGE_SECS,
         }
     }
 }
@@ -262,6 +271,8 @@ impl TurnStateStore {
                     model_bound_lens: mbl,
                     distributions: dist,
                     account_id: store.account_id,
+                    max_age_secs: MAX_AGE_SECS,
+                    prefetch_age_secs: PREFETCH_AGE_SECS,
                 };
             }
         }
@@ -298,6 +309,8 @@ impl TurnStateStore {
                     model_bound_lens: HashMap::new(),
                     distributions: HashMap::new(),
                     account_id: None,
+                    max_age_secs: MAX_AGE_SECS,
+                    prefetch_age_secs: PREFETCH_AGE_SECS,
                 };
             }
         }
@@ -321,6 +334,8 @@ impl TurnStateStore {
                     model_bound_lens: HashMap::new(),
                     distributions: HashMap::new(),
                     account_id: None,
+                    max_age_secs: MAX_AGE_SECS,
+                    prefetch_age_secs: PREFETCH_AGE_SECS,
                 };
             }
         }
@@ -427,7 +442,7 @@ impl TurnStateStore {
             entries
                 .iter()
                 .filter(|ts| is_matching_token_len(ts.len, target))
-                .filter(|ts| (now_unix() - ts.issued_unix) <= MAX_AGE_SECS)
+                .filter(|ts| self.is_fresh_issued(ts.issued_unix))
                 .max_by_key(|ts| ts.issued_unix)
                 .cloned()
         });
@@ -448,7 +463,7 @@ impl TurnStateStore {
                 let best = entries
                     .iter()
                     .filter(|ts| is_matching_token_len(ts.len, target))
-                    .filter(|ts| (now_unix() - ts.issued_unix) <= MAX_AGE_SECS)
+                    .filter(|ts| self.is_fresh_issued(ts.issued_unix))
                     .max_by_key(|ts| ts.issued_unix)
                     .cloned();
                 (model.clone(), best)
@@ -476,6 +491,20 @@ impl TurnStateStore {
 
     pub fn set_reuse_policy(&mut self, policy: TokenReusePolicy) {
         self.reuse_policy = policy;
+    }
+
+    pub fn set_lifetime(&mut self, max_age_secs: i64, prefetch_age_secs: i64) {
+        self.max_age_secs = max_age_secs.max(30);
+        self.prefetch_age_secs = prefetch_age_secs.clamp(1, self.max_age_secs.saturating_sub(1));
+    }
+
+    fn age_within(&self, issued_unix: i64, limit: i64) -> bool {
+        let age = now_unix().saturating_sub(issued_unix);
+        (-MAX_FUTURE_SKEW_SECS..=limit).contains(&age)
+    }
+
+    fn is_fresh_issued(&self, issued_unix: i64) -> bool {
+        self.age_within(issued_unix, self.max_age_secs)
     }
 
     /// 显式绑定其他长度的模型仍独立取票；332 和其他长度不跨模型共享。
@@ -508,15 +537,10 @@ impl TurnStateStore {
         }
     }
 
-    /// 按复用策略取票（不消费）。仅返回未过期（≤40min）的 token。
+    /// 按复用策略取票（不消费）。仅返回未过期的 token。
     pub fn peek_for_model(&self, model: &str) -> Option<String> {
         self.state_for_model(model).and_then(|(_, ts)| {
-            let age = now_unix().saturating_sub(ts.issued_unix);
-            if (-MAX_FUTURE_SKEW_SECS..=MAX_AGE_SECS).contains(&age) {
-                Some(ts.token.clone())
-            } else {
-                None
-            }
+            self.is_fresh_issued(ts.issued_unix).then(|| ts.token.clone())
         })
     }
 
@@ -526,23 +550,20 @@ impl TurnStateStore {
     pub fn peek_freshest(&self) -> Option<String> {
         self.tokens
             .values()
-            .filter(|ts| {
-                let age = now_unix() - ts.issued_unix;
-                age <= MAX_AGE_SECS && !is_degraded_token(&ts.token)
-            })
+            .filter(|ts| self.is_fresh_issued(ts.issued_unix) && !is_degraded_token(&ts.token))
             .max_by_key(|ts| ts.issued_unix)
             .map(|ts| ts.token.clone())
     }
 
-    /// 判断某个模型是否需要刷新 token：
+    /// 判断某个模型是否需要刷新凭据包：
     /// - 无 token → 需要
-    /// - token 年龄 > 35 分钟（PREFETCH_AGE_SECS）→ 需要预取
+    /// - 年龄达到采集间隔（默认 30 秒）→ 再采一张
     pub fn needs_refresh(&self, model: &str) -> bool {
         match self.state_for_model(model) {
             None => true,
             Some((_, ts)) => {
-                let age = now_unix().saturating_sub(ts.issued_unix);
-                !(-MAX_FUTURE_SKEW_SECS..=PREFETCH_AGE_SECS).contains(&age)
+                now_unix().saturating_sub(ts.issued_unix) >= self.prefetch_age_secs
+                    || !self.is_fresh_issued(ts.issued_unix)
             }
         }
     }
@@ -605,7 +626,7 @@ impl TurnStateStore {
     /// 将 token 存入缓存池（不管长度是否匹配绑定）。
     /// 每个 (model, len_bucket) 只保留最新的一个。
     pub fn store_to_pool(&mut self, model: &str, token: &str, source: &str) -> bool {
-        self.store_to_pool_with_session(model, token, source, None, None)
+        self.store_to_pool_with_session(model, token, source, None, None, &[])
     }
 
     fn store_to_pool_with_session(
@@ -615,6 +636,7 @@ impl TurnStateStore {
         source: &str,
         proxy_session: Option<&str>,
         previous_response_id: Option<&str>,
+        routing_cookies: &[RoutingCookie],
     ) -> bool {
         let Some(mut state) = TurnState::from_token(token, source) else {
             return false;
@@ -631,6 +653,7 @@ impl TurnStateStore {
         }) {
             state.previous_response_id = response_id.to_string();
         }
+        state.routing_cookies = chatgpt_cookies::sanitize_list(routing_cookies);
         let entries = self.pool.entry(model.to_string()).or_default();
         // 替换同长度区间的旧 token（±4 范围算同一种）
         if let Some(pos) = entries
@@ -685,7 +708,7 @@ impl TurnStateStore {
 
     /// 兼容旧接口：存入匹配绑定长度的 token 到 tokens + pool。
     pub fn capture(&mut self, model: &str, token: &str, source: &str) -> bool {
-        self.capture_with_session(model, token, source, None, None)
+        self.capture_with_session(model, token, source, None, None, &[])
     }
 
     pub fn capture_with_session(
@@ -695,6 +718,7 @@ impl TurnStateStore {
         source: &str,
         proxy_session: Option<&str>,
         previous_response_id: Option<&str>,
+        routing_cookies: &[RoutingCookie],
     ) -> bool {
         let ok = self.store_to_pool_with_session(
             model,
@@ -702,6 +726,7 @@ impl TurnStateStore {
             source,
             proxy_session,
             previous_response_id,
+            routing_cookies,
         );
         if ok {
             self.persist();
@@ -711,20 +736,14 @@ impl TurnStateStore {
 
     pub fn bound_proxy_session(&self) -> Option<String> {
         if let Some((_, ts)) = self.shared_292_state() {
-            if !ts.proxy_session.is_empty() {
-                let age = now_unix().saturating_sub(ts.issued_unix);
-                if (-MAX_FUTURE_SKEW_SECS..=MAX_AGE_SECS).contains(&age) {
-                    return Some(ts.proxy_session.clone());
-                }
+            if !ts.proxy_session.is_empty() && self.is_fresh_issued(ts.issued_unix) {
+                return Some(ts.proxy_session.clone());
             }
         }
         self.tokens
             .values()
             .filter(|ts| !ts.proxy_session.is_empty() && !is_degraded_token(&ts.token))
-            .filter(|ts| {
-                let age = now_unix().saturating_sub(ts.issued_unix);
-                (-MAX_FUTURE_SKEW_SECS..=MAX_AGE_SECS).contains(&age)
-            })
+            .filter(|ts| self.is_fresh_issued(ts.issued_unix))
             .max_by_key(|ts| ts.issued_unix)
             .map(|ts| ts.proxy_session.clone())
     }
@@ -753,6 +772,36 @@ impl TurnStateStore {
             .map(|ts| ts.previous_response_id.clone())
     }
 
+    pub fn bound_routing_cookies(&self) -> Vec<RoutingCookie> {
+        let now = now_unix();
+        if let Some((_, ts)) = self.shared_292_state() {
+            if self.is_fresh_issued(ts.issued_unix) {
+                return chatgpt_cookies::live_cookies(&ts.routing_cookies, now);
+            }
+        }
+        self.tokens
+            .values()
+            .filter(|ts| !is_degraded_token(&ts.token) && self.is_fresh_issued(ts.issued_unix))
+            .max_by_key(|ts| ts.issued_unix)
+            .map(|ts| chatgpt_cookies::live_cookies(&ts.routing_cookies, now))
+            .unwrap_or_default()
+    }
+
+    pub fn routing_cookies_for_token(&self, token: Option<&str>) -> Vec<RoutingCookie> {
+        let now = now_unix();
+        if let Some(token) = token.map(str::trim).filter(|value| !value.is_empty()) {
+            if let Some(ts) = self
+                .tokens
+                .values()
+                .chain(self.pool.values().flatten())
+                .find(|ts| ts.token == token)
+            {
+                return chatgpt_cookies::live_cookies(&ts.routing_cookies, now);
+            }
+        }
+        self.bound_routing_cookies()
+    }
+
     /// 获取某模型在池中所有有效 token 的长度分类。
     /// 返回按长度排序的 [(len, is_bound_match, age_secs)]。
     pub fn pool_summary(&self, model: &str) -> Vec<(usize, bool, i64)> {
@@ -764,10 +813,7 @@ impl TurnStateStore {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|ts| {
-                        let age = now - ts.issued_unix;
-                        age <= MAX_AGE_SECS
-                    })
+                    .filter(|ts| now - ts.issued_unix <= self.max_age_secs)
                     .map(|ts| {
                         let age = now - ts.issued_unix;
                         (ts.len, is_matching_token_len(ts.len, target), age)
@@ -817,10 +863,7 @@ impl TurnStateStore {
     pub fn fresh_count(&self) -> usize {
         self.tokens
             .values()
-            .filter(|ts| {
-                let age = now_unix() - ts.issued_unix;
-                age <= MAX_AGE_SECS && !is_degraded_token(&ts.token)
-            })
+            .filter(|ts| self.is_fresh_issued(ts.issued_unix) && !is_degraded_token(&ts.token))
             .count()
     }
 
@@ -861,7 +904,7 @@ impl TurnStateStore {
                                     len: ts.len,
                                     age_secs: age,
                                     is_bound: is_matching_token_len(ts.len, model_target),
-                                    is_valid: age <= MAX_AGE_SECS,
+                                    is_valid: age <= self.max_age_secs,
                                 }
                             })
                             .collect();
@@ -873,9 +916,9 @@ impl TurnStateStore {
                 match self.state_for_model(model) {
                     Some((source_model, state)) => {
                         let age = now - state.issued_unix;
-                        let status = if age > MAX_AGE_SECS {
+                        let status = if age > self.max_age_secs {
                             "expired"
-                        } else if age > PREFETCH_AGE_SECS {
+                        } else if age >= self.prefetch_age_secs {
                             "refreshing"
                         } else {
                             "active"
@@ -935,7 +978,7 @@ impl TurnStateStore {
                 .max_by_key(|ts| ts.issued_unix)
         });
         let shared_source = shared_state
-            .filter(|(_, ts)| now.saturating_sub(ts.issued_unix) <= MAX_AGE_SECS)
+            .filter(|(_, ts)| now.saturating_sub(ts.issued_unix) <= self.max_age_secs)
             .map(|(model, _)| model.to_string());
 
         TurnStateView {
@@ -965,6 +1008,7 @@ impl TurnState {
             captured_at: now_rfc3339(),
             proxy_session: String::new(),
             previous_response_id: String::new(),
+            routing_cookies: Vec::new(),
         })
     }
 }
@@ -1549,6 +1593,7 @@ mod tests {
             len: QUALITY_TOKEN_LEN, issued_unix: now_unix(), source: "fetch".into(), captured_at: String::new(),
             proxy_session: String::new(),
             previous_response_id: String::new(),
+            routing_cookies: Vec::new(),
         }]);
         assert!(store.peek_for_model("consumer").is_none());
         assert!(store.needs_refresh("consumer"));
@@ -1704,14 +1749,29 @@ mod tests {
         let mut store = TurnStateStore::default();
         assert!(store.needs_refresh("gpt-6-astra"));
 
-        let fresh = token_for(now_unix() - 30);
+        let fresh = token_for(now_unix() - 5);
         store.capture("gpt-6-astra", &fresh, "fetch");
         assert!(!store.needs_refresh("gpt-6-astra"));
 
-        // 36 分钟 → 需要预取
-        let old = token_for(now_unix() - 2160);
+        // 满 30 秒 → 再采一张，但仍可注入
+        let due = token_for(now_unix() - 30);
+        store.capture("gpt-6-astra", &due, "fetch");
+        assert!(store.needs_refresh("gpt-6-astra"));
+        assert_eq!(store.peek_for_model("gpt-6-astra").as_deref(), Some(due.as_str()));
+
+        // 超过 240 秒 → 停止注入
+        let old = token_for(now_unix() - 241);
         store.capture("gpt-6-astra", &old, "fetch");
         assert!(store.needs_refresh("gpt-6-astra"));
+        assert!(store.peek_for_model("gpt-6-astra").is_none());
+
+        store.set_lifetime(20 * 60, 10 * 60);
+        let mid = token_for(now_unix() - 15 * 60);
+        store.capture("gpt-6-astra", &mid, "fetch");
+        assert!(store.needs_refresh("gpt-6-astra"));
+        assert_eq!(store.peek_for_model("gpt-6-astra").as_deref(), Some(mid.as_str()));
+        store.set_lifetime(12 * 60, 8 * 60);
+        assert!(store.peek_for_model("gpt-6-astra").is_none());
     }
 
     #[test]
@@ -2050,11 +2110,30 @@ mod tests {
     fn capture_binds_and_restores_proxy_session() {
         let mut store = TurnStateStore::default();
         let token = token_for(now_unix() - 10);
-        assert!(store.capture_with_session("m1", &token, "fetch", Some("1Z5jzVPs"), Some("resp_probe")));
+        let cookies = vec![crate::chatgpt_cookies::RoutingCookie {
+            name: "__oailb".into(),
+            value: "route1".into(),
+            expires_unix: Some(now_unix() + 3600),
+        }];
+        assert!(store.capture_with_session(
+            "m1",
+            &token,
+            "fetch",
+            Some("1Z5jzVPs"),
+            Some("resp_probe"),
+            &cookies
+        ));
         assert_eq!(
             store.previous_response_id_for_token(Some(&token)).as_deref(),
             Some("resp_probe")
         );
+        let cookie_names = store
+            .routing_cookies_for_token(Some(&token))
+            .into_iter()
+            .map(|cookie| cookie.name)
+            .collect::<Vec<_>>();
+        assert_eq!(cookie_names, vec!["__oailb"]);
+        assert_eq!(store.bound_routing_cookies()[0].name, "__oailb");
         assert_eq!(store.bound_proxy_session().as_deref(), Some("1Z5jzVPs"));
         assert_eq!(
             store.proxy_session_for_token(Some(&token)).as_deref(),
@@ -2086,6 +2165,13 @@ mod tests {
                 .map(|ts| ts.previous_response_id.as_str()),
             Some("resp_probe")
         );
+        assert_eq!(
+            restored
+                .tokens
+                .get("m1")
+                .map(|ts| ts.routing_cookies.iter().map(|cookie| cookie.name.as_str()).collect::<Vec<_>>()),
+            Some(vec!["__oailb"])
+        );
         let legacy: TurnState = serde_json::from_value(serde_json::json!({
             "token": token,
             "issued_unix": now_unix() - 10,
@@ -2096,6 +2182,48 @@ mod tests {
         .unwrap();
         assert!(legacy.proxy_session.is_empty());
         assert!(legacy.previous_response_id.is_empty());
+        assert!(legacy.routing_cookies.is_empty());
+    }
+
+    #[test]
+    fn capture_drops_session_cookies_and_expired_routing_cookies() {
+        let mut store = TurnStateStore::default();
+        let token = token_for(now_unix() - 10);
+        assert!(store.capture_with_session(
+            "m1",
+            &token,
+            "fetch",
+            None,
+            None,
+            &[
+                crate::chatgpt_cookies::RoutingCookie {
+                    name: "__Secure-next-auth.session-token".into(),
+                    value: "stolen".into(),
+                    expires_unix: None,
+                },
+                crate::chatgpt_cookies::RoutingCookie {
+                    name: "chatgpt_session".into(),
+                    value: "nope".into(),
+                    expires_unix: None,
+                },
+                crate::chatgpt_cookies::RoutingCookie {
+                    name: "__cflb".into(),
+                    value: "dead".into(),
+                    expires_unix: Some(now_unix() - 1),
+                },
+                crate::chatgpt_cookies::RoutingCookie {
+                    name: "__oailb".into(),
+                    value: "live".into(),
+                    expires_unix: Some(now_unix() + 3600),
+                },
+            ],
+        ));
+        let names = store
+            .routing_cookies_for_token(Some(&token))
+            .into_iter()
+            .map(|cookie| cookie.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["__oailb"]);
     }
 
     #[test]

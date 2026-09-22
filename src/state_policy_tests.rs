@@ -155,6 +155,17 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
             value.pointer("/client_metadata/x-codex-turn-state").and_then(|v| v.as_str()),
             Some(fresh.as_str())
         );
+
+        // 同轮且客户端已带 State：只换请求头，保留 previous_response_id，不改 body。
+        let response = proxy_http(app.clone(), follow_up_request(true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let (headers, body) = received.recv().await.unwrap();
+        assert_eq!(headers.get(turn_state::HEADER_NAME).and_then(|v| v.to_str().ok()), Some(fresh.as_str()));
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value.get("previous_response_id").and_then(|v| v.as_str()), Some("resp_1"));
+        assert!(value.get("client_metadata").is_none());
+        assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, "header_only");
         // Strip-all also applies to routes other than /responses.
         app.settings.lock().await.state_miss_policy = StripAll;
         let response = proxy_http(app.clone(), Request::builder().uri("/models")
@@ -162,8 +173,8 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
         axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         assert!(!received.recv().await.unwrap().0.contains_key(turn_state::HEADER_NAME));
 
-        // Reject explicit identity conflicts before either Kit header override
-        // or waiting. A cached ticket and an absent state header are not bypasses.
+        // Reject another account before Kit header override or waiting.
+        // Same account with a stale Bearer is not a conflict after AT refresh.
         for kit_override in [true, false] {
             if !kit_override {
                 std::fs::rename(login::kit_auth_path(home.path()), home.path().join("auth.json")).unwrap();
@@ -173,33 +184,47 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
                 app.turn_state.lock().await.invalidate_all();
                 if cached { app.turn_state.lock().await.capture("policy-model", &fresh, "test"); }
                 for has_state in [false, true] {
-                    for (account, bearer) in [
-                        (Some("account-b"), Some("Bearer test-access")),
-                        (Some("account-a"), Some("Bearer conflicting-secret")),
-                        (None, Some("Bearer conflicting-secret")),
-                    ] {
-                        let mut req = request(has_state, true);
-                        req.headers_mut().remove("chatgpt-account-id");
-                        if let Some(account) = account {
-                            req.headers_mut().insert("chatgpt-account-id", HeaderValue::from_str(account).unwrap());
-                        }
-                        if let Some(bearer) = bearer {
-                            req.headers_mut().insert(header::AUTHORIZATION, HeaderValue::from_str(bearer).unwrap());
-                        }
-                        let traffic_before = app.traffic.view(Some("account-a"), Instant::now());
-                        let response = tokio::time::timeout(Duration::from_secs(1), proxy_http(app.clone(), req))
-                            .await.expect("identity conflicts must return immediately, not wait");
-                        assert_eq!(response.status(), StatusCode::CONFLICT);
-                        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-                        assert!(String::from_utf8_lossy(&body).contains("账号凭据不匹配"));
-                        assert!(received.try_recv().is_err(), "a rejected request reached upstream");
-                        assert_eq!(app.traffic.view(Some("account-a"), Instant::now()), traffic_before);
-                        let logs = app.logs.lock().await;
-                        let entry = logs.back().unwrap();
-                        assert_eq!(entry.error_kind.as_deref(), Some("state_account_mismatch"));
-                        assert!(!serde_json::to_string(entry).unwrap().contains("conflicting-secret"));
-                    }
+                    let mut req = request(has_state, true);
+                    req.headers_mut().insert("chatgpt-account-id", HeaderValue::from_static("account-b"));
+                    req.headers_mut().insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer other-account-token"));
+                    let traffic_before = app.traffic.view(Some("account-a"), Instant::now());
+                    let response = tokio::time::timeout(Duration::from_secs(1), proxy_http(app.clone(), req))
+                        .await.expect("account conflicts must return immediately, not wait");
+                    assert_eq!(response.status(), StatusCode::CONFLICT);
+                    let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+                    assert!(String::from_utf8_lossy(&body).contains("账号凭据不匹配"));
+                    assert!(received.try_recv().is_err(), "a rejected request reached upstream");
+                    assert_eq!(app.traffic.view(Some("account-a"), Instant::now()), traffic_before);
+                    let logs = app.logs.lock().await;
+                    let entry = logs.back().unwrap();
+                    assert_eq!(entry.error_kind.as_deref(), Some("state_account_mismatch"));
+                    assert!(!serde_json::to_string(entry).unwrap().contains("other-account-token"));
                 }
+            }
+            app.turn_state.lock().await.invalidate_all();
+            assert!(app.turn_state.lock().await.capture("policy-model", &fresh, "test"));
+            let mut stale_same_account = request(true, true);
+            stale_same_account
+                .headers_mut()
+                .insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer stale-access"));
+            let response = tokio::time::timeout(Duration::from_secs(1), proxy_http(app.clone(), stale_same_account))
+                .await
+                .expect("same-account stale AT must not 409");
+            assert_eq!(response.status(), StatusCode::OK, "kit_override={kit_override}");
+            axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(received.recv().await.unwrap().0[turn_state::HEADER_NAME], fresh);
+            if kit_override {
+                let mut stale_without_account = request(true, true);
+                stale_without_account.headers_mut().remove("chatgpt-account-id");
+                stale_without_account
+                    .headers_mut()
+                    .insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer stale-access"));
+                let response = tokio::time::timeout(Duration::from_secs(1), proxy_http(app.clone(), stale_without_account))
+                    .await
+                    .expect("Kit override can fill a missing account header");
+                assert_eq!(response.status(), StatusCode::OK);
+                axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+                assert_eq!(received.recv().await.unwrap().0[turn_state::HEADER_NAME], fresh);
             }
             // Matching credentials still forward successfully in both modes.
             app.turn_state.lock().await.capture("policy-model", &fresh, "test");
@@ -252,6 +277,42 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
         axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         assert_eq!(received.recv().await.unwrap().0[turn_state::HEADER_NAME], fresh);
         assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, "injected_after_wait");
+
+        app.turn_state.lock().await.invalidate_all();
+        let pending = tokio::spawn(proxy_http(app.clone(), follow_up_request(true)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!pending.is_finished());
+        assert!(received.try_recv().is_err());
+        app.turn_state.lock().await.capture("policy-model", &fresh, "test");
+        let response = pending.await.unwrap();
+        axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let (headers, body) = received.recv().await.unwrap();
+        assert_eq!(headers[turn_state::HEADER_NAME], fresh);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value.get("previous_response_id").and_then(|v| v.as_str()), Some("resp_1"));
+        assert!(value.get("client_metadata").is_none());
+        assert_eq!(app.logs.lock().await.back().unwrap().turn_state_action, "header_only_after_wait");
+
+        app.turn_state.lock().await.invalidate_all();
+        app.settings.lock().await.token_fetch_paused = true;
+        let response = tokio::time::timeout(Duration::from_secs(1), proxy_http(app.clone(), request(true, true)))
+            .await
+            .expect("paused fetch must stop waiting immediately");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(String::from_utf8_lossy(&axum::body::to_bytes(response.into_body(), 1024).await.unwrap()).contains("已暂停获取 Token"));
+        assert_eq!(app.logs.lock().await.back().unwrap().error_kind.as_deref(), Some("state_wait_fetch_paused"));
+        assert!(received.try_recv().is_err());
+        app.settings.lock().await.token_fetch_paused = false;
+
+        let pending = tokio::spawn(proxy_http(app.clone(), request(true, true)));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!pending.is_finished());
+        app.settings.lock().await.token_fetch_paused = true;
+        app.fetch_change_notify.notify_waiters();
+        assert_eq!(pending.await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(app.logs.lock().await.back().unwrap().error_kind.as_deref(), Some("state_wait_fetch_paused"));
+        assert!(received.try_recv().is_err());
+        app.settings.lock().await.token_fetch_paused = false;
 
         // Changes while waiting must never send the original request on stale
         // credentials or silently fall back to client state.

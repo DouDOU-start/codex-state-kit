@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::chatgpt_cookies::{self, RoutingCookie};
 use crate::login::ChatGptCredentials;
 use crate::logs::{self, NetworkLogDetails};
 use crate::settings::{OutboundMode, Settings};
@@ -27,7 +28,6 @@ pub const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(6);
 const CODEX_IDENTITY_VERSION: &str = "0.153.4";
 const CODEX_ORIGINATOR: &str = "codex-tui";
 const CODEX_USER_AGENT_SUFFIX: &str = " (Ubuntu 22.4.0; x86_64) xterm-256color";
-const MAX_FETCH_TICKET_AGE_SECS: i64 = 35 * 60;
 
 const SESSION_PLACEHOLDER_LC: &str = "{session}";
 const SESSION_PLACEHOLDER_UC: &str = "{SESSION}";
@@ -37,6 +37,7 @@ const PROBE_RESPONSE_ID_LIMIT: usize = 256 * 1024;
 pub(crate) struct FetchedTicket {
     pub token: String,
     pub previous_response_id: Option<String>,
+    pub routing_cookies: Vec<RoutingCookie>,
 }
 
 pub fn outbound_proxy_for_client(raw: &str) -> String {
@@ -223,6 +224,29 @@ pub(crate) async fn fetch_turn_state_with_log(
     allow_auto_quality: bool,
     details: &mut NetworkLogDetails,
 ) -> Result<FetchedTicket> {
+    fetch_turn_state_with_cookies(
+        client,
+        settings,
+        creds,
+        model,
+        target_len,
+        allow_auto_quality,
+        &[],
+        details,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_turn_state_with_cookies(
+    client: &reqwest::Client,
+    settings: &Settings,
+    creds: &ChatGptCredentials,
+    model: &str,
+    target_len: usize,
+    allow_auto_quality: bool,
+    request_cookies: &[RoutingCookie],
+    details: &mut NetworkLogDetails,
+) -> Result<FetchedTicket> {
     let url = responses_url(&settings.upstream);
     let effective_proxy = outbound_proxy_for_client(&settings.outbound_proxy);
     *details = logs::token_network_details(
@@ -238,7 +262,7 @@ pub(crate) async fn fetch_turn_state_with_log(
         .map(|body| body.len())
         .unwrap_or(0);
     let request_started = Instant::now();
-    let response = match client
+    let mut request = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", creds.access_token))
         .header("ChatGPT-Account-ID", &creds.account_id)
@@ -250,9 +274,14 @@ pub(crate) async fn fetch_turn_state_with_log(
         .header("originator", CODEX_ORIGINATOR)
         .header("version", CODEX_IDENTITY_VERSION)
         .header("User-Agent", codex_user_agent())
-        .json(&probe)
-        .send()
-        .await
+        .json(&probe);
+    if let Some(cookie) = chatgpt_cookies::request_header(
+        request_cookies,
+        chatgpt_cookies::is_chatgpt_https_url(&url),
+    ) {
+        request = request.header(http::header::COOKIE, cookie);
+    }
+    let response = match request.send().await
     {
         Ok(response) => response,
         Err(err) => {
@@ -321,15 +350,19 @@ pub(crate) async fn fetch_turn_state_with_log(
         details.turn_state_action = "rejected_future".into();
         bail!("上游返回的 {HEADER_NAME} 时间戳超前");
     }
-    if age > MAX_FETCH_TICKET_AGE_SECS {
+    if age > turn_state::MAX_AGE_SECS {
         details.turn_state_action = "rejected_stale".into();
-        bail!("上游返回的 {HEADER_NAME} 已超过预取年龄");
+        bail!("上游返回的 {HEADER_NAME} 已超过 240 秒新鲜窗口");
     }
     details.turn_state_action = "received".into();
+    let mut jar = chatgpt_cookies::CookieJar::from_stored(request_cookies);
+    jar.ingest_response_headers(response.headers(), chrono::Utc::now().timestamp());
+    let routing_cookies = jar.stored();
     let previous_response_id = read_probe_response_id(response).await;
     Ok(FetchedTicket {
         token,
         previous_response_id,
+        routing_cookies,
     })
 }
 
@@ -419,6 +452,7 @@ mod tests {
         status: StatusCode,
         token: Option<String>,
         body: Option<String>,
+        set_cookies: Vec<String>,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
     }
 
@@ -456,6 +490,12 @@ mod tests {
         if let Some(token) = &state.token {
             headers.insert(HEADER_NAME, HeaderValue::from_str(token).unwrap());
         }
+        for cookie in &state.set_cookies {
+            headers.append(
+                http::header::SET_COOKIE,
+                HeaderValue::from_str(cookie).unwrap(),
+            );
+        }
         if let Some(body) = &state.body {
             return (state.status, headers, body.clone()).into_response();
         }
@@ -474,11 +514,29 @@ mod tests {
         token: Option<String>,
         body: Option<String>,
     ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        serve_full(status, token, body, Vec::new()).await
+    }
+
+    async fn serve_with_cookies(
+        status: StatusCode,
+        token: Option<String>,
+        set_cookies: Vec<String>,
+    ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        serve_full(status, token, None, set_cookies).await
+    }
+
+    async fn serve_full(
+        status: StatusCode,
+        token: Option<String>,
+        body: Option<String>,
+        set_cookies: Vec<String>,
+    ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = MockState {
             status,
             token,
             body,
+            set_cookies,
             requests: requests.clone(),
         };
         let app = Router::new()
@@ -617,6 +675,7 @@ mod tests {
         .unwrap();
         assert_eq!(fetched.token, expected);
         assert_eq!(fetched.previous_response_id, None);
+        assert!(fetched.routing_cookies.is_empty());
         assert_eq!(details.response_status, Some(200));
         assert!(details.response_header_ms.is_some());
         assert_eq!(details.turn_state_action, "received");
@@ -768,7 +827,7 @@ mod tests {
             (
                 token_for_len_at(
                     turn_state::QUALITY_TOKEN_LEN,
-                    now - MAX_FETCH_TICKET_AGE_SECS - 1,
+                    now - turn_state::MAX_AGE_SECS - 1,
                 ),
                 "rejected_stale",
             ),
@@ -879,5 +938,66 @@ mod tests {
         .unwrap();
         assert_eq!(fetched.token, expected);
         assert_eq!(fetched.previous_response_id.as_deref(), Some("resp_probe"));
+    }
+
+    #[tokio::test]
+    async fn captures_allowlisted_cookies_and_replays_them() {
+        let expected = token_for_len(turn_state::QUALITY_TOKEN_LEN);
+        let (upstream, requests) = serve_with_cookies(
+            StatusCode::OK,
+            Some(expected.clone()),
+            vec![
+                "__oailb=route1; Max-Age=3600; Path=/".into(),
+                "__cflb=edge1; Max-Age=240".into(),
+                "__Secure-next-auth.session-token=stolen; Max-Age=3600".into(),
+                "chatgpt_session=nope".into(),
+            ],
+        )
+        .await;
+        let settings = Settings {
+            upstream,
+            ..Settings::default()
+        };
+        let mut details = NetworkLogDetails::default();
+        let fetched = fetch_turn_state_with_log(
+            &http_client("").unwrap(),
+            &settings,
+            &creds(),
+            "gpt-6-astra",
+            turn_state::QUALITY_TOKEN_LEN,
+            false,
+            &mut details,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched.token, expected);
+        assert_eq!(
+            fetched
+                .routing_cookies
+                .iter()
+                .map(|cookie| cookie.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["__cflb", "__oailb"]
+        );
+
+        let mut replay = NetworkLogDetails::default();
+        fetch_turn_state_with_cookies(
+            &http_client("").unwrap(),
+            &settings,
+            &creds(),
+            "gpt-6-astra",
+            turn_state::QUALITY_TOKEN_LEN,
+            false,
+            &fetched.routing_cookies,
+            &mut replay,
+        )
+        .await
+        .unwrap();
+        let captured = requests.lock().unwrap();
+        assert!(captured[0].headers.get(http::header::COOKIE).is_none());
+        let cookie = captured[1].headers[http::header::COOKIE].to_str().unwrap();
+        assert!(cookie.contains("__oailb=route1"));
+        assert!(cookie.contains("__cflb=edge1"));
+        assert!(!cookie.contains("session"));
     }
 }

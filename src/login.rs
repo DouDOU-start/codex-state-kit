@@ -25,6 +25,11 @@ pub enum LoginMethod {
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const USER_AGENT: &str = "codex-state-kit";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn oauth_token_endpoint() -> &'static str {
+    OAUTH_TOKEN_URL
+}
 const VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
 const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const DEFAULT_EXPIRES_IN: u64 = 900;
@@ -402,7 +407,7 @@ pub(crate) fn apply_chatgpt_credentials_headers(
     };
     headers.insert(http::header::AUTHORIZATION, auth);
     headers.insert(HeaderName::from_static("chatgpt-account-id"), account);
-    headers.remove(http::header::COOKIE);
+    crate::chatgpt_cookies::retain_allowed_request_cookies(headers);
     true
 }
 
@@ -427,29 +432,25 @@ pub(crate) fn credentials_match_headers(
     headers: &HeaderMap,
     creds: &ChatGptCredentials,
 ) -> bool {
-    (headers.contains_key("chatgpt-account-id") || headers.contains_key(http::header::AUTHORIZATION))
-        && !credentials_conflict_headers(headers, creds)
+    request_account_id(headers).is_some_and(|account_id| account_id == creds.account_id)
 }
 
-/// Absence is not a conflict: Kit may supply both authentication headers.
-/// When a client explicitly supplies either field, validate it before override.
+/// Absence is not a conflict: Kit may supply the account header.
+/// Only an explicit `chatgpt-account-id` for another account is a conflict.
+/// A different Bearer on the same account is expected after AT refresh.
 pub(crate) fn credentials_conflict_headers(
     headers: &HeaderMap,
     creds: &ChatGptCredentials,
 ) -> bool {
-    let account_conflict = headers
+    request_account_id(headers).is_some_and(|account_id| account_id != creds.account_id)
+}
+
+fn request_account_id(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get("chatgpt-account-id")
-        .is_some_and(|value| value.to_str().ok().is_none_or(|value| value.trim() != creds.account_id));
-    let authorization_conflict = headers
-        .get(http::header::AUTHORIZATION)
-        .is_some_and(|value| {
-            value.to_str().ok().is_none_or(|value| {
-                !value.split_once(' ').is_some_and(|(scheme, token)| {
-                    scheme.eq_ignore_ascii_case("bearer") && token.trim() == creds.access_token
-                })
-            })
-        });
-    account_conflict || authorization_conflict
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 pub async fn start_device_login(
@@ -669,6 +670,65 @@ async fn exchange_refresh_token_at(
     serde_json::from_str(&body).map_err(|_| anyhow::anyhow!("授权服务返回了无效的 Token 响应"))
 }
 
+fn stored_refresh_token(home: &Path) -> Option<String> {
+    let logged_in = |path: PathBuf| {
+        read_auth_file(&path)
+            .ok()
+            .flatten()
+            .filter(|auth| status_from_auth(auth).logged_in)
+    };
+    let kit = logged_in(kit_auth_path(home));
+    let official = logged_in(official_auth_path(home));
+    let auth = match (kit, official) {
+        (Some(kit_auth), Some(official_auth))
+            if should_adopt_official_refresh(&kit_auth, &official_auth) =>
+        {
+            official_auth
+        }
+        (Some(kit_auth), _) => kit_auth,
+        (None, Some(official_auth)) => official_auth,
+        (None, None) => return None,
+    };
+    auth.get("tokens")
+        .and_then(Value::as_object)
+        .and_then(|tokens| tokens.get("refresh_token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn refresh_can_reuse_current(message: &str) -> bool {
+    message.contains("earliest_refresh_at") || message.contains(" 429")
+}
+
+/// 用当前登录文件里的 RT 换新 AT/RT，立刻写回 Kit 与接入中的官方登录文件。
+pub(crate) async fn refresh_session_credentials(
+    home: &Path,
+    client: &reqwest::Client,
+    token_url: &str,
+) -> Result<ChatGptCredentials> {
+    let creds = chatgpt_credentials(home)?;
+    if !creds.refreshable {
+        return Ok(creds);
+    }
+    let Some(refresh_token) = stored_refresh_token(home) else {
+        return Ok(creds);
+    };
+    match exchange_refresh_token_at(client, token_url, &refresh_token).await {
+        Ok(tokens) => {
+            persist_refresh_token_import(home, &refresh_token, &tokens)?;
+            chatgpt_credentials(home)
+        }
+        Err(err) => {
+            if refresh_can_reuse_current(&format!("{err:#}")) {
+                return Ok(creds);
+            }
+            Err(err)
+        }
+    }
+}
+
 pub fn persist_refresh_token_import(
     home: &Path,
     supplied_refresh_token: &str,
@@ -744,9 +804,27 @@ fn oauth_error_detail(body: &str, secrets: &[&str]) -> Option<String> {
     let value: Value = serde_json::from_str(body).ok()?;
     let mut message = ["error_description", "error", "message"]
         .into_iter()
-        .find_map(|key| value.get(key).and_then(Value::as_str))?
-        .trim()
+        .find_map(|key| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("")
         .to_string();
+    if let Some(at) = value
+        .get("earliest_refresh_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if message.is_empty() {
+            message = format!("earliest_refresh_at={at}");
+        } else {
+            message = format!("{message}; earliest_refresh_at={at}");
+        }
+    }
     if message.is_empty() {
         return None;
     }
@@ -1273,6 +1351,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_session_credentials_rotates_and_rewrites_login_files() {
+        let home = tempfile::tempdir().unwrap();
+        let old_access = test_jwt("acct-rt", "old@example.com");
+        let new_access = test_jwt("acct-rt", "new@example.com");
+        std::fs::write(
+            kit_auth_path(home.path()),
+            json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": old_access,
+                    "access_token": old_access,
+                    "refresh_token": "stored-refresh",
+                    "account_id": "acct-rt"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (url, mut requests) = serve_refresh_response(
+            StatusCode::OK,
+            json!({
+                "access_token": new_access,
+                "refresh_token": "rotated-session-refresh"
+            }),
+        )
+        .await;
+        let client = token_import_http_client().unwrap();
+        let creds = refresh_session_credentials(home.path(), &client, &url)
+            .await
+            .unwrap();
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request["refresh_token"], "stored-refresh");
+        assert_eq!(creds.access_token, new_access);
+        assert_eq!(creds.account_id, "acct-rt");
+        assert!(creds.refreshable);
+
+        let kit: Value =
+            serde_json::from_str(&std::fs::read_to_string(kit_auth_path(home.path())).unwrap())
+                .unwrap();
+        assert_eq!(kit["tokens"]["access_token"], new_access);
+        assert_eq!(kit["tokens"]["refresh_token"], "rotated-session-refresh");
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("auth.json")).unwrap(),
+            std::fs::read_to_string(kit_auth_path(home.path())).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_session_credentials_keeps_current_when_too_soon() {
+        let home = tempfile::tempdir().unwrap();
+        let access = test_jwt("acct-rt", "soon@example.com");
+        std::fs::write(
+            kit_auth_path(home.path()),
+            json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": access,
+                    "access_token": access,
+                    "refresh_token": "stored-refresh",
+                    "account_id": "acct-rt"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (url, _requests) = serve_refresh_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"invalid_request","earliest_refresh_at":"2026-09-30T00:00:00Z"}),
+        )
+        .await;
+        let client = token_import_http_client().unwrap();
+        let creds = refresh_session_credentials(home.path(), &client, &url)
+            .await
+            .unwrap();
+        assert_eq!(creds.access_token, access);
+        let kit: Value =
+            serde_json::from_str(&std::fs::read_to_string(kit_auth_path(home.path())).unwrap())
+                .unwrap();
+        assert_eq!(kit["tokens"]["refresh_token"], "stored-refresh");
+    }
+
+    #[tokio::test]
     async fn refresh_token_error_redacts_supplied_secret() {
         let (url, _requests) = serve_refresh_response(
             StatusCode::BAD_REQUEST,
@@ -1672,6 +1832,38 @@ mod tests {
     }
 
     #[test]
+    fn same_account_stale_bearer_is_not_a_conflict() {
+        let creds = ChatGptCredentials {
+            access_token: "kit-access".into(),
+            account_id: "acct-a".into(),
+            email: None,
+            auth_mode: "chatgpt".into(),
+            refreshable: true,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer stale-access"),
+        );
+        assert!(!credentials_conflict_headers(&headers, &creds));
+        assert!(!credentials_match_headers(&headers, &creds));
+
+        headers.insert(
+            HeaderName::from_static("chatgpt-account-id"),
+            HeaderValue::from_static("acct-a"),
+        );
+        assert!(!credentials_conflict_headers(&headers, &creds));
+        assert!(credentials_match_headers(&headers, &creds));
+
+        headers.insert(
+            HeaderName::from_static("chatgpt-account-id"),
+            HeaderValue::from_static("acct-b"),
+        );
+        assert!(credentials_conflict_headers(&headers, &creds));
+        assert!(!credentials_match_headers(&headers, &creds));
+    }
+
+    #[test]
     fn kit_session_overrides_official_credentials() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1717,9 +1909,13 @@ mod tests {
             HeaderName::from_static("chatgpt-account-id"),
             HeaderValue::from_static("kit"),
         );
-        headers.insert(http::header::COOKIE, HeaderValue::from_static("session=old"));
-        // Matching one identity field is insufficient when another explicitly conflicts.
-        assert!(!credentials_match_headers(&headers, &request_creds));
+        headers.insert(
+            http::header::COOKIE,
+            HeaderValue::from_static("session=old; __oailb=route1; chatgpt_session=nope"),
+        );
+        // Same account with a stale AT still matches; Kit will overwrite the Bearer.
+        assert!(credentials_match_headers(&headers, &request_creds));
+        assert!(!credentials_conflict_headers(&headers, &request_creds));
         apply_kit_auth_headers(&mut headers, home.path());
         assert!(credentials_match_headers(&headers, &request_creds));
         assert_eq!(
@@ -1730,6 +1926,22 @@ mod tests {
             headers.get("chatgpt-account-id").unwrap(),
             "kit"
         );
-        assert!(headers.get(http::header::COOKIE).is_none());
+        assert_eq!(
+            headers.get(http::header::COOKIE).unwrap(),
+            "__oailb=route1"
+        );
+
+        let mut session_only = HeaderMap::new();
+        session_only.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer official-access"),
+        );
+        session_only.insert(
+            HeaderName::from_static("chatgpt-account-id"),
+            HeaderValue::from_static("kit"),
+        );
+        session_only.insert(http::header::COOKIE, HeaderValue::from_static("session=old"));
+        apply_kit_auth_headers(&mut session_only, home.path());
+        assert!(session_only.get(http::header::COOKIE).is_none());
     }
 }
