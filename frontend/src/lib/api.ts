@@ -28,6 +28,7 @@ const emptyTurnState = () => ({
 const defaultStatus = (): Status => ({
   stateMissPolicy: "preserve",
   tokenReusePolicy: "shared_292",
+  stateFetchModel: "",
   tokenFetchPaused: false,
   tokenMaxAgeMins: 40,
   tokenPrefetchAgeMins: 35,
@@ -228,6 +229,7 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
     warpHttp2: settings.warpHttp2,
     stateMissPolicy: settings.stateMissPolicy,
     tokenReusePolicy: settings.tokenReusePolicy,
+    stateFetchModel: settings.stateFetchModel,
     tokenFetchPaused: settings.tokenFetchPaused ?? false,
     tokenMaxAgeMins: settings.tokenMaxAgeMins ?? 40,
     tokenPrefetchAgeMins: settings.tokenPrefetchAgeMins ?? 35,

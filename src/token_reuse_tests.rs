@@ -72,6 +72,7 @@ fn patch(settings: &Settings, policy: TokenReusePolicy) -> SettingsPatch {
         models: settings.models.clone(),
         state_miss_policy: settings.state_miss_policy,
         token_reuse_policy: policy,
+        state_fetch_model: settings.state_fetch_model.clone(),
         network_route_policy: settings.network_route_policy,
         forced_model: settings.forced_model.clone(),
         token_fetch_paused: settings.token_fetch_paused,
@@ -260,6 +261,77 @@ async fn manual_refresh_bypasses_pause_and_cooldown() {
             Some(TOKEN_MANUAL_REFRESH_MESSAGE)
         );
         assert!(app.settings.lock().await.token_fetch_paused);
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pinned_donor_is_the_only_model_that_fetches_shared_292() {
+    if !isolated_child(
+        "proxy::token_reuse_tests::pinned_donor_is_the_only_model_that_fetches_shared_292",
+    ) {
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let home = tempfile::tempdir().unwrap();
+        write_login(home.path());
+        let probed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probed_seen = probed.clone();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let fresh = ticket(0);
+        let reply_token = fresh.clone();
+        let router =
+            axum::Router::new().fallback(move |_headers: HeaderMap, Json(body): Json<Value>| {
+                let probed = probed_seen.clone();
+                let sent = sent.clone();
+                let token = reply_token.clone();
+                async move {
+                    if body["test_business"] == true {
+                        sent.send(body).unwrap();
+                        Response::new(Body::from("ok"))
+                    } else {
+                        probed
+                            .lock()
+                            .unwrap()
+                            .push(body["model"].as_str().unwrap_or("").to_string());
+                        Response::builder()
+                            .header(turn_state::HEADER_NAME, token)
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                }
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let app = Arc::new(
+            App::new(Settings {
+                upstream: endpoint.clone(),
+                outbound_proxy: endpoint,
+                outbound_mode: OutboundMode::Manual,
+                codex_home: home.path().display().to_string(),
+                models: vec!["a".into(), "b".into()],
+                state_fetch_model: "gpt-5.5".into(),
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        assert_eq!(app.refresh_if_needed().await, fetch::CHECK_INTERVAL);
+        assert_eq!(probed.lock().unwrap().as_slice(), ["gpt-5.5".to_string()]);
+        app.refresh_turn_state().await.unwrap();
+        assert_eq!(
+            probed.lock().unwrap().as_slice(),
+            ["gpt-5.5".to_string(), "gpt-5.5".to_string()]
+        );
+        let response = proxy_http(app.clone(), request("a")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = received.recv().await.unwrap();
+        assert_eq!(body["model"], "a");
         server.abort();
     })
     .await

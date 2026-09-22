@@ -27,6 +27,7 @@ function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): Sett
     warpHttp2: status.warpHttp2,
     stateMissPolicy: status.stateMissPolicy,
     tokenReusePolicy: status.tokenReusePolicy,
+    stateFetchModel: status.stateFetchModel ?? "",
     tokenFetchPaused: status.tokenFetchPaused ?? false,
     tokenMaxAgeMins: status.tokenMaxAgeMins ?? 40,
     tokenPrefetchAgeMins: status.tokenPrefetchAgeMins ?? 35,
@@ -169,6 +170,22 @@ export function useCodexStateKit() {
       setBanner({ kind: "ok", text: tokenReusePolicy === "shared_292"
         ? "已启用跨模型复用 292，同账号共享有效票据。"
         : "已恢复按模型独立，各模型分别获取和复用 Token。" });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const saveStateFetchModel = useCallback(async (stateFetchModel: string) => {
+    setBusy("save");
+    try {
+      const latest = await getStatus();
+      const next = await setConfig(patchFrom(latest, { stateFetchModel: stateFetchModel.trim() }));
+      setStatus(next);
+      setBanner({ kind: "ok", text: next.tokenReusePolicy === "shared_292" && next.stateFetchModel
+        ? `跨模型复用只使用 ${next.stateFetchModel} 获取 292。`
+        : "已取消指定取票模型，292 会从可用模型中获取。" });
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
     } finally {
@@ -378,6 +395,7 @@ export function useCodexStateKit() {
     saveSettings,
     setStateMissPolicy,
     setTokenReusePolicy,
+    saveStateFetchModel,
     setTokenFetchPaused,
     setNetworkRoutePolicy,
     saveForcedModel,

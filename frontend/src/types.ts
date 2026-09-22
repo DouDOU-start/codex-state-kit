@@ -81,6 +81,7 @@ export interface TurnStateView {
 
 export interface Status {
   tokenReusePolicy: TokenReusePolicy;
+  stateFetchModel: string;
   tokenFetchPaused?: boolean;
   tokenMaxAgeMins?: number;
   tokenPrefetchAgeMins?: number;
@@ -114,6 +115,7 @@ export interface Status {
 
 export interface SettingsPatch {
   tokenReusePolicy: TokenReusePolicy;
+  stateFetchModel: string;
   tokenFetchPaused?: boolean;
   tokenMaxAgeMins?: number;
   tokenPrefetchAgeMins?: number;

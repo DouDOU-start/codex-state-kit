@@ -168,6 +168,7 @@ export default function App() {
   const [outboundProxy, setOutboundProxy] = useState("");
   const [upstreamProxy, setUpstreamProxy] = useState("");
   const [forcedModel, setForcedModel] = useState("");
+  const [stateFetchModel, setStateFetchModel] = useState("");
   const [loginMode, setLoginMode] = useState<LoginMode>("browser");
   const [refreshTokenInput, setRefreshTokenInput] = useState("");
   const [accessTokenInput, setAccessTokenInput] = useState("");
@@ -182,6 +183,7 @@ export default function App() {
     setOutboundProxy(fwd.status.outboundProxy ?? "");
     setUpstreamProxy(fwd.status.upstreamProxy ?? "");
     setForcedModel(fwd.status.forcedModel ?? "");
+    setStateFetchModel(fwd.status.stateFetchModel ?? "");
   }, [fwd.status]);
 
 
@@ -219,6 +221,7 @@ export default function App() {
         : null,
   ].filter(Boolean).join(" · ");
   const turn = fwd.status.turnState;
+  const stateDonor = fwd.status.tokenReusePolicy === "shared_292" ? fwd.status.stateFetchModel : "";
   const fetchPaused = Boolean(fwd.status.tokenFetchPaused);
   const token = tokenChip(turn, fetchPaused);
   const degrade = degradeChip(fwd.status);
@@ -366,7 +369,29 @@ export default function App() {
                 <span><strong>按模型独立 <small>旧策略</small></strong><span>各模型分别获取，只复用各自的 Token</span></span>
               </label>
             </div>
-            <p>292 与线路 Cookie 成套保存、成套注入。采到后 30 秒再采下一张，超过 240 秒停止注入。连续打不到时按 1→2→4→8→16 加并发。332 及其他绑定长度仍按模型独立。跨模型效果以实际请求为准，可随时切回旧策略。</p>
+            {fwd.status.tokenReusePolicy === "shared_292" ? (
+              <label className="field token-reuse-donor">
+                <span>取 State 的模型</span>
+                <input
+                  spellCheck={false}
+                  autoComplete="off"
+                  disabled={fwd.busy !== null}
+                  value={stateFetchModel}
+                  placeholder="例如 gpt-5.5，留空则从已有模型里选一个"
+                  onChange={(event) => setStateFetchModel(event.target.value)}
+                  onBlur={(event) => {
+                    const value = event.currentTarget.value;
+                    if (value.trim() === (fwd.status?.stateFetchModel ?? "")) return;
+                    setStateFetchModel(value);
+                    void fwd.saveStateFetchModel(value);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
+                />
+              </label>
+            ) : null}
+            <p>292 与线路 Cookie 成套保存、成套注入。填写取票模型后，跨模型复用只向这个模型索取 292，其他模型不再打这张共享票。332 及其他绑定长度仍按模型独立。留空则从已有模型里选一个供体。</p>
           </div>
           {turn?.models && turn.models.length > 0 ? (
             <div className="token-models">
@@ -378,6 +403,7 @@ export default function App() {
                   <span className={`token-model token-model--${m.status}`}>
                     <i />{m.model}{m.ageSecs != null ? ` · ${formatAge(m.ageSecs)}` : ""}{m.len ? ` · ${m.len}字节` : ""}
                     {m.sharedFromModel ? <span className="token-model__shared" title={`票据来源：${m.sharedFromModel}`}>共享 · {m.sharedFromModel}</span> : null}
+                    {stateDonor && stateDonor === m.model ? <span className="token-model__donor">取票</span> : null}
                     {hasOverride ? <span className="token-model__override">独立绑定 {effectiveBound}</span> : null}
                   </span>
                   {/* 池中缓存的 token（所有长度），点击设置模型级绑定 */}

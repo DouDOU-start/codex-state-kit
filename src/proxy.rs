@@ -175,6 +175,27 @@ fn model_for_fetch_round(models: &[String], round: u32) -> Option<&str> {
     Some(models[(round.saturating_sub(1) as usize) % models.len()].as_str())
 }
 
+/// 指定了取票模型时，共享 292 只保留这一个供体；其他绑定长度仍各自刷新。
+fn pin_shared_donor(store: &TurnStateStore, models: &[String], donor: &str) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut shared_due = false;
+    let mut donor_kept = false;
+    for model in models {
+        if store.shares_292_for(model) {
+            shared_due = true;
+            continue;
+        }
+        if model == donor {
+            donor_kept = true;
+        }
+        kept.push(model.clone());
+    }
+    if shared_due && !donor_kept {
+        kept.insert(0, donor.to_string());
+    }
+    kept
+}
+
 /// Shared 292 is one refresh target. Pick any eligible donor at random, while
 /// retaining round-robin fairness for independently bound non-292 models.
 fn model_for_reuse_round<'a>(store: &TurnStateStore, models: &'a [String], round: u32) -> Option<&'a str> {
@@ -258,6 +279,7 @@ pub struct Status {
     pub current_account_email: Option<String>,
     pub state_miss_policy: StateMissPolicy,
     pub token_reuse_policy: TokenReusePolicy,
+    pub state_fetch_model: String,
     pub network_route_policy: NetworkRoutePolicy,
     pub forced_model: String,
     pub configured_models: Vec<String>,
@@ -519,6 +541,7 @@ impl App {
             current_account_email: login_status.email,
             state_miss_policy: settings.state_miss_policy,
             token_reuse_policy: settings.token_reuse_policy,
+            state_fetch_model: settings.state_fetch_model,
             network_route_policy: settings.network_route_policy,
             forced_model: settings.forced_model,
             configured_models: settings.models,
@@ -554,11 +577,26 @@ impl App {
                 models.insert(0, model.to_string());
             }
         }
+        let pinned_donor = {
+            let store = self.turn_state.lock().await;
+            settings
+                .shared_state_donor()
+                .filter(|donor| store.shares_292_for(donor))
+                .map(str::to_string)
+        };
+        if let Some(donor) = pinned_donor.as_deref() {
+            self.turn_state.lock().await.register_model(donor);
+            if !models.iter().any(|item| item == donor) {
+                models.insert(0, donor.to_string());
+            }
+        }
         let mut errors = Vec::new();
         let mut shared_refreshed = false;
         for model in &models {
             let shared = self.turn_state.lock().await.shares_292_for(model);
-            if shared && shared_refreshed {
+            if shared
+                && (pinned_donor.as_deref().is_some_and(|donor| donor != model) || shared_refreshed)
+            {
                 continue;
             }
             if let Err(e) = self.fetch_once(model).await {
@@ -1114,6 +1152,11 @@ impl App {
                     eprintln!("[seed] 从强制绑定注册模型: {}", model);
                 }
             }
+            if let Some(model) = settings.shared_state_donor() {
+                if store.register_model(model) {
+                    eprintln!("[seed] 跨模型复用指定取票模型: {}", model);
+                }
+            }
         }
 
         // 312 降智信号 → 清池（所有模型的 token，但保留追踪）
@@ -1123,14 +1166,20 @@ impl App {
             *self.degraded_at.lock().await = None;
         }
 
-        // 获取所有活跃模型（最近 60 分钟内有请求的），检查哪些需要刷新
+        // 获取所有活跃模型（最近 60 分钟内有请求的），检查哪些需要刷新。
+        // 指定了取票模型时，共享 292 只向该模型索取。
+        let donor = settings.shared_state_donor().map(str::to_string);
         let models_needing_refresh: Vec<String> = {
             let store = self.turn_state.lock().await;
-            store
+            let models: Vec<String> = store
                 .all_active_models()
                 .into_iter()
                 .filter(|m| store.needs_refresh(m))
-                .collect()
+                .collect();
+            match donor.as_deref() {
+                Some(donor) if store.shares_292_for(donor) => pin_shared_donor(&store, &models, donor),
+                _ => models,
+            }
         };
 
         if models_needing_refresh.is_empty() {
@@ -1544,6 +1593,12 @@ impl ProxyHandle {
         }
         if old.forced_model != next.forced_model {
             if let Some(model) = next.forced_model() {
+                self.app.turn_state.lock().await.register_model(model);
+            }
+            self.app.model_notify.notify_one();
+        }
+        if old.state_fetch_model != next.state_fetch_model {
+            if let Some(model) = next.shared_state_donor() {
                 self.app.turn_state.lock().await.register_model(model);
             }
             self.app.model_notify.notify_one();
@@ -2690,6 +2745,20 @@ mod tests {
             assert_eq!(model_for_reuse_round(&store, &models, round), model_for_fetch_round(&models, round));
         }
         assert!(model_for_reuse_round(&store, &[], 1).is_none());
+        store.set_reuse_policy(TokenReusePolicy::Shared292);
+        let pinned = pin_shared_donor(&store, &models, "b");
+        assert_eq!(pinned, vec!["b".to_string(), "independent".to_string()]);
+        for round in 1..=10 {
+            let selected = model_for_reuse_round(&store, &pinned, round).unwrap();
+            if round % 2 == 0 {
+                assert_eq!(selected, "independent");
+            } else {
+                assert_eq!(selected, "b");
+            }
+        }
+        let only_donor = pin_shared_donor(&store, &["a".into(), "b".into()], "gpt-5.5");
+        assert_eq!(only_donor, vec!["gpt-5.5".to_string()]);
+        assert!(only_donor.iter().all(|model| model == "gpt-5.5"));
     }
 
     #[test]

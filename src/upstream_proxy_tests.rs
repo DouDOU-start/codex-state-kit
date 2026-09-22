@@ -73,6 +73,7 @@ fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
         outbound_mode: settings.outbound_mode,
         warp_http2: settings.warp_http2,
         models: settings.models.clone(),
+        state_fetch_model: settings.state_fetch_model.clone(),
         network_route_policy: settings.network_route_policy,
         forced_model: settings.forced_model.clone(),
         token_fetch_paused: settings.token_fetch_paused,

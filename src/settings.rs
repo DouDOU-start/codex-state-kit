@@ -56,6 +56,9 @@ pub struct Settings {
     pub models: Vec<String>,
     pub state_miss_policy: StateMissPolicy,
     pub token_reuse_policy: TokenReusePolicy,
+    /// 跨模型复用 292 时，只向这个模型索取共享票据。空字符串表示不指定。
+    #[serde(default)]
+    pub state_fetch_model: String,
     pub network_route_policy: NetworkRoutePolicy,
     pub forced_model: String,
     #[serde(default)]
@@ -79,6 +82,7 @@ impl Default for Settings {
             models: vec![],
             state_miss_policy: StateMissPolicy::Preserve,
             token_reuse_policy: TokenReusePolicy::default(),
+            state_fetch_model: String::new(),
             network_route_policy: NetworkRoutePolicy::default(),
             forced_model: String::new(),
             token_fetch_paused: false,
@@ -96,6 +100,19 @@ impl Settings {
     pub fn forced_model(&self) -> Option<&str> {
         let model = self.forced_model.trim();
         (!model.is_empty()).then_some(model)
+    }
+
+    pub fn state_fetch_model(&self) -> Option<&str> {
+        let model = self.state_fetch_model.trim();
+        (!model.is_empty()).then_some(model)
+    }
+
+    /// 跨模型复用时指定唯一的 292 取票模型。未指定，或当前不是共享策略时，不限制供体。
+    pub fn shared_state_donor(&self) -> Option<&str> {
+        if self.token_reuse_policy != TokenReusePolicy::Shared292 {
+            return None;
+        }
+        self.state_fetch_model()
     }
 
     pub fn token_max_age_secs(&self) -> i64 {
@@ -160,6 +177,8 @@ pub struct SettingsPatch {
     #[serde(default)]
     pub token_reuse_policy: TokenReusePolicy,
     #[serde(default)]
+    pub state_fetch_model: String,
+    #[serde(default)]
     pub network_route_policy: NetworkRoutePolicy,
     #[serde(default)]
     pub forced_model: String,
@@ -186,6 +205,7 @@ impl SettingsPatch {
             models,
             state_miss_policy: self.state_miss_policy,
             token_reuse_policy: self.token_reuse_policy,
+            state_fetch_model: normalize_model_id(&self.state_fetch_model, "取 State 的模型")?,
             network_route_policy: self.network_route_policy,
             forced_model: normalize_forced_model(&self.forced_model)?,
             token_fetch_paused: self.token_fetch_paused,
@@ -248,15 +268,19 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
 }
 
 pub fn normalize_forced_model(raw: &str) -> Result<String> {
+    normalize_model_id(raw, "强制绑定模型")
+}
+
+pub fn normalize_model_id(raw: &str, label: &str) -> Result<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(String::new());
     }
     if raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        bail!("强制绑定模型不能包含空白或控制字符");
+        bail!("{label}不能包含空白或控制字符");
     }
     if raw.len() > 80 {
-        bail!("强制绑定模型过长");
+        bail!("{label}过长");
     }
     Ok(raw.to_string())
 }
@@ -398,6 +422,7 @@ mod tests {
     fn patch_keeps_optional_proxy() {
         let settings = SettingsPatch {
             token_reuse_policy: TokenReusePolicy::default(),
+            state_fetch_model: String::new(),
             state_miss_policy: StateMissPolicy::Preserve,
             proxy_listen: "127.0.0.1:8787".into(),
             upstream: "https://chatgpt.com/backend-api/codex".into(),
@@ -467,6 +492,27 @@ mod tests {
         assert_eq!(loaded.forced_model(), Some("gpt-6-astra"));
         assert!(normalize_forced_model("gpt 6").is_err());
         assert!(normalize_forced_model(&"m".repeat(81)).is_err());
+    }
+
+    #[test]
+    fn state_fetch_model_defaults_and_only_pins_shared_292() {
+        assert!(Settings::default().shared_state_donor().is_none());
+        assert!(settings_from_json("{}").unwrap().state_fetch_model().is_none());
+        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
+            "stateFetchModel":" gpt-5.5 ", "tokenReusePolicy":"shared_292"
+        }))
+        .unwrap();
+        let settings = patch.into_settings().unwrap();
+        assert_eq!(settings.shared_state_donor(), Some("gpt-5.5"));
+        let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.shared_state_donor(), Some("gpt-5.5"));
+        let mut per_model = loaded.clone();
+        per_model.token_reuse_policy = TokenReusePolicy::PerModel;
+        assert!(per_model.shared_state_donor().is_none());
+        assert_eq!(per_model.state_fetch_model(), Some("gpt-5.5"));
+        assert!(normalize_model_id("gpt 5.5", "取 State 的模型").is_err());
+        assert!(normalize_model_id(&"m".repeat(81), "取 State 的模型").is_err());
     }
 
     #[test]
