@@ -389,6 +389,8 @@ const emptyBillingTotals = (): BillingUsageTotals => ({
   cachedInputTokens: 0,
   outputTokens: 0,
   costNanos: null,
+  pricedCostNanos: 0,
+  unpricedCount: 0,
 });
 
 const mockBillingSummary = (): BillingSummary => {
@@ -398,6 +400,7 @@ const mockBillingSummary = (): BillingSummary => {
   previous.inputTokens = 1_420;
   previous.outputTokens = 684;
   previous.costNanos = 96_800_000;
+  previous.pricedCostNanos = 96_800_000;
   const current = emptyBillingTotals();
   current.requestCount = 3;
   current.measuredRequestCount = 2;
@@ -405,7 +408,9 @@ const mockBillingSummary = (): BillingSummary => {
   current.inputTokens = 12_480;
   current.cachedInputTokens = 2_048;
   current.outputTokens = 2_316;
-  current.costNanos = 17_612_800;
+  current.costNanos = null;
+  current.pricedCostNanos = 17_612_800;
+  current.unpricedCount = 1;
   return {
     generatedAt: new Date().toISOString(),
     from: null,
@@ -618,7 +623,16 @@ export async function getBillingSummary(period: Pick<BillingQuery, "from" | "to"
       to: period.to ?? null,
     });
   }
-  return cloneBillingSummary(mockBillingSummary());
+  const summary = cloneBillingSummary(mockBillingSummary());
+  if (!period.from) {
+    // All-time view: pretend there is older history before the 30 days.
+    for (const account of summary.accounts) {
+      account.firstSeenAt = new Date(Date.now() - 86_400_000 * 75).toISOString();
+      account.total.requestCount += 120;
+      account.total.pricedCostNanos += 4_318_250_000;
+    }
+  }
+  return summary;
 }
 
 /** Changes whenever usage records are written; poll it to know when to reload. */

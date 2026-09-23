@@ -235,7 +235,12 @@ export interface BillingUsageTotals {
   outputTokens: number;
   /** Already included in outputTokens. */
   reasoningTokens?: number;
+  /** Null as soon as any request lacks a price. */
   costNanos: number | null;
+  /** Sum over the requests that have a price. */
+  pricedCostNanos: number;
+  /** Requests without a price (no matching price or no usage reported). */
+  unpricedCount: number;
 }
 
 export interface BillingAccountSummary {

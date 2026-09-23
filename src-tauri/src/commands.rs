@@ -53,19 +53,7 @@ pub async fn mihomo_select(
     group: String,
     node: String,
 ) -> CommandResult<()> {
-    command(
-        state
-            .proxy
-            .app()
-            .mihomo
-            .select_in_group(&group, &node)
-            .await,
-    )?;
-    // The selected node is part of the live account's outbound line.
-    if let Err(error) = state.proxy.sync_account_environment().await {
-        eprintln!("[accounts] 绑定账号环境失败: {error:#}");
-    }
-    Ok(())
+    command(state.proxy.select_mihomo_node(&group, &node).await)
 }
 
 #[tauri::command(async)]

@@ -50,6 +50,18 @@ function formatMoney(costNanos: number | null | undefined): string {
   return `$${amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: digits })}`;
 }
 
+function formatDay(iso?: string | null): string {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  if (Number.isNaN(date.valueOf())) return iso.slice(0, 10);
+  return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
+}
+
+/** Totals only cover priced requests; say how many are left out. */
+function unpricedNote(count: number): string {
+  return count > 0 ? ` · ${count} 条未计价` : "";
+}
+
 function formatTokens(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
@@ -74,6 +86,8 @@ function tokenSum(records: BillingRecord[]): number {
 
 export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccounts, active, refreshMs, onRefreshMsChange }: BillingPanelProps) {
   const [summary, setSummary] = useState<BillingSummary | null>(null);
+  /** All-time totals, for the cumulative cost. */
+  const [lifetime, setLifetime] = useState<BillingSummary | null>(null);
   const [records, setRecords] = useState<BillingRecord[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState(currentAccountId ?? "");
   const [loading, setLoading] = useState(false);
@@ -90,18 +104,22 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
     try {
       // Read the revision first: a write during the query is caught next tick.
       const revision = await getBillingRevision();
-      const [nextSummary, nextRecords] = await Promise.all([
+      const [nextSummary, nextLifetime, nextRecords] = await Promise.all([
         getBillingSummary({ from, to }),
+        getBillingSummary(),
         getBillingRecords({ from, to, limit: 500, offset: 0 }),
       ]);
       setSummary(nextSummary);
+      setLifetime(nextLifetime);
       setRecords(nextRecords.records);
       setError(null);
       shownRevision.current = revision;
+      // Accounts with only older usage stay selectable.
+      const known = nextLifetime.accounts;
       setSelectedAccountId((current) => {
-        if (current && nextSummary.accounts.some((account) => account.accountId === current)) return current;
-        if (currentAccountId && nextSummary.accounts.some((account) => account.accountId === currentAccountId)) return currentAccountId;
-        return nextSummary.accounts[0]?.accountId ?? "";
+        if (current && known.some((account) => account.accountId === current)) return current;
+        if (currentAccountId && known.some((account) => account.accountId === currentAccountId)) return currentAccountId;
+        return nextSummary.accounts[0]?.accountId ?? known[0]?.accountId ?? "";
       });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -125,11 +143,14 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
     if ((await getBillingRevision()) !== shownRevision.current) await reload(true);
   }, refreshMs, active);
 
-  const accounts = summary?.accounts ?? [];
-  const selected = accounts.find((account) => account.accountId === selectedAccountId) ?? accounts[0];
+  const accounts = lifetime?.accounts ?? summary?.accounts ?? [];
+  const chosen = accounts.find((account) => account.accountId === selectedAccountId) ?? accounts[0];
+  /** The chosen account's last 30 days; undefined when it has no recent usage. */
+  const selected = summary?.accounts.find((account) => account.accountId === chosen?.accountId);
+  const allTime = lifetime?.accounts.find((account) => account.accountId === chosen?.accountId);
   const mine = useMemo(
-    () => records.filter((record) => !selected || record.accountId === selected.accountId),
-    [records, selected],
+    () => records.filter((record) => !chosen || record.accountId === chosen.accountId),
+    [records, chosen],
   );
   const today = mine.filter((record) => isToday(record.startedAt));
   const days = useMemo(() => {
@@ -172,21 +193,22 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
   const requestCount = selected?.total.requestCount ?? mine.length;
   const activeDays = days.length;
   const dailyRequests = activeDays ? requestCount / activeDays : 0;
-  const dailyCost = activeDays && selected?.total.costNanos != null ? selected.total.costNanos / activeDays : null;
+  const recentCost = selected?.total.pricedCostNanos ?? 0;
+  const dailyCost = activeDays ? recentCost / activeDays : null;
 
   return (
     <section className="usage-dash panel" aria-label="使用统计">
       <header className="usage-dash__header">
         <div>
           <h2>使用统计</h2>
-          <p>{selected ? `${accountLabel(selected.accountId, selected.email || (selected.accountId === currentAccountId ? currentAccountEmail : null), savedAccounts)} · 近 30 天用量 · ChatGPT` : "近 30 天用量"}{!isTauri ? " · 浏览器示例" : ""}</p>
+          <p>{chosen ? `${accountLabel(chosen.accountId, chosen.email || (chosen.accountId === currentAccountId ? currentAccountEmail : null), savedAccounts)} · 近 30 天用量 · ChatGPT` : "近 30 天用量"}{!isTauri ? " · 浏览器示例" : ""}</p>
         </div>
         <div className="usage-dash__tools">
           {accounts.length > 1 ? (
             <Select
               variant="compact"
               ariaLabel="统计账号"
-              value={selected?.accountId ?? ""}
+              value={chosen?.accountId ?? ""}
               options={accounts.map((account) => ({ value: account.accountId, label: accountLabel(account.accountId, account.email, savedAccounts) }))}
               onChange={setSelectedAccountId}
             />
@@ -199,7 +221,12 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
       ) : (
         <>
           <div className="usage-dash__cards">
-            <article><span>30 天总成本</span><strong>{formatMoney(selected?.total.costNanos)}</strong><small>已计价请求</small></article>
+            <article>
+              <span>累计成本</span>
+              <strong>{formatMoney(allTime ? allTime.total.pricedCostNanos : null)}</strong>
+              <small>{allTime ? `自 ${formatDay(allTime.firstSeenAt)} · ${new Intl.NumberFormat("zh-CN").format(allTime.total.requestCount)} 次请求${unpricedNote(allTime.total.unpricedCount)}` : "还没有记录"}</small>
+            </article>
+            <article><span>30 天总成本</span><strong>{formatMoney(recentCost)}</strong><small>{`已计价请求${unpricedNote(selected?.total.unpricedCount ?? 0)}`}</small></article>
             <article><span>30 天总请求</span><strong>{new Intl.NumberFormat("zh-CN").format(requestCount)}</strong><small>累计调用</small></article>
             <article><span>日均成本</span><strong>{formatMoney(dailyCost)}</strong><small>基于 {activeDays} 个有数据的日期</small></article>
             <article><span>日均请求</span><strong>{dailyRequests ? dailyRequests.toFixed(0) : "0"}</strong><small>日均使用量</small></article>
