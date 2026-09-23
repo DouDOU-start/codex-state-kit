@@ -4,6 +4,7 @@ pub mod browser_login;
 pub mod chatgpt_cookies;
 pub mod diag;
 pub mod fetch;
+pub mod identity;
 pub mod latency;
 pub mod login;
 pub mod logs;

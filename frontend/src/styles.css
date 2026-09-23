@@ -223,6 +223,13 @@ svg { flex-shrink: 0; }
 .proxy-mode button { display: flex; flex: 1; align-items: center; justify-content: center; gap: 7px; padding: 7px 6px; border: 1px solid transparent; border-radius: 7px; font-size: 11px; color: var(--muted); background: transparent; cursor: pointer; }
 .proxy-mode button[aria-pressed="true"] { color: var(--accent-strong); background: #fffefa; border-color: #dbe4ef; box-shadow: 0 2px 4px #273d5408; font-weight: 600; }
 .mihomo-error { padding: 9px 11px; border: 1px solid #efd6d3; border-radius: 7px; color: var(--red); background: var(--red-soft); font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
+.vm-identity { display: grid; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.vm-identity__summary { margin: 0; color: var(--text-soft); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.vm-identity__id { color: var(--muted); font-size: 10px; }
+.vm-identity__grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+.vm-identity__grid .field { margin: 6px 0; }
+.vm-identity__actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+@media (max-width: 640px) { .vm-identity__grid { grid-template-columns: 1fr; } }
 .ws-line { display: flex; align-items: center; gap: 10px; margin-top: 8px; color: var(--muted); font-size: 11px; }
 .ws-line label { display: inline-flex; align-items: center; gap: 6px; color: var(--text); }
 .ws-line input { margin: 0; }

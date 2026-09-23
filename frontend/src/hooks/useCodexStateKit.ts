@@ -16,8 +16,11 @@ import {
   mihomoSelect,
   mihomoGroupDelay,
   reconnectWsUpstream,
+  updateVmIdentity,
+  regenerateVmInstallationId,
+  detectVmCliVersion,
 } from "@/lib/api";
-import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy, SettingsPatch, ProbeKind, LatencyReport } from "@/types";
+import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy, SettingsPatch, ProbeKind, LatencyReport, VmProfile } from "@/types";
 
 function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): SettingsPatch {
   return {
@@ -430,6 +433,51 @@ export function useCodexStateKit() {
     }
   }, []);
 
+  const saveVmIdentity = useCallback(async (profile: VmProfile) => {
+    setBusy("save");
+    try {
+      const next = await updateVmIdentity(profile);
+      setStatus(next);
+      setBanner({ kind: "ok", text: "虚拟设备身份已保存，之后的请求都使用这份指纹" });
+      return next;
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+      return null;
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const regenerateVmInstallation = useCallback(async () => {
+    setBusy("save");
+    try {
+      const next = await regenerateVmInstallationId();
+      setStatus(next);
+      setBanner({ kind: "ok", text: "已换成新的 Installation ID，上游会把 Kit 看成一台新设备" });
+      return next;
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+      return null;
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const detectVmVersion = useCallback(async () => {
+    setBusy("save");
+    try {
+      const next = await detectVmCliVersion();
+      setStatus(next);
+      setBanner({ kind: "ok", text: `已对齐本机 Codex CLI ${next.vmIdentity.cliVersion}` });
+      return next;
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+      return null;
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
   const reconnectUpstream = useCallback(async () => {
     setBusy("save");
     try {
@@ -487,6 +535,9 @@ export function useCodexStateKit() {
     probeMihomoGroup,
     probeAllMihomo,
     setWsUpstreamEnabled,
+    saveVmIdentity,
+    regenerateVmInstallation,
+    detectVmVersion,
     reconnectUpstream,
     startLogin,
     importRefreshLogin,

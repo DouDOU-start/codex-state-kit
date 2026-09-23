@@ -19,7 +19,7 @@ import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
 import { NetworkLogDialog } from "@/components/NetworkLogDialog";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { LoginMode, Status, TurnStateView, StateMissPolicy, TokenReusePolicy, LatencySample } from "@/types";
+import type { LoginMode, Status, TurnStateView, StateMissPolicy, TokenReusePolicy, LatencySample, VmIdentityView } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -177,6 +177,12 @@ export default function App() {
   const [mihomoNode, setMihomoNode] = useState("");
   const [forcedModel, setForcedModel] = useState("");
   const [stateFetchModel, setStateFetchModel] = useState("");
+  const [cliVersion, setCliVersion] = useState("0.155.0");
+  const [vmOriginator, setVmOriginator] = useState("codex_cli_rs");
+  const [osType, setOsType] = useState("Mac OS");
+  const [osVersion, setOsVersion] = useState("15.5.0");
+  const [vmArch, setVmArch] = useState("arm64");
+  const [vmTerminal, setVmTerminal] = useState("xterm-256color");
   const [loginMode, setLoginMode] = useState<LoginMode>("browser");
   const [refreshTokenInput, setRefreshTokenInput] = useState("");
   const [accessTokenInput, setAccessTokenInput] = useState("");
@@ -193,8 +199,25 @@ export default function App() {
     setMihomoNode(fwd.status.mihomoNode ?? "");
     setForcedModel(fwd.status.forcedModel ?? "");
     setStateFetchModel(fwd.status.stateFetchModel ?? "");
+    const identity = fwd.status.vmIdentity;
+    if (identity) {
+      setCliVersion(identity.cliVersion);
+      setVmOriginator(identity.originator);
+      setOsType(identity.osType);
+      setOsVersion(identity.osVersion);
+      setVmArch(identity.arch);
+      setVmTerminal(identity.terminal);
+    }
   }, [fwd.status]);
 
+  function applyVmDraft(identity: VmIdentityView) {
+    setCliVersion(identity.cliVersion);
+    setVmOriginator(identity.originator);
+    setOsType(identity.osType);
+    setOsVersion(identity.osVersion);
+    setVmArch(identity.arch);
+    setVmTerminal(identity.terminal);
+  }
 
   if (!fwd.status) {
     return (
@@ -532,6 +555,76 @@ export default function App() {
             </label>
             <span>{fwd.status.wsUpstreamConnected ? `已连接${fwd.status.wsUpstreamConnectedAt ? ` · ${fwd.status.wsUpstreamConnectedAt}` : ""}` : "未连接"}</span>
             <button type="button" className="text-button" disabled={fwd.busy !== null} onClick={() => void fwd.reconnectUpstream()}>重连</button>
+          </div>
+          <div className="vm-identity">
+            <p className="vm-identity__summary">虚拟设备 {fwd.status.vmIdentity?.userAgent ?? "—"}</p>
+            <p className="vm-identity__id">Installation {fwd.status.vmIdentity?.installationId ?? "—"}</p>
+            <div className="vm-identity__grid">
+              <label className="field">
+                <span>CLI 版本</span>
+                <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={cliVersion} onChange={(event) => setCliVersion(event.target.value)} />
+              </label>
+              <label className="field">
+                <span>Originator</span>
+                <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmOriginator} onChange={(event) => setVmOriginator(event.target.value)} />
+              </label>
+              <label className="field">
+                <span>系统</span>
+                <select disabled={fwd.busy !== null} value={osType} onChange={(event) => setOsType(event.target.value)}>
+                  <option value="Mac OS">Mac OS</option>
+                  <option value="Linux">Linux</option>
+                  <option value="Windows">Windows</option>
+                </select>
+              </label>
+              <label className="field">
+                <span>系统版本</span>
+                <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={osVersion} onChange={(event) => setOsVersion(event.target.value)} />
+              </label>
+              <label className="field">
+                <span>架构</span>
+                <select disabled={fwd.busy !== null} value={vmArch} onChange={(event) => setVmArch(event.target.value)}>
+                  <option value="arm64">arm64</option>
+                  <option value="x86_64">x86_64</option>
+                </select>
+              </label>
+              <label className="field">
+                <span>终端</span>
+                <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmTerminal} onChange={(event) => setVmTerminal(event.target.value)} />
+              </label>
+            </div>
+            <div className="vm-identity__actions">
+              <button
+                type="button"
+                className="text-button"
+                disabled={fwd.busy !== null}
+                onClick={() => {
+                  void fwd.saveVmIdentity({
+                    cliVersion,
+                    originator: vmOriginator,
+                    osType,
+                    osVersion,
+                    arch: vmArch,
+                    terminal: vmTerminal,
+                  }).then((next) => {
+                    if (next) applyVmDraft(next.vmIdentity);
+                  });
+                }}
+              >
+                保存身份
+              </button>
+              <button type="button" className="text-button" disabled={fwd.busy !== null} onClick={() => void fwd.detectVmVersion().then((next) => { if (next) applyVmDraft(next.vmIdentity); })}>检测本机 CLI</button>
+              <button
+                type="button"
+                className="text-button"
+                disabled={fwd.busy !== null}
+                onClick={() => {
+                  if (!window.confirm("重新生成 Installation ID 后，上游会把 Kit 看成一台新设备。确定继续？")) return;
+                  void fwd.regenerateVmInstallation();
+                }}
+              >
+                换一台新机器
+              </button>
+            </div>
           </div>
           {fwd.status.outboundMode === "manual" ? <>
           <label className="field">

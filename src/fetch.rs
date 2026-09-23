@@ -2,9 +2,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
-
 use crate::chatgpt_cookies::{self, RoutingCookie};
+use crate::identity::VmIdentity;
 use crate::login::ChatGptCredentials;
 use crate::logs::{self, NetworkLogDetails};
 use crate::settings::{OutboundMode, Settings};
@@ -32,12 +31,6 @@ pub const BURST_EXHAUSTED_BACKOFF: Duration = Duration::from_secs(60);
 pub fn fetch_burst_concurrency(miss_streak: u32) -> usize {
     1usize << miss_streak.min(MAX_FETCH_BURST.ilog2())
 }
-
-/// 对齐 Codex CLI `get_codex_user_agent()`：`{originator}/{version} ({os_type} {version}; {arch}) {terminal}`。
-/// `os_info` 在 macOS 上打印 `Mac OS 15.5.0`，不是 `macOS 15.5`。
-const CODEX_IDENTITY_VERSION: &str = "0.155.0";
-const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-const CODEX_USER_AGENT_SUFFIX: &str = " (Mac OS 15.5.0; arm64) xterm-256color";
 
 const SESSION_PLACEHOLDER_LC: &str = "{session}";
 const SESSION_PLACEHOLDER_UC: &str = "{SESSION}";
@@ -216,10 +209,6 @@ pub fn probe_body(model: &str) -> serde_json::Value {
     })
 }
 
-fn codex_user_agent() -> String {
-    format!("{CODEX_ORIGINATOR}/{CODEX_IDENTITY_VERSION}{CODEX_USER_AGENT_SUFFIX}")
-}
-
 /// 探针请求头按抓包顺序写入。HTTP/2 的 HEADERS 帧顺序仍由 hyper 决定，这里只保证 HTTP/1.1 与 HeaderMap 插入序。
 fn codex_probe_request(
     client: &reqwest::Client,
@@ -227,6 +216,8 @@ fn codex_probe_request(
     creds: &ChatGptCredentials,
     probe: &serde_json::Value,
     turn_state: Option<&str>,
+    identity: &VmIdentity,
+    model: &str,
 ) -> Result<(reqwest::RequestBuilder, usize)> {
     let plain = serde_json::to_vec(probe).context("encode probe json")?;
     let body = zstd::encode_all(plain.as_slice(), 3).context("compress probe body")?;
@@ -237,11 +228,14 @@ fn codex_probe_request(
         .header("accept", "text/event-stream")
         .header("authorization", format!("Bearer {}", creds.access_token))
         .header("openai-beta", "responses=experimental")
-        .header("user-agent", codex_user_agent())
+        .header("user-agent", identity.user_agent())
         .header("chatgpt-account-id", &creds.account_id)
-        .header("originator", CODEX_ORIGINATOR)
-        .header("version", CODEX_IDENTITY_VERSION)
-        .header("session_id", Uuid::new_v4().to_string());
+        .header("originator", &identity.originator)
+        .header("version", &identity.cli_version)
+        .header("session_id", &identity.session_id)
+        .header("x-codex-installation-id", &identity.installation_id)
+        .header("x-codex-routing-hint", identity.routing_hint(model))
+        .header("x-codex-window-id", &identity.window_id);
     if let Some(state) = turn_state {
         request = request.header(HEADER_NAME, state);
     }
@@ -251,6 +245,13 @@ fn codex_probe_request(
         request.header("content-encoding", "zstd").body(body),
         wire_len,
     ))
+}
+
+#[cfg(test)]
+fn shared_test_identity() -> &'static VmIdentity {
+    use std::sync::OnceLock;
+    static IDENTITY: OnceLock<VmIdentity> = OnceLock::new();
+    IDENTITY.get_or_init(VmIdentity::ephemeral)
 }
 
 #[cfg(test)]
@@ -271,6 +272,7 @@ pub(crate) async fn fetch_turn_state_with_log(
         target_len,
         allow_auto_quality,
         &[],
+        shared_test_identity(),
         details,
     )
     .await
@@ -284,6 +286,7 @@ pub(crate) async fn fetch_turn_state_with_cookies(
     target_len: usize,
     allow_auto_quality: bool,
     request_cookies: &[RoutingCookie],
+    identity: &VmIdentity,
     details: &mut NetworkLogDetails,
 ) -> Result<FetchedTicket> {
     let url = responses_url(&settings.upstream);
@@ -304,7 +307,8 @@ pub(crate) async fn fetch_turn_state_with_cookies(
         .email
         .as_deref()
         .map(|email| logs::safe_text(email, 254));
-    let (mut request, wire_len) = codex_probe_request(client, &url, creds, &probe, None)?;
+    let (mut request, wire_len) =
+        codex_probe_request(client, &url, creds, &probe, None, identity, model)?;
     details.body_bytes = wire_len;
     let request_started = Instant::now();
     if let Some(cookie) = chatgpt_cookies::request_header(
@@ -701,7 +705,7 @@ mod tests {
     #[test]
     fn user_agent_matches_codex_cli_shape() {
         assert_eq!(
-            codex_user_agent(),
+            shared_test_identity().user_agent(),
             "codex_cli_rs/0.155.0 (Mac OS 15.5.0; arm64) xterm-256color"
         );
     }
@@ -841,9 +845,20 @@ mod tests {
         let captured = requests.lock().unwrap();
         let request = captured.first().unwrap();
         assert_eq!(request.body, probe_body("gpt-6-astra"));
-        assert_eq!(request.headers["originator"], CODEX_ORIGINATOR);
-        assert_eq!(request.headers["version"], CODEX_IDENTITY_VERSION);
-        assert_eq!(request.headers["user-agent"], codex_user_agent());
+        let identity = shared_test_identity();
+        assert_eq!(request.headers["originator"], identity.originator);
+        assert_eq!(request.headers["version"], identity.cli_version);
+        assert_eq!(request.headers["user-agent"], identity.user_agent());
+        assert_eq!(request.headers["session_id"], identity.session_id);
+        assert_eq!(
+            request.headers["x-codex-installation-id"],
+            identity.installation_id
+        );
+        assert_eq!(request.headers["x-codex-window-id"], identity.window_id);
+        assert_eq!(
+            request.headers["x-codex-routing-hint"],
+            "model=gpt-6-astra"
+        );
         assert!(request.headers.get("connection").is_none());
         assert_eq!(request.headers["content-encoding"], "zstd");
         assert_eq!(request.headers["openai-beta"], "responses=experimental");
@@ -867,7 +882,6 @@ mod tests {
         assert_eq!(request.headers["authorization"], "Bearer access");
         assert_eq!(request.headers["chatgpt-account-id"], "acct");
         assert!(request.headers.get(HEADER_NAME).is_none());
-        Uuid::parse_str(request.headers["session_id"].to_str().unwrap()).unwrap();
     }
 
     #[tokio::test]
@@ -896,7 +910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_probe_uses_a_fresh_session_id() {
+    async fn probes_reuse_the_vm_session_id() {
         let token = token_for_len(turn_state::QUALITY_TOKEN_LEN);
         let (upstream, requests) = serve(StatusCode::OK, Some(token)).await;
         let settings = Settings {
@@ -920,9 +934,9 @@ mod tests {
         let captured = requests.lock().unwrap();
         let first = captured[0].headers["session_id"].to_str().unwrap();
         let second = captured[1].headers["session_id"].to_str().unwrap();
-        assert_ne!(first, second);
-        Uuid::parse_str(first).unwrap();
-        Uuid::parse_str(second).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, shared_test_identity().session_id);
+        uuid::Uuid::parse_str(first).unwrap();
     }
 
     #[tokio::test]
@@ -1212,6 +1226,7 @@ mod tests {
             turn_state::QUALITY_TOKEN_LEN,
             false,
             &fetched.routing_cookies,
+            shared_test_identity(),
             &mut replay,
         )
         .await

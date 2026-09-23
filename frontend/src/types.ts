@@ -79,6 +79,28 @@ export interface TurnStateView {
   boundProxySession?: string | null;
 }
 
+export interface VmIdentityView {
+  installationId: string;
+  sessionId: string;
+  cliVersion: string;
+  originator: string;
+  osType: string;
+  osVersion: string;
+  arch: string;
+  terminal: string;
+  userAgent: string;
+  versionLocked: boolean;
+}
+
+export interface VmProfile {
+  cliVersion: string;
+  originator: string;
+  osType: string;
+  osVersion: string;
+  arch: string;
+  terminal: string;
+}
+
 export interface Status {
   tokenReusePolicy: TokenReusePolicy;
   stateFetchModel: string;
@@ -110,6 +132,7 @@ export interface Status {
   degraded: boolean;
   degradedAt?: string | null;
   logs: LogEntry[];
+  vmIdentity: VmIdentityView;
   wsUpstreamEnabled: boolean;
   wsUpstreamConnected: boolean;
   wsUpstreamConnectedAt?: string | null;

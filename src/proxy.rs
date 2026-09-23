@@ -23,6 +23,7 @@ use crate::billing::{BillingStore, RequestStart, TokenUsage, UsageOutcome, Usage
 use crate::chatgpt_cookies::{self, RoutingCookie};
 use crate::diag;
 use crate::fetch;
+use crate::identity::{self, VmIdentity};
 use crate::login::{self, has_chatgpt_login};
 #[cfg(test)]
 use crate::logs::ObservedStream;
@@ -315,6 +316,7 @@ pub struct Status {
     pub token_max_age_mins: u32,
     pub token_prefetch_age_mins: u32,
     pub diag_log_path: String,
+    pub vm_identity: identity::VmIdentityView,
     pub ws_upstream_enabled: bool,
     pub ws_upstream_connected: bool,
     pub ws_upstream_connected_at: Option<String>,
@@ -352,6 +354,7 @@ pub struct App {
     model_notify: Notify,
     /// 是否已注册 settings.models 中的种子模型
     seeds_registered: AtomicBool,
+    vm_identity: Mutex<VmIdentity>,
     ws_upstream: WsUpstreamPool,
     #[cfg(test)]
     oauth_token_url: std::sync::Mutex<Option<String>>,
@@ -426,6 +429,11 @@ impl App {
             sidecar_wake: Notify::new(),
             model_notify: Notify::new(),
             seeds_registered: AtomicBool::new(false),
+            vm_identity: Mutex::new(if cfg!(test) {
+                VmIdentity::ephemeral()
+            } else {
+                VmIdentity::load_or_create()
+            }),
             ws_upstream: WsUpstreamPool::new(),
             #[cfg(test)]
             oauth_token_url: std::sync::Mutex::new(None),
@@ -630,6 +638,7 @@ impl App {
             token_max_age_mins: settings.token_max_age_mins,
             token_prefetch_age_mins: settings.token_prefetch_age_mins,
             diag_log_path: diag::path().display().to_string(),
+            vm_identity: self.vm_identity.lock().await.view(),
             ws_upstream_enabled: settings.ws_upstream_enabled,
             ws_upstream_connected: ws.connected,
             ws_upstream_connected_at: ws.connected_at,
@@ -1167,6 +1176,7 @@ impl App {
         );
         let mut details = NetworkLogDetails::default();
         let request_cookies = self.turn_state.lock().await.bound_routing_cookies();
+        let identity = self.vm_identity.lock().await.clone();
         let result = fetch::fetch_turn_state_with_cookies(
             &client,
             &fetch_settings,
@@ -1175,6 +1185,7 @@ impl App {
             target_len,
             allow_auto_quality,
             &request_cookies,
+            &identity,
             &mut details,
         )
         .await;
@@ -1586,6 +1597,41 @@ impl ProxyHandle {
     }
 
     pub async fn reconnect_ws_upstream(&self) -> Result<Status> {
+        self.app.ws_upstream.invalidate().await;
+        Ok(self.managed_status().await)
+    }
+
+    pub async fn update_vm_identity(&self, profile: identity::VmProfile) -> Result<Status> {
+        {
+            let mut identity = self.app.vm_identity.lock().await;
+            identity.apply_profile(profile)?;
+            identity.save()?;
+        }
+        self.app.ws_upstream.invalidate().await;
+        Ok(self.managed_status().await)
+    }
+
+    pub async fn regenerate_vm_installation_id(&self) -> Result<Status> {
+        {
+            let mut identity = self.app.vm_identity.lock().await;
+            identity.regenerate_installation_id();
+            identity.save()?;
+        }
+        self.app.ws_upstream.invalidate().await;
+        Ok(self.managed_status().await)
+    }
+
+    pub async fn detect_vm_cli_version(&self) -> Result<Status> {
+        let version = tokio::task::spawn_blocking(identity::detect_local_cli_version)
+            .await
+            .context("检测 Codex CLI 版本")?
+            .context("没有检测到本机 codex --version")?;
+        {
+            let mut identity = self.app.vm_identity.lock().await;
+            identity.cli_version = version;
+            identity.version_locked = false;
+            identity.save()?;
+        }
         self.app.ws_upstream.invalidate().await;
         Ok(self.managed_status().await)
     }
@@ -3029,6 +3075,7 @@ async fn forward_http_tracked(
         );
     }
     details.injected_token = injected_token.clone();
+    parts.headers.remove(header::COOKIE);
     if injected_token.is_some() {
         let chatgpt_host = chatgpt_cookies::is_chatgpt_https_url(&target);
         if !routing_cookies.is_empty() || chatgpt_host {
@@ -3082,6 +3129,16 @@ async fn forward_http_tracked(
     {
         *activity = Some(app.traffic.begin(account, Instant::now()));
     }
+    let vm = app.vm_identity.lock().await.clone();
+    match identity::rewrite_client_metadata_in_body(&bytes, content_encoding.as_deref(), &vm) {
+        Ok(rewritten) => {
+            bytes = rewritten.into();
+            details.body_bytes = bytes.len();
+        }
+        Err(err) => {
+            eprintln!("[identity] 请求体身份改写失败，保留原正文: {err}");
+        }
+    }
     if ws_bridge::should_bridge_http(
         request_settings.ws_upstream_enabled,
         parts.method.as_str(),
@@ -3113,10 +3170,24 @@ async fn forward_http_tracked(
         )
         .body(bytes);
     for (name, value) in &parts.headers {
-        if is_hop(name) {
+        if is_hop(name) || identity::is_vm_identity_header(name.as_str()) {
             continue;
         }
         builder = builder.header(name, value);
+    }
+    builder = builder
+        .header("user-agent", vm.user_agent())
+        .header("originator", &vm.originator)
+        .header("version", &vm.cli_version)
+        .header("x-codex-installation-id", &vm.installation_id)
+        .header("x-codex-window-id", &vm.window_id)
+        .header("session_id", &vm.session_id);
+    if let Some(model) = request_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.chars().any(char::is_control))
+    {
+        builder = builder.header("x-codex-routing-hint", vm.routing_hint(model));
     }
     let upstream_resp = match builder.send().await {
         Ok(response) => response,
@@ -3209,14 +3280,6 @@ async fn forward_http_tracked(
     Ok(response)
 }
 
-const WS_REQUEST_HEADERS: &[&str] = &[
-    "originator",
-    "user-agent",
-    "version",
-    "x-codex-installation-id",
-    "x-codex-routing-hint",
-];
-
 async fn forward_responses_over_ws(
     app: &App,
     target: &str,
@@ -3234,7 +3297,13 @@ async fn forward_responses_over_ws(
     {
         ws_bridge::ensure_turn_state(&mut frame, token);
     }
-    let dial = ws_dial(target, proxy, headers)?;
+    let identity = app.vm_identity.lock().await.clone();
+    identity::rewrite_client_metadata_value(&mut frame, &identity);
+    let model = frame
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let dial = ws_dial(target, proxy, headers, &identity, model)?;
     let rx = app.ws_upstream.open_turn(dial, frame).await?;
     let header_ms = started.elapsed().as_millis();
     details.transport = "http_to_ws".into();
@@ -3269,20 +3338,40 @@ async fn forward_responses_over_ws(
         .context("构造 WebSocket SSE 响应")
 }
 
-fn ws_dial(target: &str, proxy: &str, headers: &HeaderMap) -> Result<WsDial> {
+fn ws_dial(
+    target: &str,
+    proxy: &str,
+    headers: &HeaderMap,
+    identity: &VmIdentity,
+    model: &str,
+) -> Result<WsDial> {
     let url = ws_bridge::upstream_to_ws_url(target).map_err(|err| anyhow::anyhow!(err))?;
+    let mut extra_headers = vec![
+        ("user-agent".into(), identity.user_agent()),
+        ("originator".into(), identity.originator.clone()),
+        ("version".into(), identity.cli_version.clone()),
+        (
+            "x-codex-installation-id".into(),
+            identity.installation_id.clone(),
+        ),
+        ("x-codex-window-id".into(), identity.window_id.clone()),
+        ("session_id".into(), identity.session_id.clone()),
+        ("thread-id".into(), identity.thread_id.clone()),
+        ("x-client-request-id".into(), identity.thread_id.clone()),
+    ];
+    let model = model.trim();
+    if !model.is_empty() && !model.chars().any(char::is_control) {
+        extra_headers.push((
+            "x-codex-routing-hint".into(),
+            identity.routing_hint(model),
+        ));
+    }
     Ok(WsDial {
         url,
         proxy: fetch::outbound_proxy_for_client(proxy),
         authorization: header_string(headers, "authorization"),
         account_id: header_string(headers, "chatgpt-account-id"),
-        extra_headers: WS_REQUEST_HEADERS
-            .iter()
-            .filter_map(|name| {
-                let value = header_string(headers, name);
-                (!value.is_empty()).then(|| ((*name).to_string(), value))
-            })
-            .collect(),
+        extra_headers,
     })
 }
 
@@ -3345,7 +3434,7 @@ async fn client_ws_session(
         } else {
             app.begin_internal_billing("business", started, &account, None, &model)
         };
-        let dial = match current_ws_dial(&app, &client_headers).await {
+        let dial = match current_ws_dial(&app, &client_headers, &model).await {
             Ok(dial) => dial,
             Err(err) => {
                 let mut metrics = logs::ResponseBodyMetrics::new("");
@@ -3461,10 +3550,12 @@ async fn prepare_client_ws_frame(app: &App, text: &str) -> Result<serde_json::Va
             }
         }
     }
+    let identity = app.vm_identity.lock().await.clone();
+    identity::rewrite_client_metadata_value(&mut frame, &identity);
     Ok(frame)
 }
 
-async fn current_ws_dial(app: &App, client_headers: &HeaderMap) -> Result<WsDial> {
+async fn current_ws_dial(app: &App, client_headers: &HeaderMap, model: &str) -> Result<WsDial> {
     let settings = app.settings.lock().await.clone();
     let mut headers = client_headers.clone();
     if let Some((creds, true)) = app
@@ -3487,7 +3578,8 @@ async fn current_ws_dial(app: &App, client_headers: &HeaderMap) -> Result<WsDial
         );
     }
     let proxy = app.ws_upstream.resolve_proxy(&template, None).await?;
-    ws_dial(&settings.upstream, &proxy, &headers)
+    let identity = app.vm_identity.lock().await.clone();
+    ws_dial(&settings.upstream, &proxy, &headers, &identity, model)
 }
 
 async fn finish_client_ws_turn(
@@ -4311,6 +4403,139 @@ mod tests {
         assert!(!cookie.contains("session"));
         assert_eq!(headers[turn_state::HEADER_NAME], fresh);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn business_forward_replaces_client_identity() {
+        let (sent, mut received) =
+            tokio::sync::mpsc::unbounded_channel::<(HeaderMap, Vec<u8>)>();
+        let upstream = axum::Router::new().fallback(move |req: Request<Body>| {
+            let sent = sent.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap();
+                sent.send((parts.headers, bytes.to_vec())).unwrap();
+                "ok"
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = Arc::new(
+            App::new(Settings {
+                state_miss_policy: StateMissPolicy::Passthrough,
+                upstream: format!("http://{}", listener.local_addr().unwrap()),
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        let identity = app.vm_identity.lock().await.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let response = proxy_http(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("user-agent", "client-ua")
+                .header("originator", "client-origin")
+                .header("version", "9.9.9")
+                .header("session_id", "client-session")
+                .header("x-codex-installation-id", "client-install")
+                .header("x-codex-window-id", "client-window")
+                .header("x-codex-routing-hint", "model=client")
+                .header("x-codex-turn-metadata", "client-turn")
+                .header(header::COOKIE, "__cf_bm=client")
+                .body(Body::from(
+                    r#"{"model":"gpt-test","client_metadata":{"x-codex-installation-id":"client-install","session_id":"client-session","x-codex-window-id":"client-window","thread_id":"thread-keep","turn_id":"turn-keep"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let (headers, body) = received.recv().await.unwrap();
+        assert_eq!(headers["user-agent"], identity.user_agent());
+        assert_eq!(headers["originator"], identity.originator);
+        assert_eq!(headers["version"], identity.cli_version);
+        assert_eq!(headers["session_id"], identity.session_id);
+        assert_eq!(headers["x-codex-installation-id"], identity.installation_id);
+        assert_eq!(headers["x-codex-window-id"], identity.window_id);
+        assert_eq!(headers["x-codex-routing-hint"], "model=gpt-test");
+        assert!(headers.get("x-codex-turn-metadata").is_none());
+        assert!(headers.get(header::COOKIE).is_none());
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let metadata = value["client_metadata"].as_object().unwrap();
+        assert_eq!(
+            metadata["x-codex-installation-id"],
+            identity.installation_id
+        );
+        assert_eq!(metadata["session_id"], identity.session_id);
+        assert_eq!(metadata["x-codex-window-id"], identity.window_id);
+        assert_eq!(metadata["thread_id"], "thread-keep");
+        assert_eq!(metadata["turn_id"], "turn-keep");
+        server.abort();
+    }
+
+    #[test]
+    fn ws_dial_uses_the_vm_identity() {
+        let identity = VmIdentity::ephemeral();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        headers.insert("chatgpt-account-id", "acct".parse().unwrap());
+        headers.insert("user-agent", "client-ua".parse().unwrap());
+        headers.insert("x-codex-installation-id", "client-install".parse().unwrap());
+        let dial = ws_dial(
+            "https://chatgpt.com/backend-api/codex/responses",
+            "",
+            &headers,
+            &identity,
+            "gpt-test",
+        )
+        .unwrap();
+        let extra = |name: &str| {
+            dial.extra_headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+                .unwrap()
+        };
+        assert_eq!(dial.authorization, "Bearer secret");
+        assert_eq!(dial.account_id, "acct");
+        assert_eq!(extra("user-agent"), identity.user_agent());
+        assert_eq!(extra("x-codex-installation-id"), identity.installation_id);
+        assert_eq!(extra("session_id"), identity.session_id);
+        assert_eq!(extra("x-codex-window-id"), identity.window_id);
+        assert_eq!(extra("thread-id"), identity.thread_id);
+        assert_eq!(extra("x-client-request-id"), identity.thread_id);
+        assert_eq!(extra("x-codex-routing-hint"), "model=gpt-test");
+        assert!(!extra("user-agent").contains("client-ua"));
+    }
+
+    #[tokio::test]
+    async fn client_ws_frame_replaces_device_metadata() {
+        let app = App::new(Settings {
+            state_miss_policy: StateMissPolicy::Passthrough,
+            ..Settings::default()
+        })
+        .unwrap();
+        let identity = app.vm_identity.lock().await.clone();
+        let frame = prepare_client_ws_frame(
+            &app,
+            r#"{"type":"response.create","model":"gpt-test","client_metadata":{"x-codex-installation-id":"client","session_id":"client","x-codex-window-id":"client","thread_id":"keep","turn_id":"turn"}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            frame["client_metadata"]["x-codex-installation-id"],
+            identity.installation_id
+        );
+        assert_eq!(frame["client_metadata"]["session_id"], identity.session_id);
+        assert_eq!(frame["client_metadata"]["x-codex-window-id"], identity.window_id);
+        assert_eq!(frame["client_metadata"]["thread_id"], "keep");
+        assert_eq!(frame["client_metadata"]["turn_id"], "turn");
     }
 
     #[test]

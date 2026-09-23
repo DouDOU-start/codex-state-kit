@@ -67,6 +67,24 @@ pub async fn ws_upstream_reconnect(state: State<'_, AppState>) -> CommandResult<
 }
 
 #[tauri::command(async)]
+pub async fn update_vm_identity(
+    state: State<'_, AppState>,
+    profile: codex_state_kit::identity::VmProfile,
+) -> CommandResult<Status> {
+    command(state.proxy.update_vm_identity(profile).await)
+}
+
+#[tauri::command(async)]
+pub async fn regenerate_vm_installation_id(state: State<'_, AppState>) -> CommandResult<Status> {
+    command(state.proxy.regenerate_vm_installation_id().await)
+}
+
+#[tauri::command(async)]
+pub async fn detect_vm_cli_version(state: State<'_, AppState>) -> CommandResult<Status> {
+    command(state.proxy.detect_vm_cli_version().await)
+}
+
+#[tauri::command(async)]
 pub async fn mihomo_group_delay(
     state: State<'_, AppState>,
     group: String,

@@ -9,6 +9,7 @@ import type {
   ProbeKind,
   SettingsPatch,
   Status,
+  VmProfile,
   LatencyReport,
   LatencySample,
   BillingRecord,
@@ -71,6 +72,18 @@ const defaultStatus = (): Status => ({
   turnState: emptyTurnState(),
   degraded: false,
   degradedAt: null,
+  vmIdentity: {
+    installationId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    sessionId: "11111111-2222-4333-8444-555555555555",
+    cliVersion: "0.155.0",
+    originator: "codex_cli_rs",
+    osType: "Mac OS",
+    osVersion: "15.5.0",
+    arch: "arm64",
+    terminal: "xterm-256color",
+    userAgent: "codex_cli_rs/0.155.0 (Mac OS 15.5.0; arm64) xterm-256color",
+    versionLocked: false,
+  },
   wsUpstreamEnabled: true,
   wsUpstreamConnected: false,
   wsUpstreamConnectedAt: null,
@@ -216,6 +229,7 @@ function cloneStatus(): Status {
     },
     accountTraffic: { ...mockStatus.accountTraffic },
     turnState: { ...mockStatus.turnState },
+    vmIdentity: { ...mockStatus.vmIdentity },
     logs: mockStatus.logs.map((entry) => ({ ...entry })),
   };
 }
@@ -363,6 +377,52 @@ export async function mihomoGroupDelay(group: string): Promise<LatencySample[]> 
     if (node) node.delay = delayMs;
     return { name, delayMs, error: delayMs == null ? "超时" : null };
   });
+}
+
+function mockUserAgent(profile: VmProfile): string {
+  return `${profile.originator}/${profile.cliVersion} (${profile.osType} ${profile.osVersion}; ${profile.arch}) ${profile.terminal}`;
+}
+
+export async function updateVmIdentity(profile: VmProfile): Promise<Status> {
+  if (isTauri) return invoke<Status>("update_vm_identity", { profile });
+  mockStatus = {
+    ...mockStatus,
+    vmIdentity: {
+      ...mockStatus.vmIdentity,
+      ...profile,
+      userAgent: mockUserAgent(profile),
+      versionLocked: true,
+    },
+  };
+  return cloneStatus();
+}
+
+export async function regenerateVmInstallationId(): Promise<Status> {
+  if (isTauri) return invoke<Status>("regenerate_vm_installation_id");
+  mockStatus = {
+    ...mockStatus,
+    vmIdentity: {
+      ...mockStatus.vmIdentity,
+      installationId: crypto.randomUUID(),
+    },
+  };
+  return cloneStatus();
+}
+
+export async function detectVmCliVersion(): Promise<Status> {
+  if (isTauri) return invoke<Status>("detect_vm_cli_version");
+  const cliVersion = "0.160.0";
+  const profile: VmProfile = { ...mockStatus.vmIdentity, cliVersion };
+  mockStatus = {
+    ...mockStatus,
+    vmIdentity: {
+      ...mockStatus.vmIdentity,
+      cliVersion,
+      userAgent: mockUserAgent(profile),
+      versionLocked: false,
+    },
+  };
+  return cloneStatus();
 }
 
 export async function reconnectWsUpstream(): Promise<Status> {
