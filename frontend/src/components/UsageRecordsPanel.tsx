@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import BookOpen from "lucide-react/dist/esm/icons/book-open.js";
-import Check from "lucide-react/dist/esm/icons/check.js";
 import CircleArrowDown from "lucide-react/dist/esm/icons/circle-arrow-down.js";
 import CircleArrowUp from "lucide-react/dist/esm/icons/circle-arrow-up.js";
 import PencilLine from "lucide-react/dist/esm/icons/pencil-line.js";
-import Copy from "lucide-react/dist/esm/icons/copy.js";
 import Route from "lucide-react/dist/esm/icons/route.js";
 import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
@@ -14,12 +12,14 @@ import { PAGE_SIZES, Pager } from "@/components/Pager";
 import { RefreshControl } from "@/components/RefreshControl";
 import { usePolling } from "@/hooks/usePolling";
 import { useNotify } from "@/components/Notifier";
-import type { BillingRecord, DowngradeReport, LogEntry, Status } from "@/types";
+import type { BillingRecord, DowngradeReport, LogEntry, SavedAccount, Status } from "@/types";
 
 interface UsageRecordsPanelProps {
   /** 所在 tab 是否可见；切到该 tab 时重新读取记录。 */
   active: boolean;
   status: Status;
+  /** Saved logins; label accounts whose records carry no email. */
+  savedAccounts: SavedAccount[];
   /** Auto-refresh interval; 0 turns it off. */
   refreshMs: number;
   onRefreshMsChange: (intervalMs: number) => void;
@@ -143,8 +143,14 @@ function costParts(record: BillingRecord): string[] {
     .map(([label, nanos]) => `${label} ${formatMoney(nanos)}`);
 }
 
+/** Billing email, else the saved login's email or label, else the id. */
+export function accountLabel(accountId: string, email: string | null | undefined, saved: SavedAccount[]): string {
+  if (email) return email;
+  const login = saved.find((account) => account.accountId === accountId);
+  return login?.email || login?.label || accountId;
+}
 
-export function UsageRecordsPanel({ active, status, refreshMs, onRefreshMsChange }: UsageRecordsPanelProps) {
+export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, onRefreshMsChange }: UsageRecordsPanelProps) {
   const [loading, setLoading] = useState(false);
   const [records, setRecords] = useState<BillingRecord[]>([]);
   const [total, setTotal] = useState(0);
@@ -159,7 +165,6 @@ export function UsageRecordsPanel({ active, status, refreshMs, onRefreshMsChange
     // One notice, updated in place, even when auto-refresh keeps failing.
     notify({ id: "usage-records-error", kind: "error", title: "读取使用记录失败", message: cause instanceof Error ? cause.message : String(cause) });
   }, [notify]);
-  const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
   const accountChosen = useRef(false);
   const requestSeq = useRef(0);
   const tableRef = useRef<HTMLDivElement>(null);
@@ -201,7 +206,7 @@ export function UsageRecordsPanel({ active, status, refreshMs, onRefreshMsChange
   const loadAccounts = useCallback(async () => {
     try {
       const summary = await getBillingSummary();
-      const list = summary.accounts.map((account): [string, string] => [account.accountId, account.email || account.accountId]);
+      const list = summary.accounts.map((account): [string, string] => [account.accountId, account.email || ""]);
       setAccounts(list);
       if (!accountChosen.current) {
         accountChosen.current = true;
@@ -255,48 +260,12 @@ export function UsageRecordsPanel({ active, status, refreshMs, onRefreshMsChange
     });
   };
 
-  useEffect(() => {
-    if (copyState === "idle") return;
-    const timer = window.setTimeout(() => setCopyState("idle"), 1800);
-    return () => window.clearTimeout(timer);
-  }, [copyState]);
-
   const refresh = () => {
     void loadAccounts();
     void loadPage(accountId, page, onlyDowngraded, pageSize);
   };
 
   const visible = records;
-
-  const copyRows = async () => {
-    const text = visible.map((record) => {
-      const clock = recordClock(record);
-      const log = matchLog(record, status.logs);
-      return [
-        clock.time,
-        clock.date,
-        record.sentModel || record.requestedModel || "未知模型",
-        transportLabel(record),
-        `→ ${record.responseModel ?? "—"}`,
-        record.downgrade ? downgradeLabel(record.downgrade) : "",
-        `首字 ${formatDuration(record.firstTokenMs ?? log?.firstTokenMs)}`,
-        `总耗时 ${formatDuration(log?.ms ?? durationMs(record))}`,
-        `in ${record.inputTokens ?? "—"}`,
-        `cache_read ${record.cachedInputTokens ?? 0}`,
-        `cache_write ${record.cacheWriteTokens ?? 0}`,
-        `out ${record.outputTokens ?? "—"}`,
-        `reasoning ${record.reasoningTokens ?? 0}`,
-        formatMoney(record.costNanos),
-        costParts(record).join(" "),
-      ].join("\t");
-    }).join("\n");
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopyState("done");
-    } catch {
-      setCopyState("error");
-    }
-  };
 
   return (
     <div className="usage-records">
@@ -310,10 +279,6 @@ export function UsageRecordsPanel({ active, status, refreshMs, onRefreshMsChange
         </div>
         <div className="usage-records__actions">
           <RefreshControl loading={loading} onRefresh={refresh} intervalMs={refreshMs} onIntervalChange={onRefreshMsChange} />
-          <button className="billing-panel__refresh" type="button" disabled={!visible.length} onClick={() => void copyRows()}>
-            {copyState === "done" ? <Check size={13} /> : <Copy size={13} />}
-            {copyState === "done" ? "已复制" : copyState === "error" ? "复制失败" : "复制本页"}
-          </button>
         </div>
       </header>
       <div className="usage-record-filter">
@@ -323,7 +288,7 @@ export function UsageRecordsPanel({ active, status, refreshMs, onRefreshMsChange
             variant="compact"
             ariaLabel="筛选账号"
             value={accountId}
-            options={[{ value: "", label: "全部账号" }, ...accounts.map(([id, label]) => ({ value: id, label }))]}
+            options={[{ value: "", label: "全部账号" }, ...accounts.map(([id, email]) => ({ value: id, label: accountLabel(id, email, savedAccounts) }))]}
             onChange={(next) => {
               accountChosen.current = true;
               setAccountId(next);

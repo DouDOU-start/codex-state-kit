@@ -298,13 +298,15 @@ impl App {
         logs::push(&mut logs, entry);
     }
 
-    fn begin_internal_billing(
+    /// Opens the usage record for a WebSocket turn, attributed like HTTP
+    /// turns: to the credentials Kit sends upstream.
+    fn begin_ws_billing(
         &self,
-        source: &str,
         started: Instant,
-        account_id: &str,
-        email: Option<&str>,
-        model: &str,
+        account: &BillingAccount,
+        requested_model: Option<&str>,
+        sent_model: Option<&str>,
+        service_tier: Option<String>,
     ) -> Option<BillingRequest> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let started_at = chrono::Utc::now()
@@ -314,17 +316,17 @@ impl App {
         match self.billing.begin_request(RequestStart {
             request_id: request_id.clone(),
             provider: "chatgpt".into(),
-            account_id: account_id.to_owned(),
-            email: email.map(str::to_owned),
-            source: source.to_owned(),
+            account_id: account.id.clone(),
+            email: account.email.clone(),
+            source: "business".into(),
             started_at,
-            requested_model: Some(model.to_owned()),
-            sent_model: Some(model.to_owned()),
-            service_tier: None,
+            requested_model: requested_model.or(sent_model).map(str::to_owned),
+            sent_model: sent_model.map(str::to_owned),
+            service_tier,
         }) {
             Ok(_) => Some(BillingRequest::new(self.billing.clone(), request_id)),
             Err(error) => {
-                eprintln!("[billing] begin {source} record failed: {error:#}");
+                eprintln!("[billing] begin websocket record failed: {error:#}");
                 None
             }
         }
@@ -1526,6 +1528,8 @@ async fn forward_http_tracked(
         .and_then(|v| v.to_str().ok())
         .map(|value| value.to_string());
     details.content_encoding = logs::safe_content_encoding(content_encoding.as_deref());
+    // The model the client asked for, before a forced model replaces it.
+    let client_model = crate::body_model::extract_model_from_body(&bytes);
     if path.contains("/responses") {
         if let Some(forced) = request_settings.forced_model() {
             bytes = crate::body_model::rewrite_model_in_body(
@@ -1629,7 +1633,7 @@ async fn forward_http_tracked(
                 email,
                 source: "business".into(),
                 started_at: chrono::Utc::now().to_rfc3339(),
-                requested_model: request_model.clone(),
+                requested_model: client_model.or_else(|| request_model.clone()),
                 sent_model,
                 service_tier: crate::body_model::extract_str_field(
                     &bytes,
@@ -1928,25 +1932,32 @@ async fn client_ws_session(
             WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => continue,
         };
         let started = Instant::now();
-        let frame = prepare_client_ws_frame(&app, &text).await?;
+        let (frame, client_model) = prepare_client_ws_frame(&app, &text).await?;
         let model = frame
             .get("model")
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_string();
-        let account = header_string(&client_headers, "chatgpt-account-id");
-        let billing = if account.is_empty() {
-            None
-        } else {
-            app.begin_internal_billing("business", started, &account, None, &model)
-        };
+        let account = ws_billing_account(&app, &client_headers).await;
+        let billing = account.as_ref().and_then(|account| {
+            app.begin_ws_billing(
+                started,
+                account,
+                client_model.as_deref(),
+                Some(model.as_str()).filter(|model| !model.is_empty()),
+                frame
+                    .get("service_tier")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+            )
+        });
         let dial = match current_ws_dial(&app, &client_headers, &model).await {
             Ok(dial) => dial,
             Err(err) => {
                 let mut metrics = logs::ResponseBodyMetrics::new("");
                 finish_client_ws_turn(
                     &app,
-                    &client_headers,
+                    account.as_ref(),
                     &model,
                     started,
                     billing,
@@ -1965,7 +1976,7 @@ async fn client_ws_session(
                 let mut metrics = logs::ResponseBodyMetrics::new("");
                 finish_client_ws_turn(
                     &app,
-                    &client_headers,
+                    account.as_ref(),
                     &model,
                     started,
                     billing,
@@ -2002,7 +2013,7 @@ async fn client_ws_session(
         metrics.finish(started.elapsed().as_millis());
         finish_client_ws_turn(
             &app,
-            &client_headers,
+            account.as_ref(),
             &model,
             started,
             billing,
@@ -2013,9 +2024,20 @@ async fn client_ws_session(
     }
 }
 
-async fn prepare_client_ws_frame(app: &App, text: &str) -> Result<serde_json::Value> {
+/// The frame to send upstream, and the model the client asked for before a
+/// forced model replaced it.
+async fn prepare_client_ws_frame(
+    app: &App,
+    text: &str,
+) -> Result<(serde_json::Value, Option<String>)> {
     let mut frame: serde_json::Value =
         serde_json::from_str(text).context("客户端 WebSocket 帧不是 JSON")?;
+    let client_model = frame
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
     let settings = app.settings.lock().await.clone();
     if let Some(model) = settings.forced_model() {
         ws_bridge::rewrite_model_in_ws_frame(&mut frame, model);
@@ -2025,7 +2047,30 @@ async fn prepare_client_ws_frame(app: &App, text: &str) -> Result<serde_json::Va
     }
     let identity = app.vm_identity.lock().await.clone();
     identity::rewrite_client_metadata_value(&mut frame, &identity);
-    Ok(frame)
+    Ok((frame, client_model))
+}
+
+/// Who a WebSocket turn is billed to and logged as.
+struct BillingAccount {
+    id: String,
+    email: Option<String>,
+}
+
+/// The account a WebSocket turn runs as, decided the same way as for HTTP
+/// turns: the credentials Kit applies, unless the client explicitly uses
+/// another account with its own credentials (then it is not billed).
+async fn ws_billing_account(app: &App, client_headers: &HeaderMap) -> Option<BillingAccount> {
+    let home = app.settings.lock().await.codex_home.clone();
+    let (creds, override_headers) = app.sync_request_identity(Path::new(&home)).await?;
+    (override_headers || !login::credentials_conflict_headers(client_headers, &creds)).then(|| {
+        BillingAccount {
+            id: logs::safe_text(&creds.account_id, 128),
+            email: creds
+                .email
+                .as_deref()
+                .map(|email| logs::safe_text(email, 254)),
+        }
+    })
 }
 
 async fn current_ws_dial(app: &App, client_headers: &HeaderMap, model: &str) -> Result<WsDial> {
@@ -2085,7 +2130,7 @@ async fn business_ws_dial(
 
 async fn finish_client_ws_turn(
     app: &App,
-    headers: &HeaderMap,
+    account: Option<&BillingAccount>,
     model: &str,
     started: Instant,
     billing: Option<BillingRequest>,
@@ -2130,8 +2175,8 @@ async fn finish_client_ws_turn(
     details.response_header_ms = Some(started.elapsed().as_millis());
     details.output_tokens = metrics.output_tokens();
     details.first_token_ms = metrics.first_token_ms();
-    let account = header_string(headers, "chatgpt-account-id");
-    details.account_id = (!account.is_empty()).then_some(account);
+    details.account_id = account.map(|account| account.id.clone());
+    details.account_email = account.and_then(|account| account.email.clone());
     details.in_progress = false;
     if failed {
         details.error_kind = Some("ws_upstream".into());
@@ -2428,11 +2473,12 @@ mod tests {
     #[tokio::test]
     async fn client_ws_frame_replaces_device_metadata() {
         let app = App::new(Settings {
+            forced_model: "gpt-forced".into(),
             ..Settings::default()
         })
         .unwrap();
         let identity = app.vm_identity.lock().await.clone();
-        let frame = prepare_client_ws_frame(
+        let (frame, client_model) = prepare_client_ws_frame(
             &app,
             r#"{"type":"response.create","model":"gpt-test","client_metadata":{"x-codex-installation-id":"client","session_id":"client","x-codex-window-id":"client","thread_id":"keep","turn_id":"turn"}}"#,
         )
@@ -2449,6 +2495,83 @@ mod tests {
         );
         assert_eq!(frame["client_metadata"]["thread_id"], "keep");
         assert_eq!(frame["client_metadata"]["turn_id"], "turn");
+        // The forced model is sent; the client's own model is kept for records.
+        assert_eq!(frame["model"], "gpt-forced");
+        assert_eq!(client_model.as_deref(), Some("gpt-test"));
+    }
+
+    #[tokio::test]
+    async fn websocket_turns_are_billed_to_kits_credentials() {
+        const TEST: &str = "proxy::tests::websocket_turns_are_billed_to_kits_credentials";
+        if std::env::var_os("CSK_WS_BILLING_TEST_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("CSK_WS_BILLING_TEST_CHILD", "1")
+                .env("HOME", dir.path())
+                .env("USERPROFILE", dir.path())
+                .env("APPDATA", dir.path())
+                .env("LOCALAPPDATA", dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        use base64::Engine as _;
+        let home = tempfile::tempdir().unwrap();
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::json!({"chatgpt_account_id":"account-a","email":"a@example.com"})
+                .to_string(),
+        );
+        std::fs::write(
+            login::kit_auth_path(home.path()),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": format!("e30.{claims}.signature"),
+                    "access_token": "access-a",
+                    "refresh_token": "refresh-a",
+                    "account_id": "account-a"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let app = App::new(Settings {
+            codex_home: home.path().display().to_string(),
+            ..Settings::default()
+        })
+        .unwrap();
+        // Codex still sends the account it had before a switch in Kit: the
+        // turn runs as Kit's account, so it is billed there, with the email.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("stale-account"),
+        );
+        let account = ws_billing_account(&app, &headers).await.unwrap();
+        assert_eq!(account.id, "account-a");
+        assert_eq!(account.email.as_deref(), Some("a@example.com"));
+        let billing = app
+            .begin_ws_billing(
+                Instant::now(),
+                &account,
+                Some("gpt-client"),
+                Some("gpt-forced"),
+                Some("priority".into()),
+            )
+            .unwrap();
+        let record = app.billing.get_by_id(&billing.request_id).unwrap().unwrap();
+        assert_eq!(record.account_id, "account-a");
+        assert_eq!(record.email.as_deref(), Some("a@example.com"));
+        assert_eq!(record.requested_model.as_deref(), Some("gpt-client"));
+        assert_eq!(record.sent_model.as_deref(), Some("gpt-forced"));
+        drop(billing);
     }
 
     #[test]

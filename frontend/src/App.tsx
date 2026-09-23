@@ -319,6 +319,7 @@ export default function App() {
         <BillingPanel
           currentAccountId={fwd.status.currentAccountId}
           currentAccountEmail={fwd.status.currentAccountEmail}
+          savedAccounts={fwd.accounts}
           active={tab === "overview"}
           refreshMs={refreshMs}
           onRefreshMsChange={changeRefreshMs}
@@ -327,7 +328,7 @@ export default function App() {
 
 
         <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-records" aria-labelledby="tab-records" hidden={tab !== "records"}>
-          <UsageRecordsPanel active={tab === "records"} status={fwd.status} refreshMs={refreshMs} onRefreshMsChange={changeRefreshMs} />
+          <UsageRecordsPanel active={tab === "records"} status={fwd.status} savedAccounts={fwd.accounts} refreshMs={refreshMs} onRefreshMsChange={changeRefreshMs} />
         </section>
 
         <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-pricing" aria-labelledby="tab-pricing" hidden={tab !== "pricing"}>
