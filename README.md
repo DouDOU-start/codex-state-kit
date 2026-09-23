@@ -73,6 +73,7 @@ Turn-State 获取 ── 内置 WARP / 手动代理 ── Codex 上游
 | [ChatGPT 登录](docs/browser-login.md) | 回调、授权码、Refresh Token 与 Access Token 登录 |
 | [出站代理与 WARP](docs/warp.md) | 自动连接、手动代理、运行限制 |
 | [网络路由日志](docs/network-logs.md) | Token 与业务线路、请求字段和数据边界 |
+| [账号计费设计](docs/account-billing-design.md) | 按 ChatGPT 账号持久化用量与估算成本的设计草案 |
 | [常见问题](docs/troubleshooting.md) | 登录、网络、接入与恢复排查 |
 | [Turn-State 机制](docs/turn-state-notes.md) | 当前缓存、替换规则和效果边界 |
 | [维护与验收](docs/turn-state-sop.md) | 验证步骤和问题报告 |

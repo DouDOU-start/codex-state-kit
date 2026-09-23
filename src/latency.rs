@@ -159,7 +159,8 @@ mod tests {
     #[test]
     fn missing_nodes_are_timeouts() {
         let body = serde_json::json!({"alpha": 186, "beta": 0});
-        let samples = samples_from_group_delays(&["alpha".into(), "beta".into(), "gamma".into()], &body);
+        let samples =
+            samples_from_group_delays(&["alpha".into(), "beta".into(), "gamma".into()], &body);
         assert_eq!(samples[0].delay_ms, Some(186));
         assert_eq!(samples[1].error.as_deref(), Some("超时"));
         assert_eq!(samples[2].error.as_deref(), Some("超时"));

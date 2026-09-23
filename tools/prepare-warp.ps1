@@ -16,5 +16,7 @@ if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant
 $unpacked = Join-Path $downloadDir 'unpacked'
 Expand-Archive -LiteralPath $archive -DestinationPath $unpacked -Force
 Copy-Item -LiteralPath (Join-Path $unpacked 'usque.exe') -Destination $resourceDir
+$unixBinary = Join-Path $resourceDir 'usque'
+if (Test-Path -LiteralPath $unixBinary) { Remove-Item -LiteralPath $unixBinary -Force }
 Copy-Item -LiteralPath (Join-Path $unpacked 'LICENSE.md') -Destination $resourceDir
 Write-Host 'Bundled usque v4.2.1 (Windows x64); SHA-256 verified.'

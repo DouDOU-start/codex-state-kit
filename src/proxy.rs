@@ -18,20 +18,21 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::attach::{self, is_attached};
+use crate::billing::{BillingStore, RequestStart, TokenUsage, UsageOutcome, UsageState};
 use crate::chatgpt_cookies::{self, RoutingCookie};
 use crate::diag;
 use crate::fetch;
 use crate::login::{self, has_chatgpt_login};
-use crate::logs::{self, LogEntry, NetworkLogDetails, StreamLifecycle};
 #[cfg(test)]
 use crate::logs::ObservedStream;
-use crate::traffic::{AccountTraffic, RequestActivity, TrafficTracker};
+use crate::logs::{self, LogEntry, NetworkLogDetails, StreamLifecycle};
+use crate::mihomo::{MihomoRuntime, MihomoStatus};
 use crate::settings::{
     save_settings, NetworkRoutePolicy, OutboundMode, Settings, SettingsPatch, StateMissPolicy,
     TokenReusePolicy,
 };
+use crate::traffic::{AccountTraffic, RequestActivity, TrafficTracker};
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
-use crate::mihomo::{MihomoRuntime, MihomoStatus};
 use crate::warp::{WarpRuntime, WarpStatus};
 
 const TOKEN_FETCH_PAUSED_MESSAGE: &str = "已暂停获取 Token";
@@ -141,7 +142,11 @@ fn fetch_failure_escalates(details: &NetworkLogDetails) -> bool {
 }
 
 /// 目标长度连续未命中并已打到最大并发时，返回静置时长。429/401/403 不走这条。
-fn length_miss_rest(concurrency: usize, class: FetchRetryClass, escalate: bool) -> Option<Duration> {
+fn length_miss_rest(
+    concurrency: usize,
+    class: FetchRetryClass,
+    escalate: bool,
+) -> Option<Duration> {
     if escalate && class == FetchRetryClass::Normal && concurrency >= fetch::MAX_FETCH_BURST {
         Some(fetch::BURST_EXHAUSTED_BACKOFF)
     } else {
@@ -208,14 +213,26 @@ fn pin_shared_donor(store: &TurnStateStore, models: &[String], donor: &str) -> V
 
 /// Shared 292 is one refresh target. Pick any eligible donor at random, while
 /// retaining round-robin fairness for independently bound non-292 models.
-fn model_for_reuse_round<'a>(store: &TurnStateStore, models: &'a [String], round: u32) -> Option<&'a str> {
-    let shared: Vec<&String> = models.iter().filter(|model| store.shares_292_for(model)).collect();
+fn model_for_reuse_round<'a>(
+    store: &TurnStateStore,
+    models: &'a [String],
+    round: u32,
+) -> Option<&'a str> {
+    let shared: Vec<&String> = models
+        .iter()
+        .filter(|model| store.shares_292_for(model))
+        .collect();
     if shared.is_empty() {
         return model_for_fetch_round(models, round);
     }
     let donor = shared[(rand::random::<u64>() % shared.len() as u64) as usize];
     let mut candidates = vec![donor.as_str()];
-    candidates.extend(models.iter().filter(|model| !store.shares_292_for(model)).map(String::as_str));
+    candidates.extend(
+        models
+            .iter()
+            .filter(|model| !store.shares_292_for(model))
+            .map(String::as_str),
+    );
     Some(candidates[(round.saturating_sub(1) as usize) % candidates.len()])
 }
 
@@ -307,6 +324,8 @@ pub struct App {
     pub mihomo: MihomoRuntime,
     pub settings: Mutex<Settings>,
     pub logs: Mutex<VecDeque<LogEntry>>,
+    /// Durable usage/cost accounting. The network log remains bounded and in-memory.
+    pub billing: Arc<BillingStore>,
     traffic: TrafficTracker,
     pub proxy_ok: AtomicBool,
     pub login_http: reqwest::Client,
@@ -323,7 +342,8 @@ pub struct App {
     fetch_change_notify: Notify,
     fetch_transition: Mutex<()>,
     turn_state: Mutex<TurnStateStore>,
-    http: Mutex<reqwest::Client>,
+    http: Mutex<PooledUpstream>,
+    fetch_http: Mutex<Option<PooledUpstream>>,
     degraded: AtomicBool,
     degraded_at: Mutex<Option<String>>,
     pub degrade_notify: Notify,
@@ -369,7 +389,18 @@ impl App {
         warp: WarpRuntime,
         mihomo: MihomoRuntime,
     ) -> Result<Self> {
-        let http = business_http_client(&resolved_business_proxy(&settings, &warp, &mihomo), None)?;
+        let business_proxy = resolved_business_proxy(&settings, &warp, &mihomo);
+        let http = pooled_upstream(business_proxy_key(&business_proxy, None)?)?;
+        let billing_path = crate::home_dir().join(if cfg!(debug_assertions) {
+            ".codex-state-kit-dev-billing.sqlite3"
+        } else {
+            ".codex-state-kit-billing.sqlite3"
+        });
+        let billing = if cfg!(test) {
+            BillingStore::open_in_memory()?
+        } else {
+            BillingStore::open(billing_path)?
+        };
         let mut turn_state = TurnStateStore::load();
         turn_state.set_reuse_policy(settings.token_reuse_policy);
         turn_state.set_lifetime(turn_state::MAX_AGE_SECS, turn_state::PREFETCH_AGE_SECS);
@@ -378,6 +409,7 @@ impl App {
             mihomo,
             settings: Mutex::new(settings),
             logs: Mutex::new(VecDeque::with_capacity(80)),
+            billing: Arc::new(billing),
             traffic: TrafficTracker::default(),
             proxy_ok: AtomicBool::new(false),
             login_http: crate::login::http_client()?,
@@ -395,6 +427,7 @@ impl App {
             fetch_transition: Mutex::new(()),
             turn_state: Mutex::new(turn_state),
             http: Mutex::new(http),
+            fetch_http: Mutex::new(None),
             degraded: AtomicBool::new(false),
             degraded_at: Mutex::new(None),
             degrade_notify: Notify::new(),
@@ -430,8 +463,7 @@ impl App {
             Ok(creds) => creds,
             Err(err) => {
                 let message = format!("{err:#}");
-                self.defer_fetch_failure(model, FetchRetryClass::Auth)
-                    .await;
+                self.defer_fetch_failure(model, FetchRetryClass::Auth).await;
                 *self.fetch_error.lock().await = Some(message.clone());
                 return Err(FetchOnceError::new(message, FetchRetryClass::Auth));
             }
@@ -448,8 +480,7 @@ impl App {
             Ok(client) => client,
             Err(err) => {
                 let message = format!("[{model}] 打票前刷新登录凭证失败: {err:#}");
-                self.defer_fetch_failure(model, FetchRetryClass::Auth)
-                    .await;
+                self.defer_fetch_failure(model, FetchRetryClass::Auth).await;
                 *self.fetch_error.lock().await = Some(message.clone());
                 return Err(FetchOnceError::new(message, FetchRetryClass::Auth));
             }
@@ -458,8 +489,7 @@ impl App {
             Ok(creds) => Ok(creds),
             Err(err) => {
                 let message = format!("[{model}] 打票前刷新登录凭证失败: {err:#}");
-                self.defer_fetch_failure(model, FetchRetryClass::Auth)
-                    .await;
+                self.defer_fetch_failure(model, FetchRetryClass::Auth).await;
                 *self.fetch_error.lock().await = Some(message.clone());
                 Err(FetchOnceError::new(message, FetchRetryClass::Auth))
             }
@@ -526,12 +556,15 @@ impl App {
         upstream_model: Option<&str>,
         completed: bool,
     ) {
-        let model_mismatch = completed
-            && upstream_model.is_some_and(|actual| !actual.is_empty() && actual != model);
+        let model_mismatch =
+            completed && upstream_model.is_some_and(|actual| !actual.is_empty() && actual != model);
         if !returned_is_degraded && !model_mismatch {
             return;
         }
-        let Some(injected_token) = injected_token.map(str::trim).filter(|token| !token.is_empty()) else {
+        let Some(injected_token) = injected_token
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        else {
             return;
         };
         let cleared = {
@@ -550,9 +583,8 @@ impl App {
             "[degraded] [{model}] 业务响应不合格，作废当前凭据包并等待重采"
         ));
         self.degraded.store(true, Ordering::Relaxed);
-        *self.degraded_at.lock().await = Some(
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        );
+        *self.degraded_at.lock().await =
+            Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         self.degrade_notify.notify_one();
     }
 
@@ -660,8 +692,10 @@ impl App {
             }
             if let Err(e) = self.fetch_once(model).await {
                 eprintln!("[refresh] 模型 {} 获取失败: {e}", model);
-                let can_try_other_model =
-                    matches!(e.retry, FetchRetryClass::Forbidden | FetchRetryClass::Deferred);
+                let can_try_other_model = matches!(
+                    e.retry,
+                    FetchRetryClass::Forbidden | FetchRetryClass::Deferred
+                );
                 if !can_try_other_model {
                     return Err(e.into());
                 }
@@ -742,8 +776,32 @@ impl App {
         let settings = self.settings.lock().await.clone();
         let proxy = resolved_business_proxy(&settings, &self.warp, &self.mihomo);
         let session = self.turn_state.lock().await.bound_proxy_session();
-        *self.http.lock().await = business_http_client(&proxy, session.as_deref())?;
+        let key = business_proxy_key(&proxy, session.as_deref())?;
+        *self.http.lock().await = pooled_upstream(key)?;
         Ok(())
+    }
+
+    async fn business_client(&self, key: &str) -> Result<reqwest::Client> {
+        let mut slot = self.http.lock().await;
+        if slot.key != key {
+            *slot = pooled_upstream(key.to_string())?;
+        }
+        Ok(slot.client.clone())
+    }
+
+    async fn probe_client(&self, proxy: &str) -> Result<reqwest::Client> {
+        let mut slot = self.fetch_http.lock().await;
+        if let Some(pooled) = slot.as_ref() {
+            if pooled.key == proxy {
+                return Ok(pooled.client.clone());
+            }
+        }
+        let client = fetch::http_client(proxy)?;
+        *slot = Some(PooledUpstream {
+            key: proxy.to_string(),
+            client: client.clone(),
+        });
+        Ok(client)
     }
 
     async fn wait_for_fetch_slot(&self, generation: u64) -> bool {
@@ -867,14 +925,21 @@ impl App {
         // Re-evaluate all active models periodically while every currently
         // stale model is cooling. A different model may enter its prefetch
         // window before this model's (notably 403) cooldown expires.
-        (eligible, global_wait.max(model_wait.min(fetch::CHECK_INTERVAL)))
+        (
+            eligible,
+            global_wait.max(model_wait.min(fetch::CHECK_INTERVAL)),
+        )
     }
 
     async fn fetch_once(&self, model: &str) -> std::result::Result<String, FetchOnceError> {
         self.fetch_once_inner(model, false).await
     }
 
-    async fn fetch_once_inner(&self, model: &str, only_if_needed: bool) -> std::result::Result<String, FetchOnceError> {
+    async fn fetch_once_inner(
+        &self,
+        model: &str,
+        only_if_needed: bool,
+    ) -> std::result::Result<String, FetchOnceError> {
         let _gate = self.fetch_gate.lock().await;
         let generation = self.fetch_generation.load(Ordering::SeqCst);
         if generation % 2 == 1 {
@@ -912,8 +977,7 @@ impl App {
         };
         if !has_chatgpt_login(Path::new(&settings.codex_home)) {
             let message = "尚未登录 ChatGPT".to_string();
-            self.defer_fetch_failure(model, FetchRetryClass::Auth)
-                .await;
+            self.defer_fetch_failure(model, FetchRetryClass::Auth).await;
             *self.fetch_error.lock().await = Some(message.clone());
             return Err(FetchOnceError::new(message, FetchRetryClass::Auth));
         }
@@ -921,8 +985,7 @@ impl App {
             Ok(creds) => creds,
             Err(err) => {
                 let message = format!("{err:#}");
-                self.defer_fetch_failure(model, FetchRetryClass::Auth)
-                    .await;
+                self.defer_fetch_failure(model, FetchRetryClass::Auth).await;
                 *self.fetch_error.lock().await = Some(message.clone());
                 return Err(FetchOnceError::new(message, FetchRetryClass::Auth));
             }
@@ -973,7 +1036,10 @@ impl App {
             ));
         }
         if !fetch_account_is_current(&settings, &creds.account_id) {
-            return Err(FetchOnceError::new(format!("[{model}] 登录账号已变化，取消旧账号票据请求"), FetchRetryClass::Stale));
+            return Err(FetchOnceError::new(
+                format!("[{model}] 登录账号已变化，取消旧账号票据请求"),
+                FetchRetryClass::Stale,
+            ));
         }
         if only_if_needed {
             let store = self.turn_state.lock().await;
@@ -1010,9 +1076,8 @@ impl App {
                 eprintln!("[{model}] 绑定出口 session 后刷新业务代理失败: {err:#}");
             }
             *self.fetch_error.lock().await = None;
-            *self.fetch_ok_at.lock().await = Some(
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            );
+            *self.fetch_ok_at.lock().await =
+                Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
             return Ok(token);
         }
         let mut lens: HashMap<usize, u32> = HashMap::new();
@@ -1042,7 +1107,10 @@ impl App {
                 .record_distribution(model, distribution);
         }
         let mut err = first_err.unwrap_or_else(|| {
-            FetchOnceError::new(format!("[{model}] 本波探测未返回结果"), FetchRetryClass::Normal)
+            FetchOnceError::new(
+                format!("[{model}] 本波探测未返回结果"),
+                FetchRetryClass::Normal,
+            )
         });
         if let Some(rest) = length_miss_rest(concurrency, err.retry, escalate) {
             self.fetch_burst_misses.lock().await.remove(&burst_key);
@@ -1086,14 +1154,25 @@ impl App {
         let (probe_proxy, probe_session) = fetch::resolve_probe_proxy(&settings.outbound_proxy);
         let mut fetch_settings = settings.clone();
         fetch_settings.outbound_proxy = probe_proxy;
-        let client = match fetch::http_client(&fetch_settings.outbound_proxy) {
+        let client = match self.probe_client(&fetch_settings.outbound_proxy).await {
             Ok(client) => client,
             Err(err) => {
                 let message = format!("{err:#}");
-                return Err(FetchOnceError::probing(message, FetchRetryClass::Backoff, true));
+                return Err(FetchOnceError::probing(
+                    message,
+                    FetchRetryClass::Backoff,
+                    true,
+                ));
             }
         };
         let started = Instant::now();
+        let mut billing_request = self.begin_internal_billing(
+            "token_fetch",
+            started,
+            &creds.account_id,
+            creds.email.as_deref(),
+            model,
+        );
         let mut details = NetworkLogDetails::default();
         let request_cookies = self.turn_state.lock().await.bound_routing_cookies();
         let result = fetch::fetch_turn_state_with_cookies(
@@ -1111,7 +1190,8 @@ impl App {
 
         if !fetch_account_is_current(settings, &creds.account_id) {
             details.turn_state_action = "discarded_stale_account".into();
-            self.record_fetch(started, details).await;
+            self.record_fetch(started, details, billing_request.take())
+                .await;
             return Err(FetchOnceError::new(
                 format!("[{model}] 登录账号已变化，丢弃旧账号票据结果"),
                 FetchRetryClass::Stale,
@@ -1125,7 +1205,8 @@ impl App {
                         Ok(client) => client,
                         Err(err) => {
                             details.turn_state_action = "rejected_reverify".into();
-                            self.record_fetch(started, details).await;
+                            self.record_fetch(started, details, billing_request.take())
+                                .await;
                             return Err(FetchOnceError::probing(
                                 format!("[{model}] 业务出口复验失败: {err:#}"),
                                 FetchRetryClass::Normal,
@@ -1135,8 +1216,16 @@ impl App {
                     };
                     let mut verify_settings = fetch_settings.clone();
                     verify_settings.outbound_proxy = business;
+                    let verify_started = Instant::now();
+                    let mut verify_billing = self.begin_internal_billing(
+                        "reverify",
+                        verify_started,
+                        &creds.account_id,
+                        creds.email.as_deref(),
+                        model,
+                    );
                     let mut verify_details = NetworkLogDetails::default();
-                    if let Err(err) = fetch::validate_carried_ticket(
+                    let verify_result = fetch::validate_carried_ticket(
                         &verify_client,
                         &verify_settings,
                         creds,
@@ -1145,10 +1234,14 @@ impl App {
                         &fetched.routing_cookies,
                         &mut verify_details,
                     )
-                    .await
-                    {
+                    .await;
+                    if let Some(request) = verify_billing.take() {
+                        self.settle_internal_billing(request, &verify_details);
+                    }
+                    if let Err(err) = verify_result {
                         details.turn_state_action = "rejected_reverify".into();
-                        self.record_fetch(started, details).await;
+                        self.record_fetch(started, details, billing_request.take())
+                            .await;
                         return Err(FetchOnceError::probing(
                             format!("[{model}] 业务出口复验未通过: {err:#}"),
                             FetchRetryClass::Normal,
@@ -1159,7 +1252,8 @@ impl App {
                 let token = fetched.token;
                 if self.fetch_generation.load(Ordering::SeqCst) != generation {
                     details.turn_state_action = "discarded_stale_config".into();
-                    self.record_fetch(started, details).await;
+                    self.record_fetch(started, details, billing_request.take())
+                        .await;
                     return Err(FetchOnceError::new(
                         format!("[{model}] 配置已变化，丢弃旧线路返回的票据"),
                         FetchRetryClass::Stale,
@@ -1184,7 +1278,8 @@ impl App {
                 };
                 let Some(ready) = ready else {
                     details.turn_state_action = "discarded_stale_config".into();
-                    self.record_fetch(started, details).await;
+                    self.record_fetch(started, details, billing_request.take())
+                        .await;
                     return Err(FetchOnceError::new(
                         format!("[{model}] 配置已变化，丢弃旧线路返回的票据"),
                         FetchRetryClass::Stale,
@@ -1192,7 +1287,8 @@ impl App {
                 };
                 if !ready {
                     details.turn_state_action = "pooled_unmatched".into();
-                    self.record_fetch(started, details).await;
+                    self.record_fetch(started, details, billing_request.take())
+                        .await;
                     return Err(FetchOnceError::probing(
                         format!(
                             "[{model}] 采到 {} 字节票据，但未匹配请求开始时的目标长度 {target_len}",
@@ -1205,13 +1301,15 @@ impl App {
                 details.turn_state_action = "captured".into();
                 details.token_fp = Some(diag::token_fp(&token));
                 details.cookie_names = chatgpt_cookies::cookie_names(&fetched.routing_cookies);
-                self.record_fetch(started, details).await;
+                self.record_fetch(started, details, billing_request.take())
+                    .await;
                 Ok(token)
             }
             Err(err) => {
                 if self.fetch_generation.load(Ordering::SeqCst) != generation {
                     details.turn_state_action = "discarded_stale_config".into();
-                    self.record_fetch(started, details).await;
+                    self.record_fetch(started, details, billing_request.take())
+                        .await;
                     return Err(FetchOnceError::new(
                         format!("[{model}] 配置已变化，忽略旧线路请求错误"),
                         FetchRetryClass::Stale,
@@ -1220,7 +1318,8 @@ impl App {
                 let retry_class = classify_fetch_failure(&details);
                 let escalate = fetch_failure_escalates(&details);
                 let returned_len = details.returned_turn_state_len;
-                self.record_fetch(started, details).await;
+                self.record_fetch(started, details, billing_request.take())
+                    .await;
                 let message = format!("{err:#}");
                 eprintln!("[{model}] turn-state fetch failed: {message}");
                 Err(FetchOnceError::probing(message, retry_class, escalate).with_len(returned_len))
@@ -1285,7 +1384,9 @@ impl App {
                 .filter(|m| store.needs_refresh(m))
                 .collect();
             match donor.as_deref() {
-                Some(donor) if store.shares_292_for(donor) => pin_shared_donor(&store, &models, donor),
+                Some(donor) if store.shares_292_for(donor) => {
+                    pin_shared_donor(&store, &models, donor)
+                }
                 _ => models,
             }
         };
@@ -1303,7 +1404,8 @@ impl App {
         let selected = {
             let store = self.turn_state.lock().await;
             model_for_reuse_round(&store, &eligible_models, round)
-                .expect("eligible_models is not empty").to_string()
+                .expect("eligible_models is not empty")
+                .to_string()
         };
         let model = selected.as_str();
         let bound_len = self.turn_state.lock().await.bound_len_for(model);
@@ -1396,7 +1498,91 @@ impl App {
         logs::push(&mut logs, entry);
     }
 
-    async fn record_fetch(&self, started: Instant, details: NetworkLogDetails) {
+    fn begin_internal_billing(
+        &self,
+        source: &str,
+        started: Instant,
+        account_id: &str,
+        email: Option<&str>,
+        model: &str,
+    ) -> Option<BillingRequest> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now()
+            .checked_sub_signed(chrono::Duration::from_std(started.elapsed()).unwrap_or_default())
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        match self.billing.begin_request(RequestStart {
+            request_id: request_id.clone(),
+            provider: "chatgpt".into(),
+            account_id: account_id.to_owned(),
+            email: email.map(str::to_owned),
+            source: source.to_owned(),
+            started_at,
+            requested_model: Some(model.to_owned()),
+            sent_model: Some(model.to_owned()),
+        }) {
+            Ok(_) => Some(BillingRequest::new(self.billing.clone(), request_id)),
+            Err(error) => {
+                eprintln!("[billing] begin {source} record failed: {error:#}");
+                None
+            }
+        }
+    }
+
+    fn settle_internal_billing(&self, request: BillingRequest, details: &NetworkLogDetails) {
+        let failed = details.error_kind.is_some()
+            || details.response_status.is_none()
+            || details.response_status.is_some_and(|status| status >= 400);
+        request.settle(UsageOutcome {
+            state: if failed {
+                UsageState::Interrupted
+            } else {
+                UsageState::MissingUsage
+            },
+            finished_at: Some(chrono::Utc::now().to_rfc3339()),
+            http_status: details.response_status,
+            error_kind: details.error_kind.clone(),
+            ..UsageOutcome::default()
+        });
+    }
+
+    async fn record_internal_billing(
+        &self,
+        source: &str,
+        started: Instant,
+        details: &NetworkLogDetails,
+    ) {
+        // Internal probes are real upstream requests too. Their parser does
+        // not currently expose provider usage, so persist them as explicit
+        // `missing_usage` rows rather than silently dropping them or charging
+        // an invented zero cost.
+        let Some(account_id) = details.account_id.as_deref().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let Some(request) = self.begin_internal_billing(
+            source,
+            started,
+            account_id,
+            details.account_email.as_deref(),
+            details.model.as_deref().unwrap_or("unknown"),
+        ) else {
+            return;
+        };
+        self.settle_internal_billing(request, details);
+    }
+
+    async fn record_fetch(
+        &self,
+        started: Instant,
+        details: NetworkLogDetails,
+        billing_request: Option<BillingRequest>,
+    ) {
+        if let Some(request) = billing_request {
+            self.settle_internal_billing(request, &details);
+        } else {
+            self.record_internal_billing("token_fetch", started, &details)
+                .await;
+        }
         let status = details.response_status.unwrap_or(502);
         self.record("POST", "/responses", status, started, details)
             .await;
@@ -1434,7 +1620,8 @@ impl ProxyHandle {
     }
 
     pub fn enable_auto_attach(&self) {
-        *self.managed_routes.lock().expect("managed routes") = Some(attach::ManagedRoutes::new(attach::backup_path()));
+        *self.managed_routes.lock().expect("managed routes") =
+            Some(attach::ManagedRoutes::new(attach::backup_path()));
     }
 
     pub fn restore_managed_routes(&self) -> Result<()> {
@@ -1449,7 +1636,10 @@ impl ProxyHandle {
             Some(routes) => routes.sync(settings, self.app.proxy_ok.load(Ordering::Relaxed)),
             None => Ok(()),
         };
-        *self.attach_error.lock().expect("attach error") = result.as_ref().err().map(|err| format!("自动接入失败：{err:#}"));
+        *self.attach_error.lock().expect("attach error") = result
+            .as_ref()
+            .err()
+            .map(|err| format!("自动接入失败：{err:#}"));
         result
     }
 
@@ -1605,11 +1795,12 @@ impl ProxyHandle {
         };
         let old = self.app.settings.lock().await.clone();
         let next_business = resolved_business_proxy(&next, &self.app.warp, &self.app.mihomo);
-        let next_http = if resolved_business_proxy(&old, &self.app.warp, &self.app.mihomo) != next_business {
-            Some(business_http_client(&next_business, None)?)
-        } else {
-            None
-        };
+        let next_http =
+            if resolved_business_proxy(&old, &self.app.warp, &self.app.mihomo) != next_business {
+                Some(pooled_upstream(business_proxy_key(&next_business, None)?)?)
+            } else {
+                None
+            };
         if old.codex_home != next.codex_home {
             attach::validate_codex_home(Path::new(&next.codex_home))?;
         }
@@ -1682,7 +1873,12 @@ impl ProxyHandle {
                 return Err(err);
             }
             // Managed routes are already synchronized by start(), under their exit lock.
-            if self.managed_routes.lock().expect("managed routes").is_none() {
+            if self
+                .managed_routes
+                .lock()
+                .expect("managed routes")
+                .is_none()
+            {
                 attach::update_attached_base_url(&next)?;
             }
         } else if fetch_changed {
@@ -1693,7 +1889,8 @@ impl ProxyHandle {
             self.app.model_notify.notify_one();
             if next.token_fetch_paused {
                 *self.app.fetch_error.lock().await = Some(TOKEN_FETCH_PAUSED_MESSAGE.into());
-            } else if self.app.fetch_error.lock().await.as_deref() == Some(TOKEN_FETCH_PAUSED_MESSAGE)
+            } else if self.app.fetch_error.lock().await.as_deref()
+                == Some(TOKEN_FETCH_PAUSED_MESSAGE)
             {
                 *self.app.fetch_error.lock().await = None;
             }
@@ -1777,7 +1974,9 @@ impl ProxyHandle {
                 vec![crate::latency::sample_from_result("warp", result)]
             }
             "manual" => {
-                let raw = proxy.filter(|value| !value.trim().is_empty()).unwrap_or(settings.outbound_proxy);
+                let raw = proxy
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(settings.outbound_proxy);
                 vec![crate::latency::sample_from_result(
                     "manual",
                     crate::latency::probe_through_proxy(&raw, &target).await,
@@ -1861,7 +2060,11 @@ async fn proxy(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
         // 返回 426 Upgrade Required —— 官方 Codex 客户端检测到此状态码后
         // 会自动永久切换到 HTTP SSE 流式传输（见 client.rs FallbackToHttp 逻辑）。
         eprintln!("[ws] 拒绝 WS 升级（无 Cloudflare cookie），返回 426 触发客户端回退到 HTTP SSE");
-        return (StatusCode::UPGRADE_REQUIRED, "WebSocket not supported by proxy, use HTTP SSE").into_response();
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "WebSocket not supported by proxy, use HTTP SSE",
+        )
+            .into_response();
     }
     proxy_http(app, req).await
 }
@@ -1880,11 +2083,23 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
     let path = logs::safe_text(req.uri().path(), 256);
     let mut details = NetworkLogDetails::default();
     let mut activity = None;
-    match forward_http_tracked(&app, req, &mut details, &mut activity, started).await {
+    let mut billing_request = None;
+    match forward_http_tracked(
+        &app,
+        req,
+        &mut details,
+        &mut activity,
+        &mut billing_request,
+        started,
+    )
+    .await
+    {
         Ok(resp) => {
             details.response_header_ms = Some(started.elapsed().as_millis());
             details.response_content_encoding = Some(logs::safe_content_encoding(
-                resp.headers().get(header::CONTENT_ENCODING).and_then(|value| value.to_str().ok()),
+                resp.headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok()),
             ));
             if method == http::Method::HEAD
                 || matches!(resp.status().as_u16(), 204 | 304)
@@ -1895,6 +2110,15 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
             {
                 if let Some(lifecycle) = &details.stream_lifecycle {
                     lifecycle.complete();
+                }
+                if let Some(request) = billing_request.take() {
+                    request.settle(UsageOutcome {
+                        state: UsageState::MissingUsage,
+                        finished_at: Some(chrono::Utc::now().to_rfc3339()),
+                        http_status: Some(resp.status().as_u16()),
+                        error_kind: None,
+                        ..UsageOutcome::default()
+                    });
                 }
                 app.record(
                     method.as_str(),
@@ -1909,26 +2133,28 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
             details.in_progress = true;
             // Some Codex upstream responses omit Content-Type despite sending
             // SSE. Retain the request's explicit SSE negotiation in that case.
-            let is_sse = details.transport == "http_sse" || resp
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| {
-                    value
-                        .split(';')
-                        .next()
-                        .unwrap_or_default()
-                        .trim()
-                        .eq_ignore_ascii_case("text/event-stream")
-                });
+            let is_sse = details.transport == "http_sse"
+                || resp
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value
+                            .split(';')
+                            .next()
+                            .unwrap_or_default()
+                            .trim()
+                            .eq_ignore_ascii_case("text/event-stream")
+                    });
             if is_sse {
                 details.transport = "http_sse".into();
             }
-            let metrics = logs::ResponseBodyMetrics::new(resp
-                .headers()
-                .get(header::CONTENT_ENCODING)
-                .map(|value| value.to_str().unwrap_or("unsupported"))
-                .unwrap_or_default());
+            let metrics = logs::ResponseBodyMetrics::new(
+                resp.headers()
+                    .get(header::CONTENT_ENCODING)
+                    .map(|value| value.to_str().unwrap_or("unsupported"))
+                    .unwrap_or_default(),
+            );
             let remaining_bytes = resp
                 .headers()
                 .get(header::CONTENT_LENGTH)
@@ -1967,6 +2193,8 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 finished: false,
                 remaining_bytes,
                 activity,
+                billing: billing_request,
+                billing_settled: false,
                 lifecycle,
                 diag: diag_req,
                 diag_first_token: false,
@@ -1987,8 +2215,11 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                         .as_ref()
                         .map(|lifecycle| lifecycle.snapshot().stream_chunks)
                         .unwrap_or(0);
-                    let next = match tokio::time::timeout(business_stream_idle_timeout(chunks), stream.next())
-                        .await
+                    let next = match tokio::time::timeout(
+                        business_stream_idle_timeout(chunks),
+                        stream.next(),
+                    )
+                    .await
                     {
                         Ok(next) => next,
                         Err(_) => {
@@ -2056,6 +2287,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                         }
                     }
                     if tracker.finished {
+                        tracker.settle_billing();
                         tracker.activity.take();
                         tracker.note_model_mismatch().await;
                     }
@@ -2064,7 +2296,8 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                     if tracker.finished
                         || tracker.entry.first_token_ms != tracker.metrics.first_token_ms()
                         || tracker.entry.output_tokens != tracker.metrics.output_tokens()
-                        || tracker.entry.upstream_response_model.as_deref() != tracker.metrics.upstream_response_model()
+                        || tracker.entry.upstream_response_model.as_deref()
+                            != tracker.metrics.upstream_response_model()
                         || tracker.entry.error_kind.as_deref() != tracker.metrics.error_kind
                     {
                         tracker.refresh();
@@ -2077,7 +2310,17 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
             Response::from_parts(parts, Body::from_stream(stream))
         }
         Err(err) => {
-            let status = details.response_status
+            if let Some(request) = billing_request.take() {
+                request.settle(UsageOutcome {
+                    state: UsageState::Interrupted,
+                    finished_at: Some(chrono::Utc::now().to_rfc3339()),
+                    http_status: details.response_status,
+                    error_kind: details.error_kind.clone(),
+                    ..UsageOutcome::default()
+                });
+            }
+            let status = details
+                .response_status
                 .and_then(|status| StatusCode::from_u16(status).ok())
                 .unwrap_or(StatusCode::BAD_GATEWAY);
             app.record(method.as_str(), &path, status.as_u16(), started, details)
@@ -2092,6 +2335,54 @@ fn fetch_account_is_current(settings: &Settings, account: &str) -> bool {
         .is_ok_and(|creds| creds.account_id == account)
 }
 
+/// The durable billing row is created before the upstream request is sent.
+/// Keeping this small context with the response body makes account attribution
+/// stable even when the login file changes while a stream is still running.
+struct BillingRequest {
+    store: Arc<BillingStore>,
+    request_id: String,
+    settled: AtomicBool,
+}
+
+impl BillingRequest {
+    fn new(store: Arc<BillingStore>, request_id: String) -> Self {
+        Self {
+            store,
+            request_id,
+            settled: AtomicBool::new(false),
+        }
+    }
+
+    fn settle(&self, outcome: UsageOutcome) {
+        if self.settled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Err(error) = self.store.settle_request(&self.request_id, outcome) {
+            self.settled.store(false, Ordering::Release);
+            eprintln!("[billing] settle {} failed: {error:#}", self.request_id);
+        }
+    }
+}
+
+impl Drop for BillingRequest {
+    fn drop(&mut self) {
+        if self.settled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Err(error) = self.store.mark_interrupted(
+            &self.request_id,
+            None,
+            Some("request_dropped"),
+            Some(chrono::Utc::now().to_rfc3339()),
+        ) {
+            eprintln!(
+                "[billing] mark dropped {} failed: {error:#}",
+                self.request_id
+            );
+        }
+    }
+}
+
 struct ResponseLogTracker {
     app: Arc<App>,
     entry: LogEntry,
@@ -2100,6 +2391,8 @@ struct ResponseLogTracker {
     finished: bool,
     remaining_bytes: Option<u64>,
     activity: Option<RequestActivity>,
+    billing: Option<BillingRequest>,
+    billing_settled: bool,
     lifecycle: Option<Arc<StreamLifecycle>>,
     diag: Option<diag::Request>,
     diag_first_token: bool,
@@ -2114,7 +2407,8 @@ impl ResponseLogTracker {
         self.entry.ms = self.started.elapsed().as_millis();
         self.entry.first_token_ms = self.metrics.first_token_ms();
         self.entry.output_tokens = self.metrics.output_tokens();
-        self.entry.upstream_response_model = self.metrics.upstream_response_model().map(str::to_owned);
+        self.entry.upstream_response_model =
+            self.metrics.upstream_response_model().map(str::to_owned);
         self.entry.in_progress = !self.finished;
         if self.entry.error_kind.is_none() {
             self.entry.error_kind = self.metrics.error_kind.map(str::to_owned);
@@ -2136,6 +2430,43 @@ impl ResponseLogTracker {
         replace_network_log(&self.app, self.entry.clone()).await;
     }
 
+    fn settle_billing(&mut self) {
+        if self.billing_settled {
+            return;
+        }
+        let Some(request) = self.billing.as_ref() else {
+            self.billing_settled = true;
+            return;
+        };
+        let usage_complete = self.metrics.usage_seen()
+            && self.metrics.input_tokens().is_some()
+            && self.metrics.output_tokens().is_some();
+        let state = if self.entry.error_kind.is_some() || self.entry.status >= 400 {
+            UsageState::Interrupted
+        } else if usage_complete {
+            UsageState::Measured
+        } else {
+            UsageState::MissingUsage
+        };
+        request.settle(UsageOutcome {
+            state,
+            finished_at: Some(chrono::Utc::now().to_rfc3339()),
+            http_status: Some(self.entry.status),
+            response_model: self.metrics.upstream_response_model().map(str::to_owned),
+            usage: TokenUsage {
+                input_tokens: self.metrics.input_tokens(),
+                cached_input_tokens: self.metrics.cached_input_tokens(),
+                output_tokens: self.metrics.output_tokens(),
+            },
+            usage_source: self
+                .metrics
+                .usage_seen()
+                .then(|| "provider_response".into()),
+            error_kind: self.entry.error_kind.clone(),
+        });
+        self.billing_settled = true;
+    }
+
     async fn note_model_mismatch(&mut self) {
         if self.mismatch_noted || !self.metrics.completed() {
             return;
@@ -2151,7 +2482,13 @@ impl ResponseLogTracker {
         }
         self.mismatch_noted = true;
         self.app
-            .observe_business_response(&requested, self.injected_token.as_deref(), false, Some(&upstream), true)
+            .observe_business_response(
+                &requested,
+                self.injected_token.as_deref(),
+                false,
+                Some(&upstream),
+                true,
+            )
             .await;
     }
 
@@ -2168,10 +2505,7 @@ impl ResponseLogTracker {
             .as_ref()
             .map(|lifecycle| lifecycle.snapshot().stream_chunks)
             .unwrap_or(self.entry.stream_chunks);
-        if chunks > 0
-            && chunks != self.last_diag_chunks
-            && (chunks <= 8 || chunks % 20 == 0)
-        {
+        if chunks > 0 && chunks != self.last_diag_chunks && (chunks <= 8 || chunks % 20 == 0) {
             self.last_diag_chunks = chunks;
             self.emit_diag("chunk");
         }
@@ -2243,6 +2577,33 @@ impl Drop for ResponseLogTracker {
             self.finished = true;
             self.refresh();
         }
+        if !self.billing_settled {
+            // A dropped body means the client disconnected before a reliable
+            // terminal usage event. Preserve the row as interrupted.
+            if let Some(request) = self.billing.as_ref() {
+                request.settle(UsageOutcome {
+                    state: UsageState::Interrupted,
+                    finished_at: Some(chrono::Utc::now().to_rfc3339()),
+                    http_status: Some(self.entry.status),
+                    usage: TokenUsage {
+                        input_tokens: self.metrics.input_tokens(),
+                        cached_input_tokens: self.metrics.cached_input_tokens(),
+                        output_tokens: self.metrics.output_tokens(),
+                    },
+                    usage_source: self
+                        .metrics
+                        .usage_seen()
+                        .then(|| "provider_response".into()),
+                    error_kind: self
+                        .entry
+                        .error_kind
+                        .clone()
+                        .or_else(|| Some("client_cancelled".into())),
+                    ..UsageOutcome::default()
+                });
+            }
+            self.billing_settled = true;
+        }
         if !self.diag_finished {
             self.diag_finished = true;
             self.emit_diag("finish");
@@ -2286,22 +2647,40 @@ fn business_network_details(settings: &Settings, upstream: &str, proxy: &str) ->
     details
 }
 
-fn business_http_client(template: &str, session: Option<&str>) -> Result<reqwest::Client> {
-    let proxy = match fetch::apply_bound_session(template, session) {
-        Ok(proxy) => proxy,
+struct PooledUpstream {
+    key: String,
+    client: reqwest::Client,
+}
+
+fn business_proxy_key(template: &str, session: Option<&str>) -> Result<String> {
+    match fetch::apply_bound_session(template, session) {
+        Ok(proxy) => Ok(proxy),
         Err(_) if fetch::has_session_placeholder(template) => {
-            fetch::replace_session_placeholder(template, "unbound0")
+            Ok(fetch::replace_session_placeholder(template, "unbound0"))
         }
-        Err(err) => return Err(err),
-    };
-    upstream_http_client(&proxy)
+        Err(err) => Err(err),
+    }
+}
+
+fn pooled_upstream(key: String) -> Result<PooledUpstream> {
+    let client = upstream_http_client(&key)?;
+    Ok(PooledUpstream { key, client })
+}
+
+fn business_http_client(template: &str, session: Option<&str>) -> Result<reqwest::Client> {
+    Ok(pooled_upstream(business_proxy_key(template, session)?)?.client)
 }
 
 fn upstream_http_client(proxy: &str) -> Result<reqwest::Client> {
     let proxy = crate::settings::normalize_proxy(proxy, "上游转发代理")?;
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::limited(5));
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(4)
+        // 业务转发要原样交回下游。关掉自动解压，避免吃掉 Codex 自己的 Content-Encoding。
+        .no_gzip()
+        .no_zstd();
     if !proxy.is_empty() {
         let proxy = reqwest::Proxy::all(fetch::outbound_proxy_for_client(&proxy))
             .map_err(|_| anyhow::anyhow!("上游转发代理地址无效"))?;
@@ -2325,7 +2704,7 @@ async fn forward_http_with_log(
     details: &mut NetworkLogDetails,
     started: Instant,
 ) -> Result<Response> {
-    let response = forward_http_tracked(app, req, details, &mut None, started).await?;
+    let response = forward_http_tracked(app, req, details, &mut None, &mut None, started).await?;
     let Some(lifecycle) = details.stream_lifecycle.clone() else {
         return Ok(response);
     };
@@ -2336,7 +2715,12 @@ async fn forward_http_with_log(
     ))
 }
 
-fn state_wait_error(details: &mut NetworkLogDetails, status: StatusCode, kind: &str, message: &str) -> anyhow::Error {
+fn state_wait_error(
+    details: &mut NetworkLogDetails,
+    status: StatusCode,
+    kind: &str,
+    message: &str,
+) -> anyhow::Error {
     details.response_status = Some(status.as_u16());
     details.error_kind = Some(kind.into());
     details.turn_state_action = kind.into();
@@ -2353,27 +2737,59 @@ async fn wait_for_request_state(
     details: &mut NetworkLogDetails,
 ) -> Result<String> {
     let Some(model) = model else {
-        return Err(state_wait_error(details, StatusCode::UNPROCESSABLE_ENTITY, "state_model_unknown", "无法识别请求模型，不能等待匹配的 state；请求未转发"));
+        return Err(state_wait_error(
+            details,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "state_model_unknown",
+            "无法识别请求模型，不能等待匹配的 state；请求未转发",
+        ));
     };
     let Some(account) = account else {
-        return Err(state_wait_error(details, StatusCode::CONFLICT, "state_account_unknown", "无法识别请求账号，不能等待匹配的 state；请求未转发"));
+        return Err(state_wait_error(
+            details,
+            StatusCode::CONFLICT,
+            "state_account_unknown",
+            "无法识别请求账号，不能等待匹配的 state；请求未转发",
+        ));
     };
     app.model_notify.notify_one();
     loop {
         let current = app.settings.lock().await.clone();
         if current.state_miss_policy != StateMissPolicy::Wait
-            || current.token_reuse_policy != request_settings.token_reuse_policy {
-            return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_policy_changed", "等待策略已切换，请重新发起请求；请求未转发"));
+            || current.token_reuse_policy != request_settings.token_reuse_policy
+        {
+            return Err(state_wait_error(
+                details,
+                StatusCode::CONFLICT,
+                "state_wait_policy_changed",
+                "等待策略已切换，请重新发起请求；请求未转发",
+            ));
         }
-        if current.codex_home != request_settings.codex_home || current.upstream != request_settings.upstream
-            || current.upstream_proxy != request_settings.upstream_proxy || current.outbound_proxy != request_settings.outbound_proxy
-            || current.outbound_mode != request_settings.outbound_mode || current.warp_http2 != request_settings.warp_http2
+        if current.codex_home != request_settings.codex_home
+            || current.upstream != request_settings.upstream
+            || current.upstream_proxy != request_settings.upstream_proxy
+            || current.outbound_proxy != request_settings.outbound_proxy
+            || current.outbound_mode != request_settings.outbound_mode
+            || current.warp_http2 != request_settings.warp_http2
             || current.network_route_policy != request_settings.network_route_policy
-            || current.forced_model != request_settings.forced_model {
-            return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_config_changed", "等待期间线路配置已变化，请重新发起请求；请求未转发"));
+            || current.forced_model != request_settings.forced_model
+        {
+            return Err(state_wait_error(
+                details,
+                StatusCode::CONFLICT,
+                "state_wait_config_changed",
+                "等待期间线路配置已变化，请重新发起请求；请求未转发",
+            ));
         }
-        if !login::chatgpt_credentials(Path::new(&request_settings.codex_home)).is_ok_and(|creds| creds.account_id == account) {
-            return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_account_changed", "等待期间登录账号已变化或退出，请重新发起请求；请求未转发"));
+        if !login::chatgpt_credentials(Path::new(&request_settings.codex_home))
+            .is_ok_and(|creds| creds.account_id == account)
+        {
+            return Err(state_wait_error(
+                details,
+                StatusCode::CONFLICT,
+                "state_wait_account_changed",
+                "等待期间登录账号已变化或退出，请重新发起请求；请求未转发",
+            ));
         }
         {
             let mut store = app.turn_state.lock().await;
@@ -2389,7 +2805,12 @@ async fn wait_for_request_state(
             }
         }
         if current.token_fetch_paused {
-            return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_fetch_paused", "已暂停获取 Token，当前没有可用凭证；请求未转发"));
+            return Err(state_wait_error(
+                details,
+                StatusCode::CONFLICT,
+                "state_wait_fetch_paused",
+                "已暂停获取 Token，当前没有可用凭证；请求未转发",
+            ));
         }
         // Poll also observes login files changed outside Kit. No locks are held
         // while sleeping and no task is spawned that could outlive the client.
@@ -2405,16 +2826,16 @@ async fn forward_http_tracked(
     req: Request<Body>,
     details: &mut NetworkLogDetails,
     activity: &mut Option<RequestActivity>,
+    billing_request: &mut Option<BillingRequest>,
     started: Instant,
 ) -> Result<Response> {
-    let (upstream, home, upstream_proxy, cached_http, state_miss_policy, request_settings) = {
+    let (upstream, home, upstream_proxy, state_miss_policy, request_settings) = {
         let settings = app.settings.lock().await;
         let business_proxy = resolved_business_proxy(&settings, &app.warp, &app.mihomo);
         (
             settings.upstream.clone(),
             settings.codex_home.clone(),
             business_proxy,
-            app.http.lock().await.clone(),
             settings.state_miss_policy,
             settings.clone(),
         )
@@ -2427,9 +2848,11 @@ async fn forward_http_tracked(
     {
         anyhow::bail!(
             "{}",
-            app.warp.proxy_url().err().map(|err| err.to_string()).unwrap_or_else(|| {
-                "内置 WARP 正在自动连接，请稍候。".into()
-            })
+            app.warp
+                .proxy_url()
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| { "内置 WARP 正在自动连接，请稍候。".into() })
         );
     }
     if request_settings.same_network()
@@ -2496,11 +2919,18 @@ async fn forward_http_tracked(
     let client_credentials_conflict = request_identity
         .as_ref()
         .is_some_and(|(creds, _)| login::credentials_conflict_headers(&parts.headers, creds));
-    let request_account_matches = request_identity
-        .as_ref()
-        .is_some_and(|(creds, override_headers)| {
-            *override_headers || login::credentials_match_headers(&parts.headers, creds)
-        });
+    let request_account_matches =
+        request_identity
+            .as_ref()
+            .is_some_and(|(creds, override_headers)| {
+                *override_headers || login::credentials_match_headers(&parts.headers, creds)
+            });
+    let billing_identity_matches =
+        request_identity
+            .as_ref()
+            .is_some_and(|(creds, override_headers)| {
+                *override_headers || !login::credentials_conflict_headers(&parts.headers, creds)
+            });
     if let Some((creds, true)) = &request_identity {
         if !login::apply_chatgpt_credentials_headers(&mut parts.headers, creds) {
             anyhow::bail!("无法应用 ChatGPT 鉴权请求头");
@@ -2512,14 +2942,22 @@ async fn forward_http_tracked(
         .is_some_and(|(creds, override_headers)| {
             *override_headers && client_account.as_deref() != Some(creds.account_id.as_str())
         });
-    details.account_id = effective_account.as_deref().map(|id| logs::safe_text(id, 128));
-    if let Some((creds, _)) = &request_identity {
-        if effective_account.as_deref() == Some(creds.account_id.as_str()) {
-            details.account_email = creds
-                .email
-                .as_deref()
-                .map(|email| logs::safe_text(email, 254));
-        }
+    if let Some((creds, _)) = request_identity
+        .as_ref()
+        .filter(|_| billing_identity_matches)
+    {
+        // The persisted identity is the credential selected by Kit, never a
+        // free-form client header. This also keeps the log and billing keys in
+        // sync when Kit has overridden the official Codex credentials.
+        details.account_id = Some(logs::safe_text(&creds.account_id, 128));
+        details.account_email = creds
+            .email
+            .as_deref()
+            .map(|email| logs::safe_text(email, 254));
+    } else {
+        details.account_id = effective_account
+            .as_deref()
+            .map(|id| logs::safe_text(id, 128));
     }
     let request_model = should_stamp
         .then(|| turn_state::extract_model_from_body(&bytes))
@@ -2552,7 +2990,10 @@ async fn forward_http_tracked(
         if let Some(ref model) = request_model {
             let is_new = app.turn_state.lock().await.register_model(model);
             if is_new {
-                debug_log(&format!("[discover] 发现新模型: {}，通知 fetch 循环预取 token", model));
+                debug_log(&format!(
+                    "[discover] 发现新模型: {}，通知 fetch 循环预取 token",
+                    model
+                ));
                 app.model_notify.notify_one();
             }
         }
@@ -2564,15 +3005,29 @@ async fn forward_http_tracked(
             parts.headers.remove(turn_state::HEADER_NAME);
             details.turn_state_action = "removed_all_policy".into();
         } else if state_miss_policy == StateMissPolicy::Passthrough {
-            details.turn_state_action = if client_already_has { "preserved_by_policy" } else { "initial_request" }.into();
-            details.turn_state_len = parts.headers.get(turn_state::HEADER_NAME)
-                .and_then(|value| value.to_str().ok()).map(str::trim).filter(|value| !value.is_empty()).map(str::len);
+            details.turn_state_action = if client_already_has {
+                "preserved_by_policy"
+            } else {
+                "initial_request"
+            }
+            .into();
+            details.turn_state_len = parts
+                .headers
+                .get(turn_state::HEADER_NAME)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::len);
         } else {
             // 探针当作每轮第一包。新一轮首包补上规范票据并包装成同轮第二包；
             // 同轮续跑只改请求头，保留客户端 body（含 previous_response_id）。
             let mut token = {
                 let store = app.turn_state.lock().await;
-                if request_account_matches && effective_account.as_deref().is_some_and(|id| store.is_bound_to_account(id)) {
+                if request_account_matches
+                    && effective_account
+                        .as_deref()
+                        .is_some_and(|id| store.is_bound_to_account(id))
+                {
                     request_model
                         .as_deref()
                         .and_then(|model| store.peek_for_model(model))
@@ -2601,8 +3056,11 @@ async fn forward_http_tracked(
                 // 子代理多步后续跑会空转推理。
                 let header_only = same_turn;
                 if !header_only {
-                    match turn_state::wrap_as_second_packet(&bytes, content_encoding.as_deref(), &token)
-                    {
+                    match turn_state::wrap_as_second_packet(
+                        &bytes,
+                        content_encoding.as_deref(),
+                        &token,
+                    ) {
                         Ok(wrapped) => {
                             bytes = wrapped.into();
                             details.body_bytes = bytes.len();
@@ -2638,7 +3096,11 @@ async fn forward_http_tracked(
                     },
                     token.len(),
                     request_model,
-                    if header_only { "原样" } else { "包装第二包" },
+                    if header_only {
+                        "原样"
+                    } else {
+                        "包装第二包"
+                    },
                     parts.method,
                     path
                 );
@@ -2734,13 +3196,41 @@ async fn forward_http_tracked(
             }
         }
     }
-    let http = if fetch::has_session_placeholder(&upstream_proxy) {
+    // Persist the account/request association before sending upstream. The
+    // account comes from the credentials actually applied to this request, so
+    // a late login switch cannot reassign an in-flight response.
+    if parts.method == http::Method::POST && path.contains("/responses") && billing_identity_matches
+    {
+        let (account_id, email) = request_identity
+            .as_ref()
+            .map(|(creds, _)| (creds.account_id.clone(), creds.email.clone()))
+            .expect("billing_identity_matches implies an identity");
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let sent_model = request_model
+            .clone()
+            .or_else(|| turn_state::extract_model_from_body(&bytes));
+        app.billing
+            .begin_request(RequestStart {
+                request_id: request_id.clone(),
+                provider: "chatgpt".into(),
+                account_id,
+                email,
+                source: "business".into(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                requested_model: request_model.clone(),
+                sent_model,
+            })
+            .context("begin durable billing record")?;
+        *billing_request = Some(BillingRequest::new(app.billing.clone(), request_id));
+    }
+    let resolved_proxy = if fetch::has_session_placeholder(&upstream_proxy) {
         let resolved = fetch::apply_bound_session(&upstream_proxy, bound_session.as_deref())?;
         details.proxy_endpoint = Some(logs::endpoint_origin(&resolved));
-        business_http_client(&upstream_proxy, bound_session.as_deref())?
+        resolved
     } else {
-        cached_http
+        upstream_proxy.clone()
     };
+    let http = app.business_client(&resolved_proxy).await?;
     let mut builder = http
         .request(
             reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?,
@@ -2806,14 +3296,8 @@ async fn forward_http_tracked(
     if let Some(model) =
         degraded_response_model(request_model.as_deref(), upstream_turn_state.as_deref())
     {
-        app.observe_business_response(
-            model,
-            injected_token.as_deref(),
-            true,
-            None,
-            false,
-        )
-        .await;
+        app.observe_business_response(model, injected_token.as_deref(), true, None, false)
+            .await;
     }
     let injected_len = injected_token.as_ref().map(|t| t.len());
     let upstream_ts_len = upstream_turn_state.as_ref().map(|t| t.len());
@@ -2870,8 +3354,12 @@ fn is_hop(name: &HeaderName) -> bool {
 }
 
 fn request_account(headers: &HeaderMap) -> Option<String> {
-    headers.get("chatgpt-account-id").and_then(|value| value.to_str().ok())
-        .map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned)
+    headers
+        .get("chatgpt-account-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 pub fn join_upstream(upstream: &str, uri: &Uri) -> Result<String> {
@@ -2943,6 +3431,31 @@ mod tests {
     }
 
     #[test]
+    fn dropped_billing_request_is_recovered_as_interrupted() {
+        let store = BillingStore::open_in_memory().unwrap();
+        let request_id = "dropped-billing-request".to_string();
+        store
+            .begin_request(RequestStart {
+                request_id: request_id.clone(),
+                provider: "chatgpt".into(),
+                account_id: "account-a".into(),
+                email: None,
+                source: "token_fetch".into(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                requested_model: Some("gpt-test".into()),
+                sent_model: Some("gpt-test".into()),
+            })
+            .unwrap();
+        {
+            let _request = BillingRequest::new(Arc::new(store.clone()), request_id.clone());
+        }
+        assert_eq!(
+            store.get_by_id(&request_id).unwrap().unwrap().state,
+            UsageState::Interrupted
+        );
+    }
+
+    #[test]
     fn shared_fetch_round_groups_donors_without_starving_other_bindings() {
         let mut store = TurnStateStore::default();
         let models = vec!["a".into(), "b".into(), "independent".into()];
@@ -2957,7 +3470,10 @@ mod tests {
         }
         store.set_reuse_policy(TokenReusePolicy::PerModel);
         for round in 1..=6 {
-            assert_eq!(model_for_reuse_round(&store, &models, round), model_for_fetch_round(&models, round));
+            assert_eq!(
+                model_for_reuse_round(&store, &models, round),
+                model_for_fetch_round(&models, round)
+            );
         }
         assert!(model_for_reuse_round(&store, &[], 1).is_none());
         store.set_reuse_policy(TokenReusePolicy::Shared292);
@@ -2988,14 +3504,26 @@ mod tests {
 
     #[test]
     fn fetch_errors_never_retry_without_delay() {
-        assert_eq!(fetch_retry_delay(FetchRetryClass::Normal), fetch::RETRY_INTERVAL);
-        assert_eq!(fetch_retry_delay(FetchRetryClass::Backoff), fetch::ERROR_BACKOFF);
-        assert_eq!(fetch_retry_delay(FetchRetryClass::Auth), fetch::AUTH_BACKOFF);
+        assert_eq!(
+            fetch_retry_delay(FetchRetryClass::Normal),
+            fetch::RETRY_INTERVAL
+        );
+        assert_eq!(
+            fetch_retry_delay(FetchRetryClass::Backoff),
+            fetch::ERROR_BACKOFF
+        );
+        assert_eq!(
+            fetch_retry_delay(FetchRetryClass::Auth),
+            fetch::AUTH_BACKOFF
+        );
         assert_eq!(
             fetch_retry_delay(FetchRetryClass::Forbidden),
             fetch::FORBIDDEN_BACKOFF
         );
-        assert_eq!(fetch_retry_delay(FetchRetryClass::Stale), fetch::RETRY_INTERVAL);
+        assert_eq!(
+            fetch_retry_delay(FetchRetryClass::Stale),
+            fetch::RETRY_INTERVAL
+        );
         assert!(fetch::RETRY_INTERVAL >= Duration::from_secs(6));
         assert_eq!(fetch::MAX_FETCH_BURST, 4);
         assert_eq!(fetch::fetch_burst_concurrency(0), 1);
@@ -3096,21 +3624,16 @@ mod tests {
             store.register_model("gpt-6-astra");
             assert!(store.capture("gpt-6-astra", &current_ticket, "test"));
         }
-        assert!(app
-            .turn_state
-            .lock()
-            .await
-            .peek_for_model("gpt-6-astra")
-            .as_deref()
-            == Some(current_ticket.as_str()));
-        app.observe_business_response(
-            "gpt-6-astra",
-            Some(&current_ticket),
-            true,
-            None,
-            false,
-        )
-        .await;
+        assert!(
+            app.turn_state
+                .lock()
+                .await
+                .peek_for_model("gpt-6-astra")
+                .as_deref()
+                == Some(current_ticket.as_str())
+        );
+        app.observe_business_response("gpt-6-astra", Some(&current_ticket), true, None, false)
+            .await;
         assert!(app
             .turn_state
             .lock()
@@ -3197,10 +3720,7 @@ mod tests {
             response_status: Some(401),
             ..NetworkLogDetails::default()
         };
-        assert_eq!(
-            classify_fetch_failure(&unauthorized),
-            FetchRetryClass::Auth
-        );
+        assert_eq!(classify_fetch_failure(&unauthorized), FetchRetryClass::Auth);
         let forbidden = NetworkLogDetails {
             response_status: Some(403),
             ..NetworkLogDetails::default()
@@ -3248,21 +3768,55 @@ mod tests {
         let mut store = TurnStateStore::default();
         store.set_model_bound_len("astra", Some(turn_state::QUALITY_TOKEN_LEN));
         let original_292 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
-        assert!(capture_fetched_ticket(&mut store, "astra", &original_292, None, None, &[]));
+        assert!(capture_fetched_ticket(
+            &mut store,
+            "astra",
+            &original_292,
+            None,
+            None,
+            &[]
+        ));
         let token_332 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN_332);
-        assert!(!capture_fetched_ticket(&mut store, "astra", &token_332, None, None, &[]));
+        assert!(!capture_fetched_ticket(
+            &mut store,
+            "astra",
+            &token_332,
+            None,
+            None,
+            &[]
+        ));
         assert_eq!(
             store.peek_for_model("astra").as_deref(),
             Some(original_292.as_str())
         );
 
         let token_292 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
-        assert!(capture_fetched_ticket(&mut store, "astra", &token_292, None, None, &[]));
-        assert_eq!(store.peek_for_model("astra").as_deref(), Some(token_292.as_str()));
+        assert!(capture_fetched_ticket(
+            &mut store,
+            "astra",
+            &token_292,
+            None,
+            None,
+            &[]
+        ));
+        assert_eq!(
+            store.peek_for_model("astra").as_deref(),
+            Some(token_292.as_str())
+        );
 
         let mut auto = TurnStateStore::default();
-        assert!(capture_fetched_ticket(&mut auto, "astra", &token_332, None, None, &[]));
-        assert_eq!(auto.bound_len_for("astra"), turn_state::QUALITY_TOKEN_LEN_332);
+        assert!(capture_fetched_ticket(
+            &mut auto,
+            "astra",
+            &token_332,
+            None,
+            None,
+            &[]
+        ));
+        assert_eq!(
+            auto.bound_len_for("astra"),
+            turn_state::QUALITY_TOKEN_LEN_332
+        );
     }
 
     #[tokio::test]
@@ -3293,12 +3847,17 @@ mod tests {
     #[test]
     fn same_network_keeps_session_placeholder_until_bound() {
         let settings = Settings {
-            outbound_proxy: "socks5://xmtt1126849-region-DE-sid-{session}-t-120:pass@us.arxlabs.io:3010".into(),
+            outbound_proxy:
+                "socks5://xmtt1126849-region-DE-sid-{session}-t-120:pass@us.arxlabs.io:3010".into(),
             outbound_mode: OutboundMode::Manual,
             network_route_policy: NetworkRoutePolicy::SameNetwork,
             ..Settings::default()
         };
-        let template = resolved_business_proxy(&settings, &WarpRuntime::default(), &MihomoRuntime::default());
+        let template = resolved_business_proxy(
+            &settings,
+            &WarpRuntime::default(),
+            &MihomoRuntime::default(),
+        );
         assert!(fetch::has_session_placeholder(&template));
         assert!(fetch::apply_bound_session(&template, None).is_err());
         assert!(fetch::apply_bound_session(&template, Some("1Z5jzVPs"))
@@ -3383,7 +3942,10 @@ mod tests {
             }),
         );
         let oauth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let oauth_url = format!("http://{}/oauth/token", oauth_listener.local_addr().unwrap());
+        let oauth_url = format!(
+            "http://{}/oauth/token",
+            oauth_listener.local_addr().unwrap()
+        );
         let oauth_server = tokio::spawn(async move {
             axum::serve(oauth_listener, oauth_app).await.unwrap();
         });
@@ -3643,7 +4205,9 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("response.incomplete"));
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {

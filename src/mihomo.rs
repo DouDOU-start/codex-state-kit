@@ -61,7 +61,9 @@ impl Default for MihomoRuntime {
 
 impl MihomoRuntime {
     pub fn new(paths: Option<MihomoPaths>) -> Self {
-        let available = paths.as_ref().is_some_and(|paths| paths.bundled_binary.is_file());
+        let available = paths
+            .as_ref()
+            .is_some_and(|paths| paths.bundled_binary.is_file());
         Self {
             paths,
             inner: Mutex::new(Inner {
@@ -212,14 +214,18 @@ impl MihomoRuntime {
         let config = render_config(&nodes, mixed, &controller, &secret);
         let config_path = paths.data_dir.join("config.yaml");
         fs::write(&config_path, config).context("无法写入 Mihomo 配置")?;
-        let log = File::create(paths.data_dir.join("mihomo.log")).context("无法写入 Mihomo 日志")?;
-        let mut command = sidecar_command(&binary, &log)?;
-        command.arg("-d").arg(&paths.data_dir).arg("-f").arg(&config_path);
-        let child = OwnedChild::spawn(&mut command)?;
+        let log =
+            File::create(paths.data_dir.join("mihomo.log")).context("无法写入 Mihomo 日志")?;
+        let mut command = sidecar_command(&binary, &log, &paths.data_dir)?;
+        command
+            .arg("-d")
+            .arg(&paths.data_dir)
+            .arg("-f")
+            .arg(&config_path);
+        let mut child = OwnedChild::spawn(&mut command)?;
         let proxy_url = format!("http://127.0.0.1:{mixed}");
         {
             let mut inner = self.inner.lock().expect("mihomo state");
-            inner.child = Some(child);
             inner.proxy_url = Some(proxy_url.clone());
             inner.controller = Some(controller.clone());
             inner.secret = Some(secret.clone());
@@ -227,7 +233,15 @@ impl MihomoRuntime {
             inner.view.nodes = names.clone();
             inner.view.available = true;
         }
-        wait_until_ready(&controller, &secret).await?;
+        // This is a local sidecar endpoint. Do not route the readiness probe
+        // through HTTP(S)_PROXY/ALL_PROXY inherited from the desktop process.
+        wait_until_ready(
+            &controller,
+            &secret,
+            &mut child,
+            &paths.data_dir.join("mihomo.log"),
+        )
+        .await?;
         let chosen = if let Some(name) = selected.or_else(|| names.first().cloned()) {
             select_node(&controller, &secret, &name).await?;
             Some(name)
@@ -235,6 +249,7 @@ impl MihomoRuntime {
             None
         };
         let mut inner = self.inner.lock().expect("mihomo state");
+        inner.child = Some(child);
         inner.view.phase = "connected".into();
         inner.view.proxy_url = Some(proxy_url);
         inner.view.selected = chosen;
@@ -246,10 +261,28 @@ impl MihomoRuntime {
 }
 
 fn bundled_binary(paths: &MihomoPaths) -> Result<PathBuf> {
-    if paths.bundled_binary.is_file() {
-        return Ok(paths.bundled_binary.clone());
+    if !paths.bundled_binary.is_file() {
+        bail!("内核文件缺失，请使用完整安装包。")
     }
-    bail!("内核文件缺失，请使用完整安装包。")
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::metadata(&paths.bundled_binary).context("无法读取 Mihomo 内核权限")?;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            // Some macOS archive and app-bundle copy steps lose the executable
+            // bit. Keep the bundled resource untouched and run a writable copy.
+            let fallback = paths.data_dir.join(".mihomo");
+            fs::copy(&paths.bundled_binary, &fallback).context("无法准备 Mihomo 内核")?;
+            let mut permissions = fs::metadata(&fallback)
+                .context("无法读取 Mihomo 内核副本权限")?
+                .permissions();
+            permissions.set_mode(permissions.mode() | 0o755);
+            fs::set_permissions(&fallback, permissions).context("无法设置 Mihomo 内核执行权限")?;
+            return Ok(fallback);
+        }
+    }
+    Ok(paths.bundled_binary.clone())
 }
 
 async fn load_subscription(raw: &str) -> Result<String> {
@@ -331,7 +364,12 @@ fn yaml_proxies(text: &str) -> Option<Vec<ProxyNode>> {
 
 fn node_from_yaml(value: &serde_yaml::Value) -> Option<ProxyNode> {
     let name = value.get("name")?.as_str()?.trim();
-    if name.is_empty() || value.get("type").and_then(serde_yaml::Value::as_str).is_none() {
+    if name.is_empty()
+        || value
+            .get("type")
+            .and_then(serde_yaml::Value::as_str)
+            .is_none()
+    {
         return None;
     }
     Some(ProxyNode {
@@ -415,13 +453,17 @@ fn parse_shadowsocks(rest: &str) -> Option<ProxyNode> {
 }
 
 fn ss_node(name: &str, server: &str, port: u16, cipher: &str, password: &str) -> ProxyNode {
-    mapping_node(name, "ss", &[
-        ("server", yaml_str(server)),
-        ("port", yaml_int(port)),
-        ("cipher", yaml_str(cipher)),
-        ("password", yaml_str(password)),
-        ("udp", serde_yaml::Value::Bool(true)),
-    ])
+    mapping_node(
+        name,
+        "ss",
+        &[
+            ("server", yaml_str(server)),
+            ("port", yaml_int(port)),
+            ("cipher", yaml_str(cipher)),
+            ("password", yaml_str(password)),
+            ("udp", serde_yaml::Value::Bool(true)),
+        ],
+    )
 }
 
 fn parse_vmess(rest: &str) -> Option<ProxyNode> {
@@ -446,7 +488,11 @@ fn parse_vmess(rest: &str) -> Option<ProxyNode> {
         ),
         (
             "cipher",
-            yaml_str(json.get("scy").and_then(JsonValue::as_str).unwrap_or("auto")),
+            yaml_str(
+                json.get("scy")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("auto"),
+            ),
         ),
         ("udp", serde_yaml::Value::Bool(true)),
     ];
@@ -456,7 +502,11 @@ fn parse_vmess(rest: &str) -> Option<ProxyNode> {
     }
     if json.get("tls").and_then(JsonValue::as_str) == Some("tls") {
         fields.push(("tls", serde_yaml::Value::Bool(true)));
-        if let Some(sni) = json.get("sni").and_then(JsonValue::as_str).filter(|sni| !sni.is_empty()) {
+        if let Some(sni) = json
+            .get("sni")
+            .and_then(JsonValue::as_str)
+            .filter(|sni| !sni.is_empty())
+        {
             fields.push(("servername", yaml_str(sni)));
         }
     }
@@ -503,16 +553,17 @@ fn parse_hysteria2(rest: &str) -> Option<ProxyNode> {
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
     let name = url_name(&url).unwrap_or(server);
-    let mut fields = vec![
-        ("server", yaml_str(server)),
-        ("port", yaml_int(port)),
-    ];
+    let mut fields = vec![("server", yaml_str(server)), ("port", yaml_int(port))];
     if let Some(password) = urlencoding_username(&url) {
         if !password.is_empty() {
             fields.push(("password", yaml_str(&password)));
         }
     }
-    if let Some(sni) = url.query_pairs().find(|(key, _)| key == "sni").map(|(_, value)| value.into_owned()) {
+    if let Some(sni) = url
+        .query_pairs()
+        .find(|(key, _)| key == "sni")
+        .map(|(_, value)| value.into_owned())
+    {
         fields.push(("sni", yaml_str(&sni)));
     }
     Some(mapping_node(name, "hysteria2", &fields))
@@ -525,13 +576,17 @@ fn parse_tuic(rest: &str) -> Option<ProxyNode> {
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
     let name = url_name(&url).unwrap_or(server);
-    Some(mapping_node(name, "tuic", &[
-        ("server", yaml_str(server)),
-        ("port", yaml_int(port)),
-        ("uuid", yaml_str(uuid)),
-        ("password", yaml_str(password)),
-        ("udp", serde_yaml::Value::Bool(true)),
-    ]))
+    Some(mapping_node(
+        name,
+        "tuic",
+        &[
+            ("server", yaml_str(server)),
+            ("port", yaml_int(port)),
+            ("uuid", yaml_str(uuid)),
+            ("password", yaml_str(password)),
+            ("udp", serde_yaml::Value::Bool(true)),
+        ],
+    ))
 }
 
 fn push_stream_fields(fields: &mut Vec<(&str, serde_yaml::Value)>, url: &url::Url) {
@@ -539,13 +594,21 @@ fn push_stream_fields(fields: &mut Vec<(&str, serde_yaml::Value)>, url: &url::Ur
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
-    let get = |name: &str| query.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
+    let get = |name: &str| {
+        query
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
     let network = get("type").unwrap_or("tcp");
     if network != "tcp" {
         fields.push(("network", yaml_str(network)));
     }
     let security = get("security").unwrap_or("");
-    if security == "tls" || security == "reality" || get("tls").is_some_and(|value| value == "1" || value == "true") {
+    if security == "tls"
+        || security == "reality"
+        || get("tls").is_some_and(|value| value == "1" || value == "true")
+    {
         fields.push(("tls", serde_yaml::Value::Bool(true)));
     }
     if let Some(sni) = get("sni").filter(|sni| !sni.is_empty()) {
@@ -608,7 +671,10 @@ fn percent_decode(value: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""), 16) {
+            if let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
+                16,
+            ) {
                 out.push(byte);
                 index += 3;
                 continue;
@@ -643,7 +709,12 @@ fn decode_text(raw: &str) -> Option<String> {
     String::from_utf8(b64(raw)?).ok()
 }
 
-pub fn render_config(nodes: &[ProxyNode], mixed_port: u16, controller: &str, secret: &str) -> String {
+pub fn render_config(
+    nodes: &[ProxyNode],
+    mixed_port: u16,
+    controller: &str,
+    secret: &str,
+) -> String {
     let names: Vec<serde_yaml::Value> = nodes.iter().map(|node| yaml_str(&node.name)).collect();
     let mut group = serde_yaml::Mapping::new();
     group.insert(yaml_str("name"), yaml_str(GROUP));
@@ -682,11 +753,17 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-async fn wait_until_ready(controller: &str, secret: &str) -> Result<()> {
+async fn wait_until_ready(
+    controller: &str,
+    secret: &str,
+    child: &mut OwnedChild,
+    log_path: &Path,
+) -> Result<()> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let url = format!("http://{controller}/version");
     loop {
         if client
@@ -698,8 +775,11 @@ async fn wait_until_ready(controller: &str, secret: &str) -> Result<()> {
         {
             return Ok(());
         }
+        if let Ok(Some(status)) = child.child.try_wait() {
+            bail!("Mihomo 内核已退出（{status}）{}", log_detail(log_path));
+        }
         if Instant::now() >= deadline {
-            bail!("Mihomo 内核启动超时，详情见应用数据目录 mihomo/mihomo.log");
+            bail!("Mihomo 内核启动超时{}", log_detail(log_path));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -707,6 +787,7 @@ async fn wait_until_ready(controller: &str, secret: &str) -> Result<()> {
 
 async fn select_node(controller: &str, secret: &str, name: &str) -> Result<()> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()?;
     let response = client
@@ -722,12 +803,37 @@ async fn select_node(controller: &str, secret: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn sidecar_command(binary: &Path, log: &File) -> Result<Command> {
+fn tail_text(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(max_chars.saturating_sub(1))
+        .map_or(0, |(index, _)| index);
+    format!("…{}", &text[start..])
+}
+
+fn log_detail(log_path: &Path) -> String {
+    let tail = fs::read_to_string(log_path)
+        .ok()
+        .map(|text| tail_text(&text, 2_000))
+        .filter(|text| !text.is_empty());
+    match tail {
+        Some(text) => format!("；日志文件：{}；日志尾部：{text}", log_path.display()),
+        None => format!("；日志文件：{}", log_path.display()),
+    }
+}
+
+fn sidecar_command(binary: &Path, log: &File, working_dir: &Path) -> Result<Command> {
     let mut command = Command::new(binary);
     command
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log.try_clone()?);
+        .stderr(log.try_clone()?)
+        .current_dir(working_dir);
     for key in [
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -807,7 +913,8 @@ impl WindowsJob {
             ) == 0
                 || AssignProcessToJobObject(handle, child.as_raw_handle()) == 0
             {
-                return Err(std::io::Error::last_os_error()).context("无法管理 Mihomo 子进程生命周期");
+                return Err(std::io::Error::last_os_error())
+                    .context("无法管理 Mihomo 子进程生命周期");
             }
             Ok(Self { _handle: owned })
         }
@@ -870,5 +977,4 @@ proxies:
         assert!(parse_subscription("   ").is_err());
         assert!(parse_subscription("not a subscription").is_err());
     }
-
 }

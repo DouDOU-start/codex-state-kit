@@ -6,10 +6,10 @@
 
 ## 获取与缓存
 
-应用使用当前工作目录中的 ChatGPT 凭据，通过所选出站代理向上游 `/responses` 发起轻量请求，从响应头读取 `x-codex-turn-state`。探针使用与 Codex TUI 自洽的 `User-Agent`、`originator`、`version`，每次生成新的 `session_id`，请求体为固定的 `ping/pong` 轻量交互。
+应用使用当前工作目录中的 ChatGPT 凭据，通过所选出站代理向上游 `/responses` 发起轻量请求，从响应头读取 `x-codex-turn-state`。探针使用与 Codex CLI（`codex_cli_rs`）自洽的 `User-Agent`、`originator`、`version`，每次生成新的 `session_id`，请求体为 zstd 压缩的 `ping/pong` 轻量交互。
 
 - 每轮只选择一个需要刷新的模型，共享 292 时随机选择一个不在冷却中的模型取票；按模型独立时轮询。同一波内可并发探测：第一次 1 路，连续打不到则 2，最高 4；打到目标长度后回到 1。打满 4 路仍未命中则静置 60 秒，再从 1 路重来。
-- 请求强制使用 HTTP/1.1、新连接和 `Connection: close`；认证信息不会跟随重定向。
+- 探针与官方 CLI 一样通过 TLS ALPN 协商 HTTP 版本，不发送 `Connection: close`。同一出站代理复用连接；明文 HTTP 上游仍是 HTTP/1.1。认证信息不会跟随重定向。
 - 探针会收下上游 `Set-Cookie` 里的 Cloudflare / 线路 cookie（`__oailb`、`__cflb`、`__cf_bm`、`_cfuvid`、`cf_clearance`、`cf_chl_*` 等），绑到该张票据上；后续探针和业务 `/responses` 回放这些 cookie，把请求粘在同一边缘。官方登录 / session cookie 不会收、不会回放、也不会写进日志。覆盖 Kit 鉴权时只剥掉非白名单 Cookie，线路 cookie 会留下。打到 `chatgpt.com` 时额外带官方工厂 cookie `oai-chat-psp=true`。
 - 只有 HTTP 200 下长度精确匹配该模型请求开始时绑定长度、前缀正确、时间戳可解析且未超过预取年龄的候选值才会入池；312、未来时间戳和其他长度仅记录后拒绝。
 - Token 按来源模型分别缓存并保留来源，内存与本地文件同步，启动时尝试恢复；注入与预取遵循下述复用策略。
@@ -67,7 +67,7 @@
 - **首包包装为第二包，续跑只改头**：官方客户端每一轮新建 `ModelClientSession`，首包不带 turn-state。Kit 把探针当作第一包；新一轮首包写入请求头和 `client_metadata`，并去掉 `previous_response_id`。同轮续跑（`previous_response_id` 或 tool output）只换请求头，不改 body。已携带但无法识别模型时按所选策略保留、剥离或拒绝等待。
 - **账号快照保持一致**：每个业务请求使用同一份凭据快照完成票据池账号校验和 Kit 鉴权覆盖；客户端原头与当前官方账号不一致时不注入缓存票据。
 - **业务响应不进入票池**：真实业务响应中的 Turn-State 只用于日志，不会覆盖后台探针取得的模型票据。
-- **代理 URL 不做会话改写**：每次探针使用新 client 和新连接；动态住宅代理是否更换出口由代理供应商决定。
+- **代理 URL 不做会话改写**：同一出站地址复用 HTTP 客户端。动态住宅代理是否更换出口由代理供应商决定；URL 含 `{session}` 时，每次探测仍换新出口，打到票据后业务请求复用该出口的客户端。
 - **长度是项目筛选规则**：界面中的“292”“312/降智”是项目标签，不是模型能力或计算档位的官方指标。
 - **线路 Cookie 跟票据走**：探针拿到的 `__oailb` / `__cflb` 等与那张 292 一起缓存和回放；过期后不再发送。不读取、不注入浏览器登录 cookie。
 

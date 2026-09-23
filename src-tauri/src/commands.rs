@@ -1,3 +1,4 @@
+use codex_state_kit::billing::{BillingSummary, PricingRuleSpec, UsageFilter, UsageRecordsPage};
 use codex_state_kit::{
     exchange_refresh_token, import_access_token as persist_access_token, inspect_codex_config,
     login_status, persist_refresh_token_import, poll_device_login, start_device_login,
@@ -58,7 +59,9 @@ pub async fn open_github_repo() -> CommandResult<()> {
 }
 
 #[tauri::command]
-pub async fn check_update(app: tauri::AppHandle) -> CommandResult<codex_state_kit::update::UpdateInfo> {
+pub async fn check_update(
+    app: tauri::AppHandle,
+) -> CommandResult<codex_state_kit::update::UpdateInfo> {
     command(codex_state_kit::update::check_update(&app.package_info().version.to_string()).await)
 }
 
@@ -80,14 +83,68 @@ pub async fn resume_after_update_failure(state: tauri::State<'_, AppState>) -> C
 }
 
 #[tauri::command]
-pub async fn restart_after_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> CommandResult<()> {
-    if !state.update_is_prepared() { return Err("尚未准备更新安装".into()); }
+pub async fn restart_after_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> CommandResult<()> {
+    if !state.update_is_prepared() {
+        return Err("尚未准备更新安装".into());
+    }
     app.restart();
 }
 
 #[tauri::command(async)]
 pub async fn get_status(state: State<'_, AppState>) -> CommandResult<Status> {
     Ok(state.proxy.managed_status().await)
+}
+
+/// Read durable per-account usage totals.  The billing store is independent
+/// from the bounded network log, so this remains available after a restart.
+#[tauri::command(async)]
+pub async fn get_billing_summary(
+    state: State<'_, AppState>,
+    from: Option<String>,
+    to: Option<String>,
+) -> CommandResult<BillingSummary> {
+    command(state.core().billing.account_summaries(UsageFilter {
+        from,
+        to,
+        ..UsageFilter::default()
+    }))
+}
+
+/// Query persisted request-level billing records with optional account/time,
+/// source and model filters.
+#[tauri::command(async)]
+pub async fn get_billing_records(
+    state: State<'_, AppState>,
+    account_id: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    source: Option<String>,
+    model: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> CommandResult<UsageRecordsPage> {
+    command(state.core().billing.list_usage(UsageFilter {
+        account_id,
+        from,
+        to,
+        source,
+        model,
+        limit,
+        offset,
+    }))
+}
+
+/// Add or replace a model price snapshot. Existing usage rows keep the rule
+/// selected when they were settled, so changing a price never rewrites history.
+#[tauri::command(async)]
+pub async fn set_billing_pricing(
+    state: State<'_, AppState>,
+    rule: PricingRuleSpec,
+) -> CommandResult<i64> {
+    command(state.core().billing.add_pricing_rule(rule))
 }
 
 #[tauri::command(async)]
@@ -152,11 +209,7 @@ pub async fn import_chatgpt_refresh_token(
     if slot.generation != generation || slot.closed {
         return Err("登录已取消".into());
     }
-    command(persist_refresh_token_import(
-        &home,
-        &refresh_token,
-        &tokens,
-    ))
+    command(persist_refresh_token_import(&home, &refresh_token, &tokens))
 }
 
 #[tauri::command(async)]
@@ -283,7 +336,11 @@ pub async fn set_model_bound_token_len(
     model: String,
     len: Option<usize>,
 ) -> CommandResult<Status> {
-    Ok(state.proxy.core().set_model_bound_token_len(&model, len).await)
+    Ok(state
+        .proxy
+        .core()
+        .set_model_bound_token_len(&model, len)
+        .await)
 }
 
 #[tauri::command(async)]

@@ -243,7 +243,8 @@ pub fn retain_allowed_request_cookies(headers: &mut HeaderMap) {
     else {
         return;
     };
-    match filter_request_cookie_header(raw).and_then(|filtered| HeaderValue::from_str(&filtered).ok())
+    match filter_request_cookie_header(raw)
+        .and_then(|filtered| HeaderValue::from_str(&filtered).ok())
     {
         Some(value) => {
             headers.insert(header::COOKIE, value);
@@ -308,7 +309,10 @@ fn parse_request_cookies(raw: &str) -> Vec<RoutingCookie> {
             let (name, value) = part.split_once('=')?;
             let name = name.trim();
             let value = value.trim();
-            if !is_allowed_name(name) || !valid_name(name) || !valid_value(value) || value.is_empty()
+            if !is_allowed_name(name)
+                || !valid_name(name)
+                || !valid_value(value)
+                || value.is_empty()
             {
                 return None;
             }
@@ -368,11 +372,18 @@ mod tests {
         jar.ingest_response_headers(&headers, 1_000);
         let stored = jar.stored();
         assert_eq!(
-            stored.iter().map(|cookie| cookie.name.as_str()).collect::<Vec<_>>(),
+            stored
+                .iter()
+                .map(|cookie| cookie.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["__cflb", "__oailb", "cf_chl_seq"]
         );
         assert_eq!(
-            stored.iter().find(|cookie| cookie.name == "__oailb").unwrap().expires_unix,
+            stored
+                .iter()
+                .find(|cookie| cookie.name == "__oailb")
+                .unwrap()
+                .expires_unix,
             Some(4_600)
         );
         assert!(format!("{stored:?}").contains("<redacted>"));
@@ -398,7 +409,10 @@ mod tests {
         jar.ingest_response_headers(&headers, 200);
         assert!(jar.stored().iter().all(|cookie| cookie.name != "__cflb"));
         assert!(jar.stored().iter().all(|cookie| cookie.name != "__oailb"));
-        assert_eq!(live_cookies(&jar.stored(), 200), Vec::<RoutingCookie>::new());
+        assert_eq!(
+            live_cookies(&jar.stored(), 200),
+            Vec::<RoutingCookie>::new()
+        );
     }
 
     #[test]
@@ -413,7 +427,10 @@ mod tests {
 
         apply_to_headers(
             &mut headers,
-            &[cookie("__cflb", "edge1", None), cookie("__oailb", "probe", None)],
+            &[
+                cookie("__cflb", "edge1", None),
+                cookie("__oailb", "probe", None),
+            ],
             true,
         );
         let raw = headers[header::COOKIE].to_str().unwrap();
@@ -425,9 +442,15 @@ mod tests {
 
     #[test]
     fn factory_cookie_only_for_official_chatgpt_https() {
-        assert!(is_chatgpt_https_url("https://chatgpt.com/backend-api/codex/responses"));
-        assert!(is_chatgpt_https_url("https://api.chatgpt.com/backend-api/codex"));
-        assert!(!is_chatgpt_https_url("http://chatgpt.com/backend-api/codex"));
+        assert!(is_chatgpt_https_url(
+            "https://chatgpt.com/backend-api/codex/responses"
+        ));
+        assert!(is_chatgpt_https_url(
+            "https://api.chatgpt.com/backend-api/codex"
+        ));
+        assert!(!is_chatgpt_https_url(
+            "http://chatgpt.com/backend-api/codex"
+        ));
         assert!(!is_chatgpt_https_url("https://example.com/responses"));
         assert_eq!(
             request_header(&[], true).as_deref(),

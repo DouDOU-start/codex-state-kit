@@ -161,12 +161,7 @@ impl StreamLifecycle {
             }
             if self
                 .state
-                .compare_exchange(
-                    state,
-                    STREAM_FINISHING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(state, STREAM_FINISHING, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break;
@@ -179,8 +174,10 @@ impl StreamLifecycle {
         } else {
             last_chunk_ms
         };
-        self.max_idle_ms
-            .fetch_max(elapsed_ms.saturating_sub(last_activity_ms), Ordering::Relaxed);
+        self.max_idle_ms.fetch_max(
+            elapsed_ms.saturating_sub(last_activity_ms),
+            Ordering::Relaxed,
+        );
         self.stream_total_ms.store(elapsed_ms, Ordering::Relaxed);
         self.state.store(final_state, Ordering::Release);
     }
@@ -527,7 +524,10 @@ pub fn request_error_kind(error: &reqwest::Error) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct ResponseMetrics {
     first_token_ms: Option<u128>,
+    input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    usage_seen: bool,
     upstream_response_model: Option<String>,
     line: Vec<u8>,
     data: Vec<u8>,
@@ -620,7 +620,11 @@ impl ResponseBodyMetrics {
             MetricsDecoder::Gzip(decoder) => decoder,
             MetricsDecoder::Deflate(decoder) => decoder,
         };
-        if writer.write_all(bytes).and_then(|()| writer.flush()).is_err() {
+        if writer
+            .write_all(bytes)
+            .and_then(|()| writer.flush())
+            .is_err()
+        {
             // A statistics decoding failure must not interrupt forwarding or
             // turn a successful HTTP request into a network error.
             self.disabled = true;
@@ -714,6 +718,28 @@ impl ResponseMetrics {
         self.output_tokens
     }
 
+    /// Number of input/prompt tokens reported by the provider.
+    ///
+    /// Both Responses API (`input_tokens`) and Chat Completions
+    /// (`prompt_tokens`) usage shapes are supported.
+    pub fn input_tokens(&self) -> Option<u64> {
+        self.input_tokens
+    }
+
+    /// Number of input tokens served from the provider's prompt cache.
+    ///
+    /// This is read from the nested `*_tokens_details.cached_tokens` fields
+    /// used by OpenAI, along with the common top-level cache aliases.
+    pub fn cached_input_tokens(&self) -> Option<u64> {
+        self.cached_input_tokens
+    }
+
+    /// Returns true once a provider usage object was observed, even when the
+    /// object omits one or more token counters (or reports zero).
+    pub fn usage_seen(&self) -> bool {
+        self.usage_seen
+    }
+
     pub fn upstream_response_model(&self) -> Option<&str> {
         self.upstream_response_model.as_deref()
     }
@@ -746,7 +772,11 @@ impl ResponseMetrics {
         if name.is_empty() {
             return;
         }
-        if self.sse_events.last().is_some_and(|(last, _)| last == &name) {
+        if self
+            .sse_events
+            .last()
+            .is_some_and(|(last, _)| last == &name)
+        {
             if let Some((_, count)) = self.sse_events.last_mut() {
                 *count = count.saturating_add(1);
             }
@@ -766,8 +796,14 @@ impl ResponseMetrics {
         }
         let terminal = matches!(
             json.get("type").and_then(serde_json::Value::as_str),
-            Some("response.completed" | "response.done" | "response.failed"
-                | "response.incomplete" | "response.cancelled" | "response.canceled")
+            Some(
+                "response.completed"
+                    | "response.done"
+                    | "response.failed"
+                    | "response.incomplete"
+                    | "response.cancelled"
+                    | "response.canceled"
+            )
         );
         // Read only provider metadata, never model-shaped fields in generated
         // text, output items or tool arguments. Keep the first declaration;
@@ -783,7 +819,9 @@ impl ResponseMetrics {
                 self.upstream_response_model = Some(model);
             }
         }
-        if self.is_sse && json.get("type").and_then(serde_json::Value::as_str) == Some("response.completed") {
+        if self.is_sse
+            && json.get("type").and_then(serde_json::Value::as_str) == Some("response.completed")
+        {
             self.completed = true;
         }
         self.error_kind = match json.get("type").and_then(serde_json::Value::as_str) {
@@ -794,8 +832,31 @@ impl ResponseMetrics {
         if self.is_sse && self.first_token_ms.is_none() && has_visible_output(&json) {
             self.first_token_ms = Some(elapsed_ms);
         }
-        if let Some(tokens) = find_output_tokens(&json) {
+        // Usage metadata is emitted in either the top-level `usage` object
+        // (Chat Completions and non-streaming Responses) or nested under
+        // `response.usage` (Responses SSE terminal events). Parse both when
+        // present so a provider can split counters across the two envelopes.
+        if let Some(usage) = json.get("usage").filter(|usage| usage.is_object()) {
+            self.observe_usage(usage);
+        }
+        if let Some(usage) = json
+            .pointer("/response/usage")
+            .filter(|usage| usage.is_object())
+        {
+            self.observe_usage(usage);
+        }
+    }
+
+    fn observe_usage(&mut self, usage: &serde_json::Value) {
+        self.usage_seen = true;
+        if let Some(tokens) = find_usage_tokens(usage, &["input_tokens", "prompt_tokens"]) {
+            self.input_tokens = Some(tokens);
+        }
+        if let Some(tokens) = find_usage_tokens(usage, &["output_tokens", "completion_tokens"]) {
             self.output_tokens = Some(tokens);
+        }
+        if let Some(tokens) = find_cached_input_tokens(usage) {
+            self.cached_input_tokens = Some(tokens);
         }
     }
 }
@@ -864,16 +925,48 @@ fn has_visible_output(value: &serde_json::Value) -> bool {
     false
 }
 
-fn find_output_tokens(value: &serde_json::Value) -> Option<u64> {
-    // Only trust provider usage metadata, never token-shaped fields in output/tool content.
-    let usage = value
-        .pointer("/response/usage")
-        .filter(|usage| usage.is_object())
-        .or_else(|| value.get("usage"))?;
-    usage
-        .get("output_tokens")
-        .or_else(|| usage.get("completion_tokens"))?
-        .as_u64()
+fn find_usage_tokens(usage: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| usage.get(*key).and_then(serde_json::Value::as_u64))
+}
+
+fn find_cached_input_tokens(usage: &serde_json::Value) -> Option<u64> {
+    // OpenAI uses `input_tokens_details` for Responses and
+    // `prompt_tokens_details` for Chat Completions. A few compatible
+    // providers use the singular spelling, so accept it as well. Keep the
+    // lookup constrained to the usage object to avoid charging token-shaped
+    // fields in generated output/tool arguments.
+    for details_key in [
+        "input_tokens_details",
+        "prompt_tokens_details",
+        "input_token_details",
+        "prompt_token_details",
+    ] {
+        let Some(details) = usage.get(details_key).filter(|value| value.is_object()) else {
+            continue;
+        };
+        if let Some(tokens) = find_usage_tokens(
+            details,
+            &[
+                "cached_tokens",
+                "cached_input_tokens",
+                "cache_read_input_tokens",
+                "cache_read_tokens",
+            ],
+        ) {
+            return Some(tokens);
+        }
+    }
+
+    find_usage_tokens(
+        usage,
+        &[
+            "cached_tokens",
+            "cached_input_tokens",
+            "cache_read_input_tokens",
+            "cache_read_tokens",
+        ],
+    )
 }
 
 pub fn push(logs: &mut VecDeque<LogEntry>, entry: LogEntry) {
@@ -918,11 +1011,26 @@ mod tests {
             assert_eq!(metrics.upstream_response_model(), None);
         }
         for (event, expected) in [
-            (r#"{"type":"response.created","response":{"model":"gpt-5.6-sol"}}"#, "gpt-5.6-sol"),
-            (r#"{"type":"response.in_progress","response":{"model":"ignored"}}"#, "gpt-5.6-sol"),
-            (r#"{"type":"response.completed","response":{"model":"gpt-6-sol"},"model":"ignored"}"#, "gpt-6-sol"),
-            (r#"{"type":"response.created","response":{"model":"ignored"}}"#, "gpt-6-sol"),
-            (r#"{"type":"response.completed","response":{"model":" "}}"#, "gpt-6-sol"),
+            (
+                r#"{"type":"response.created","response":{"model":"gpt-5.6-sol"}}"#,
+                "gpt-5.6-sol",
+            ),
+            (
+                r#"{"type":"response.in_progress","response":{"model":"ignored"}}"#,
+                "gpt-5.6-sol",
+            ),
+            (
+                r#"{"type":"response.completed","response":{"model":"gpt-6-sol"},"model":"ignored"}"#,
+                "gpt-6-sol",
+            ),
+            (
+                r#"{"type":"response.created","response":{"model":"ignored"}}"#,
+                "gpt-6-sol",
+            ),
+            (
+                r#"{"type":"response.completed","response":{"model":" "}}"#,
+                "gpt-6-sol",
+            ),
         ] {
             for byte in format!("data: {event}\r\n\r\n").bytes() {
                 metrics.observe(&[byte], 20, true);
@@ -934,9 +1042,18 @@ mod tests {
     #[test]
     fn response_model_reads_json_and_chat_chunks_with_bounded_safe_names() {
         for (body, expected) in [
-            (r#"{"object":"response","model":" gpt-6-sol\n "}"#.to_owned(), "gpt-6-sol".to_owned()),
-            (r#"{"response":{"model":""},"model":"gpt-6-astra"}"#.to_owned(), "gpt-6-astra".to_owned()),
-            (serde_json::json!({"model": "模".repeat(200)}).to_string(), "模".repeat(80)),
+            (
+                r#"{"object":"response","model":" gpt-6-sol\n "}"#.to_owned(),
+                "gpt-6-sol".to_owned(),
+            ),
+            (
+                r#"{"response":{"model":""},"model":"gpt-6-astra"}"#.to_owned(),
+                "gpt-6-astra".to_owned(),
+            ),
+            (
+                serde_json::json!({"model": "模".repeat(200)}).to_string(),
+                "模".repeat(80),
+            ),
         ] {
             let mut metrics = ResponseMetrics::default();
             metrics.observe(body.as_bytes(), 10, false);
@@ -944,7 +1061,11 @@ mod tests {
             assert_eq!(metrics.upstream_response_model(), Some(expected.as_str()));
         }
         let mut metrics = ResponseMetrics::default();
-        metrics.observe(b"data: {\"object\":\"chat.completion.chunk\",\"model\":\"gpt-6-sol\"}\n\n", 10, true);
+        metrics.observe(
+            b"data: {\"object\":\"chat.completion.chunk\",\"model\":\"gpt-6-sol\"}\n\n",
+            10,
+            true,
+        );
         assert_eq!(metrics.upstream_response_model(), Some("gpt-6-sol"));
         let mut metrics = ResponseMetrics::default();
         metrics.observe(b"{\"data\":[{\"id\":\"model-list-entry\"}]}", 10, false);
@@ -976,16 +1097,34 @@ mod tests {
             }
             match encoding {
                 "zstd" => encode!(zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap()),
-                "gzip" => encode!(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast())),
-                _ => encode!(flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast())),
+                "gzip" => encode!(flate2::write::GzEncoder::new(
+                    Vec::new(),
+                    flate2::Compression::fast()
+                )),
+                _ => encode!(flate2::write::ZlibEncoder::new(
+                    Vec::new(),
+                    flate2::Compression::fast()
+                )),
             }
             let mut metrics = ResponseBodyMetrics::new(encoding);
             for (index, chunk) in chunks.iter().enumerate() {
                 for byte in chunk {
                     metrics.observe(&[*byte], (index as u128 + 1) * 50, true);
                 }
-                assert_eq!(metrics.first_token_ms(), (index > 0).then_some(100), "{encoding}");
-                assert_eq!(metrics.upstream_response_model(), Some(if index == 2 { "gpt-6-sol" } else { "gpt-5.6-sol" }), "{encoding}");
+                assert_eq!(
+                    metrics.first_token_ms(),
+                    (index > 0).then_some(100),
+                    "{encoding}"
+                );
+                assert_eq!(
+                    metrics.upstream_response_model(),
+                    Some(if index == 2 {
+                        "gpt-6-sol"
+                    } else {
+                        "gpt-5.6-sol"
+                    }),
+                    "{encoding}"
+                );
             }
             metrics.finish(200);
             assert_eq!(metrics.output_tokens(), Some(120), "{encoding}");
@@ -997,7 +1136,11 @@ mod tests {
     fn unsupported_or_invalid_compression_does_not_invent_metrics() {
         for encoding in ["br", "gzip, zstd", "zstd", "gzip", "deflate"] {
             let mut metrics = ResponseBodyMetrics::new(encoding);
-            metrics.observe(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n", 25, true);
+            metrics.observe(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+                25,
+                true,
+            );
             metrics.finish(50);
             assert!(metrics.disabled, "{encoding}");
             assert_eq!(metrics.first_token_ms(), None);
@@ -1078,6 +1221,7 @@ mod tests {
         let mut metrics = ResponseMetrics::default();
         metrics.observe(b"data: {\"output\":{\"output_tokens\":999}}\n\n", 30, true);
         assert_eq!(metrics.output_tokens(), None);
+        assert!(!metrics.usage_seen());
     }
 
     #[test]
@@ -1097,6 +1241,65 @@ mod tests {
         metrics.finish(20);
         assert_eq!(metrics.output_tokens(), Some(42));
         assert_eq!(metrics.first_token_ms(), None);
+    }
+
+    #[test]
+    fn metrics_parse_responses_and_chat_completion_usage_shapes() {
+        let mut responses = ResponseMetrics::default();
+        responses.observe(
+            br#"data: {"type":"response.completed","response":{"usage":{"input_tokens":120,"output_tokens":34,"input_tokens_details":{"cached_tokens":17}}}}
+
+"#,
+            50,
+            true,
+        );
+        assert!(responses.usage_seen());
+        assert_eq!(responses.input_tokens(), Some(120));
+        assert_eq!(responses.output_tokens(), Some(34));
+        assert_eq!(responses.cached_input_tokens(), Some(17));
+
+        let mut chat = ResponseMetrics::default();
+        chat.observe(
+            br#"{"usage":{"prompt_tokens":80,"completion_tokens":13,"prompt_tokens_details":{"cached_tokens":9}}}"#,
+            10,
+            false,
+        );
+        chat.finish(20);
+        assert!(chat.usage_seen());
+        assert_eq!(chat.input_tokens(), Some(80));
+        assert_eq!(chat.output_tokens(), Some(13));
+        assert_eq!(chat.cached_input_tokens(), Some(9));
+    }
+
+    #[test]
+    fn metrics_usage_seen_distinguishes_empty_usage_from_absent_usage() {
+        let mut empty = ResponseMetrics::default();
+        empty.observe(br#"{"usage":{}}"#, 10, false);
+        empty.finish(20);
+        assert!(empty.usage_seen());
+        assert_eq!(empty.input_tokens(), None);
+        assert_eq!(empty.output_tokens(), None);
+        assert_eq!(empty.cached_input_tokens(), None);
+
+        let mut absent = ResponseMetrics::default();
+        absent.observe(br#"{"response":{"output":[{"text":"usage"}]}}"#, 10, false);
+        absent.finish(20);
+        assert!(!absent.usage_seen());
+    }
+
+    #[test]
+    fn metrics_parse_top_level_cached_input_aliases_without_output_content() {
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(
+            br#"{"usage":{"input_tokens":3,"output_tokens":4,"cached_input_tokens":2,"output":{"cached_tokens":999}}}"#,
+            10,
+            false,
+        );
+        metrics.finish(20);
+        assert!(metrics.usage_seen());
+        assert_eq!(metrics.input_tokens(), Some(3));
+        assert_eq!(metrics.output_tokens(), Some(4));
+        assert_eq!(metrics.cached_input_tokens(), Some(2));
     }
 
     #[test]
@@ -1276,10 +1479,7 @@ mod tests {
         cancelled.observe_chunk(1);
         std::thread::sleep(Duration::from_millis(20));
         cancelled.cancel();
-        assert!(cancelled
-            .snapshot()
-            .max_idle_ms
-            .is_some_and(|ms| ms >= 15));
+        assert!(cancelled.snapshot().max_idle_ms.is_some_and(|ms| ms >= 15));
     }
 
     #[test]
@@ -1308,7 +1508,9 @@ mod tests {
     async fn observed_stream_records_success_error_and_downstream_cancellation() {
         let completed = Arc::new(StreamLifecycle::new(Instant::now(), 0));
         let chunks = stream::iter(vec![Ok::<_, &'static str>(vec![1_u8, 2]), Ok(vec![3])]);
-        let output: Vec<_> = ObservedStream::new(chunks, completed.clone()).collect().await;
+        let output: Vec<_> = ObservedStream::new(chunks, completed.clone())
+            .collect()
+            .await;
         assert_eq!(output.len(), 2);
         let snapshot = completed.snapshot();
         assert_eq!(snapshot.state, "completed");
@@ -1322,7 +1524,10 @@ mod tests {
         assert_eq!(failed.snapshot().state, "error");
 
         let cancelled = Arc::new(StreamLifecycle::new(Instant::now(), 0));
-        let stream = ObservedStream::new(stream::pending::<Result<Vec<u8>, &'static str>>(), cancelled.clone());
+        let stream = ObservedStream::new(
+            stream::pending::<Result<Vec<u8>, &'static str>>(),
+            cancelled.clone(),
+        );
         drop(stream);
         assert_eq!(cancelled.snapshot().state, "cancelled");
     }

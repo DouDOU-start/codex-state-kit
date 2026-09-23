@@ -222,3 +222,79 @@ export interface Banner {
   kind: "ok" | "error";
   text: string;
 }
+
+/**
+ * A persisted, per ChatGPT account usage total.  Costs are represented as
+ * integer nano-dollars by the Rust billing store so the renderer never has to
+ * accumulate floating point values.
+ */
+export interface BillingUsageTotals {
+  requestCount: number;
+  measuredRequestCount: number;
+  unknownUsageCount: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  costNanos: number | null;
+}
+
+export interface BillingAccountSummary {
+  provider: string;
+  accountId: string;
+  email?: string | null;
+  firstSeenAt?: string | null;
+  lastSeenAt?: string | null;
+  total: BillingUsageTotals;
+  business: BillingUsageTotals;
+  internal: BillingUsageTotals;
+}
+
+export interface BillingSummary {
+  generatedAt: string;
+  from?: string | null;
+  to?: string | null;
+  accounts: BillingAccountSummary[];
+}
+
+export type BillingRecordState = "pending" | "measured" | "missing_usage" | "interrupted" | string;
+export type BillingRecordSource = "business" | "token_fetch" | "reverify" | string;
+
+export interface BillingRecord {
+  requestId: string;
+  provider?: string;
+  accountId: string;
+  email?: string | null;
+  source: BillingRecordSource;
+  startedAt: string;
+  finishedAt?: string | null;
+  state: BillingRecordState;
+  httpStatus?: number | null;
+  requestedModel?: string | null;
+  sentModel?: string | null;
+  responseModel?: string | null;
+  inputTokens?: number | null;
+  cachedInputTokens?: number | null;
+  outputTokens?: number | null;
+  usageSource?: string | null;
+  pricingRuleId?: number | null;
+  costNanos?: number | null;
+  currency?: string | null;
+  errorKind?: string | null;
+}
+
+export interface BillingQuery {
+  accountId?: string | null;
+  from?: string | null;
+  to?: string | null;
+  source?: BillingRecordSource | null;
+  model?: string | null;
+  limit?: number;
+  offset?: number;
+}
+
+export interface BillingRecordsPage {
+  records: BillingRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+}

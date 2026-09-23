@@ -34,7 +34,6 @@ const MODEL_OVERLAY_KEYS: &[&str] = &[
 const PRESERVED_MODEL_KEYS: &[&str] = &["service_tier"];
 const CUSTOM_MODEL_CATALOGS: &[&str] = &["cc-switch-model-catalog.json"];
 const KIT_MODEL_CATALOG: &str = "codex-state-kit-model-catalog.json";
-const OFFICIAL_MODELS_CACHE: &str = "models_cache.json";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KeySnapshot {
@@ -114,20 +113,33 @@ pub struct ManagedRoutes {
 
 impl ManagedRoutes {
     pub fn new(backup_file: PathBuf) -> Self {
-        Self { backup_file, current: None, closed: false }
+        Self {
+            backup_file,
+            current: None,
+            closed: false,
+        }
     }
 
     pub fn sync(&mut self, settings: &Settings, proxy_ready: bool) -> Result<()> {
-        if self.closed { return Ok(()); }
+        if self.closed {
+            return Ok(());
+        }
         let home = Path::new(&settings.codex_home);
         let ready = proxy_ready && has_chatgpt_login(home);
-        if ready && self.current.as_ref().is_some_and(|old| old.codex_home == settings.codex_home)
-            && is_attached(home, &format!("http://{}", settings.proxy_listen)) {
+        if ready
+            && self
+                .current
+                .as_ref()
+                .is_some_and(|old| old.codex_home == settings.codex_home)
+            && is_attached(home, &format!("http://{}", settings.proxy_listen))
+        {
             return Ok(());
         }
         let previous = self.current.clone();
         self.restore_current()?;
-        if !ready { return Ok(()); }
+        if !ready {
+            return Ok(());
+        }
         // Record ownership before writing so even a failed write can be restored on exit.
         self.current = Some(settings.clone());
         if let Err(err) = attach_codex_config_at(settings, &self.backup_file) {
@@ -161,7 +173,9 @@ impl ManagedRoutes {
 }
 
 pub fn validate_codex_home(home: &Path) -> Result<()> {
-    if !home.is_dir() { bail!("Codex 工作目录不存在，请选择有效目录。"); }
+    if !home.is_dir() {
+        bail!("Codex 工作目录不存在，请选择有效目录。");
+    }
     let config = home.join("config.toml");
     if config.exists() {
         parse_doc(&std::fs::read_to_string(config)?)?;
@@ -289,14 +303,12 @@ fn attach_at(home: &Path, backup_file: &Path, next: &str) -> Result<String> {
         ensure_sidecar(home, backup_file, &raw, false)?;
         refresh_model_snapshot(backup_file, &raw)?;
         apply_model_surface(home, backup_file)?;
-        if needs_overlay_migration || !kit_catalog_pointer_ok(home, &raw)? {
+        if needs_overlay_migration {
             let mut patched = apply_fwd_route(&raw, &next)?;
-            if needs_overlay_migration {
-                patched =
-                    recover_preserved_model_keys(&patched, load_backup_at(backup_file).as_ref())?;
-            }
-            patched = with_kit_catalog_pointer(home, &patched)?;
+            patched = recover_preserved_model_keys(&patched, load_backup_at(backup_file).as_ref())?;
             atomic_write_text(&config_path, &patched)?;
+        } else if kit_catalog_pointer_present(&raw)? {
+            atomic_write_text(&config_path, &clear_kit_catalog_pointer(&raw)?)?;
         }
         overlay_kit_onto_official(home)?;
         return Ok("already attached".into());
@@ -312,7 +324,6 @@ fn attach_at(home: &Path, backup_file: &Path, next: &str) -> Result<String> {
     if overlay_version < MODEL_OVERLAY_VERSION {
         patched = recover_preserved_model_keys(&patched, load_backup_at(backup_file).as_ref())?;
     }
-    patched = with_kit_catalog_pointer(home, &patched)?;
     atomic_write_text(&config_path, &patched)?;
     overlay_kit_onto_official(home)?;
     Ok(format!("patched Codex openai_base_url -> {next}"))
@@ -554,29 +565,30 @@ fn preserved_model_key_recovery_needed(raw: &str, backup: Option<&Backup>) -> Re
     let doc = parse_doc(raw)?;
     Ok(PRESERVED_MODEL_KEYS.iter().any(|key| {
         doc.get(key).is_none()
-            && backup.previous_model_keys.get(*key).is_some_and(|snapshot| {
-                snapshot.present
-                    && snapshot
-                        .value
-                        .as_deref()
-                        .is_some_and(|value| !value.trim().is_empty())
-            })
+            && backup
+                .previous_model_keys
+                .get(*key)
+                .is_some_and(|snapshot| {
+                    snapshot.present
+                        && snapshot
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty())
+                })
     }))
 }
 
-fn kit_catalog_pointer_ok(home: &Path, raw: &str) -> Result<bool> {
-    if !home.join(KIT_MODEL_CATALOG).exists() {
-        return Ok(true);
-    }
+fn kit_catalog_pointer_present(raw: &str) -> Result<bool> {
     Ok(config_string(&parse_doc(raw)?, "model_catalog_json").as_deref() == Some(KIT_MODEL_CATALOG))
 }
 
-fn with_kit_catalog_pointer(home: &Path, config_text: &str) -> Result<String> {
-    if !home.join(KIT_MODEL_CATALOG).exists() {
-        return Ok(config_text.to_string());
-    }
+/// Drop a catalog pointer left by an older attach. A configured `model_catalog_json`
+/// is authoritative in Codex and disables background `/models` refresh.
+fn clear_kit_catalog_pointer(config_text: &str) -> Result<String> {
     let mut doc = parse_doc(config_text)?;
-    doc["model_catalog_json"] = toml_edit::value(KIT_MODEL_CATALOG);
+    if config_string(&doc, "model_catalog_json").as_deref() == Some(KIT_MODEL_CATALOG) {
+        doc.as_table_mut().remove("model_catalog_json");
+    }
     Ok(doc.to_string())
 }
 
@@ -585,7 +597,7 @@ fn apply_model_surface(home: &Path, backup_file: &Path) -> Result<()> {
         return Ok(());
     };
     park_custom_catalogs(home, &mut backup)?;
-    write_official_kit_catalog(home)?;
+    remove_kit_catalog(home);
     overlay_last_selected_model(home, &mut backup)?;
     save_backup_at(backup_file, &backup)
 }
@@ -593,11 +605,15 @@ fn apply_model_surface(home: &Path, backup_file: &Path) -> Result<()> {
 fn restore_model_surface(home: &Path, backup: Option<&Backup>) -> Result<()> {
     restore_custom_catalogs(home, backup)?;
     restore_last_selected_model(home, backup)?;
-    let kit_catalog = home.join(KIT_MODEL_CATALOG);
-    if kit_catalog.exists() {
-        let _ = std::fs::remove_file(&kit_catalog);
-    }
+    remove_kit_catalog(home);
     Ok(())
+}
+
+fn remove_kit_catalog(home: &Path) {
+    let path = home.join(KIT_MODEL_CATALOG);
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn park_custom_catalogs(home: &Path, backup: &mut Backup) -> Result<()> {
@@ -619,8 +635,7 @@ fn park_custom_catalogs(home: &Path, backup: &mut Backup) -> Result<()> {
         let src = home.join(&name);
         let bak = home.join(format!("{name}.codex-state-kit.bak"));
         if src.exists() && !bak.exists() {
-            std::fs::rename(&src, &bak)
-                .with_context(|| format!("park {}", src.display()))?;
+            std::fs::rename(&src, &bak).with_context(|| format!("park {}", src.display()))?;
             if !backup.parked_catalogs.iter().any(|item| item == &name) {
                 backup.parked_catalogs.push(name);
             }
@@ -647,8 +662,7 @@ fn restore_custom_catalogs(home: &Path, backup: Option<&Backup>) -> Result<()> {
             if src.exists() {
                 let _ = std::fs::remove_file(&src);
             }
-            std::fs::rename(&bak, &src)
-                .with_context(|| format!("restore {}", src.display()))?;
+            std::fs::rename(&bak, &src).with_context(|| format!("restore {}", src.display()))?;
         }
     }
     Ok(())
@@ -660,83 +674,6 @@ fn safe_catalog_name(value: &str) -> Option<&str> {
         return None;
     }
     Some(name)
-}
-
-fn write_official_kit_catalog(home: &Path) -> Result<bool> {
-    let cache_path = home.join(OFFICIAL_MODELS_CACHE);
-    let raw = match std::fs::read_to_string(&cache_path) {
-        Ok(raw) => raw,
-        Err(_) => return Ok(false),
-    };
-    let value: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(value) => value,
-        Err(_) => return Ok(false),
-    };
-    let Some(models) = value.get("models").and_then(|item| item.as_array()) else {
-        return Ok(false);
-    };
-    let mapped: Vec<serde_json::Value> = models.iter().filter_map(map_official_catalog_model).collect();
-    if mapped.is_empty() {
-        return Ok(false);
-    }
-    let catalog = serde_json::json!({ "models": mapped });
-    atomic_write_text(
-        &home.join(KIT_MODEL_CATALOG),
-        &serde_json::to_string_pretty(&catalog)?,
-    )?;
-    Ok(true)
-}
-
-fn map_official_catalog_model(model: &serde_json::Value) -> Option<serde_json::Value> {
-    let obj = model.as_object()?;
-    let slug = obj.get("slug")?.as_str()?.trim();
-    if slug.is_empty() {
-        return None;
-    }
-    let mut out = serde_json::Map::new();
-    for key in [
-        "slug",
-        "display_name",
-        "description",
-        "default_reasoning_level",
-        "supported_reasoning_levels",
-        "additional_speed_tiers",
-        "service_tiers",
-        "visibility",
-        "priority",
-        "shell_type",
-        "supported_in_api",
-        "default_reasoning_summary",
-        "support_verbosity",
-        "default_verbosity",
-        "context_window",
-        "max_context_window",
-        "effective_context_window_percent",
-        "input_modalities",
-        "supports_search_tool",
-        "supports_reasoning_summaries",
-        "supports_image_detail_original",
-        "supports_parallel_tool_calls",
-        "truncation_policy",
-        "upgrade",
-        "availability_nux",
-        "experimental_supported_tools",
-        "base_instructions",
-    ] {
-        if let Some(value) = obj.get(key) {
-            out.insert(key.to_string(), value.clone());
-        }
-    }
-    if !out.contains_key("visibility") {
-        out.insert("visibility".into(), serde_json::json!("list"));
-    }
-    if !out.contains_key("base_instructions") {
-        out.insert(
-            "base_instructions".into(),
-            serde_json::json!("You are Codex, a coding agent."),
-        );
-    }
-    Some(serde_json::Value::Object(out))
 }
 
 fn overlay_last_selected_model(home: &Path, backup: &mut Backup) -> Result<()> {
@@ -1148,7 +1085,9 @@ mod tests {
         routes.sync(&settings, true).unwrap();
         assert!(!is_attached(&home, "http://127.0.0.1:8787"));
         assert!(!backup.exists());
-        assert!(fs::read_to_string(home.join("config.toml")).unwrap().contains("test-model"));
+        assert!(fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .contains("test-model"));
         assert!(home.join("auth.json").exists());
     }
 
@@ -1157,16 +1096,22 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first");
         let second = root.path().join("second");
-        for home in [&first, &second] { write_chatgpt_auth(home); }
+        for home in [&first, &second] {
+            write_chatgpt_auth(home);
+        }
         write_config(&first, "openai_base_url = \"https://first.example/v1\"\n");
         write_config(&second, "openai_base_url = \"https://second.example/v1\"\n");
         let mut routes = ManagedRoutes::new(root.path().join("backup.json"));
         routes.sync(&settings_for(&first), true).unwrap();
         routes.sync(&settings_for(&second), true).unwrap();
-        assert!(fs::read_to_string(first.join("config.toml")).unwrap().contains("https://first.example/v1"));
+        assert!(fs::read_to_string(first.join("config.toml"))
+            .unwrap()
+            .contains("https://first.example/v1"));
         assert!(is_attached(&second, "http://127.0.0.1:8787"));
         routes.shutdown().unwrap();
-        assert!(fs::read_to_string(second.join("config.toml")).unwrap().contains("https://second.example/v1"));
+        assert!(fs::read_to_string(second.join("config.toml"))
+            .unwrap()
+            .contains("https://second.example/v1"));
     }
 
     #[test]
@@ -1174,16 +1119,23 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first");
         let second = root.path().join("second");
-        for home in [&first, &second] { write_chatgpt_auth(home); }
+        for home in [&first, &second] {
+            write_chatgpt_auth(home);
+        }
         write_config(&first, "openai_base_url = \"https://original.example\"\n");
         write_config(&second, "invalid = [");
         let mut routes = ManagedRoutes::new(root.path().join("backup.json"));
         routes.sync(&settings_for(&first), true).unwrap();
         assert!(routes.sync(&settings_for(&second), true).is_err());
         assert!(is_attached(&first, "http://127.0.0.1:8787"));
-        assert_eq!(fs::read_to_string(second.join("config.toml")).unwrap(), "invalid = [");
+        assert_eq!(
+            fs::read_to_string(second.join("config.toml")).unwrap(),
+            "invalid = ["
+        );
         routes.shutdown().unwrap();
-        assert!(fs::read_to_string(first.join("config.toml")).unwrap().contains("https://original.example"));
+        assert!(fs::read_to_string(first.join("config.toml"))
+            .unwrap()
+            .contains("https://original.example"));
     }
 
     #[test]
@@ -1568,7 +1520,7 @@ base_url = "http://127.0.0.1:8787"
     }
 
     #[test]
-    fn attach_maps_official_catalog_with_ultra_and_fast_then_restores() {
+    fn attach_parks_custom_catalog_and_leaves_remote_models_to_codex() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("codex");
         let backup = root.path().join("backup.json");
@@ -1586,9 +1538,7 @@ model_catalog_json = "cc-switch-model-catalog.json"
             r#"{"models":[{"slug":"grok-4.6","supported_reasoning_levels":[{"effort":"xhigh"}],"additional_speed_tiers":[],"service_tiers":[]}]}"#,
         )
         .unwrap();
-        fs::write(
-            home.join("models_cache.json"),
-            r#"{
+        let cache = r#"{
   "models": [
     {
       "slug": "gpt-6-astra",
@@ -1603,9 +1553,8 @@ model_catalog_json = "cc-switch-model-catalog.json"
       "visibility": "list"
     }
   ]
-}"#,
-        )
-        .unwrap();
+}"#;
+        fs::write(home.join("models_cache.json"), cache).unwrap();
         fs::write(
             home.join(".codex-global-state.json"),
             r#"{"electron-persisted-atom-state":{"chatgpt-last-selected-model-v1":{"slug":"grok-4.6","thinkingEffort":"xhigh","versionId":null}}}"#,
@@ -1617,30 +1566,40 @@ model_catalog_json = "cc-switch-model-catalog.json"
         assert!(!patched.contains("grok-4.6"));
         assert!(!patched.contains("model_reasoning_effort"));
         assert!(patched.contains("service_tier = \"priority\""));
-        assert!(patched.contains(&format!("model_catalog_json = \"{KIT_MODEL_CATALOG}\"")));
+        assert!(!patched.contains("model_catalog_json"));
+        assert!(!home.join(KIT_MODEL_CATALOG).exists());
+        assert_eq!(
+            fs::read_to_string(home.join("models_cache.json")).unwrap(),
+            cache
+        );
         assert!(!home.join("cc-switch-model-catalog.json").exists());
         assert!(home
             .join("cc-switch-model-catalog.json.codex-state-kit.bak")
             .exists());
-        let catalog: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(home.join(KIT_MODEL_CATALOG)).unwrap()).unwrap();
-        let astra = catalog["models"][0].clone();
-        assert_eq!(astra["slug"], "gpt-6-astra");
-        let efforts: Vec<&str> = astra["supported_reasoning_levels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|item| item["effort"].as_str())
-            .collect();
-        assert!(efforts.contains(&"ultra"));
-        assert_eq!(astra["additional_speed_tiers"][0], "fast");
-        assert_eq!(astra["service_tiers"][0]["name"], "Fast");
-        let state: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(home.join(".codex-global-state.json")).unwrap())
-                .unwrap();
+        let state: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(home.join(".codex-global-state.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             state["electron-persisted-atom-state"][LAST_SELECTED_ATOM]["slug"],
             OFFICIAL_DEFAULT_MODEL
+        );
+
+        fs::write(
+            home.join(KIT_MODEL_CATALOG),
+            r#"{"models":[{"slug":"stale"}]}"#,
+        )
+        .unwrap();
+        let mut frozen = parse_doc(&patched).unwrap();
+        frozen["model_catalog_json"] = toml_edit::value(KIT_MODEL_CATALOG);
+        fs::write(home.join("config.toml"), frozen.to_string()).unwrap();
+        attach_at(&home, &backup, "http://127.0.0.1:8787").unwrap();
+        let cleared = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(!cleared.contains("model_catalog_json"));
+        assert!(!home.join(KIT_MODEL_CATALOG).exists());
+        assert_eq!(
+            fs::read_to_string(home.join("models_cache.json")).unwrap(),
+            cache
         );
 
         restore_at(&backup, &home).unwrap();
@@ -1651,9 +1610,10 @@ model_catalog_json = "cc-switch-model-catalog.json"
         assert!(after.contains("model_catalog_json = \"cc-switch-model-catalog.json\""));
         assert!(home.join("cc-switch-model-catalog.json").exists());
         assert!(!home.join(KIT_MODEL_CATALOG).exists());
-        let restored_state: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(home.join(".codex-global-state.json")).unwrap())
-                .unwrap();
+        let restored_state: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(home.join(".codex-global-state.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             restored_state["electron-persisted-atom-state"][LAST_SELECTED_ATOM]["slug"],
             "grok-4.6"
@@ -1717,14 +1677,20 @@ model_provider = "cc-switch"
             let mut changed = parse_doc(&raw).unwrap();
             match replacement {
                 Some(value) => changed["service_tier"] = toml_edit::value(value),
-                None => { changed.as_table_mut().remove("service_tier"); }
+                None => {
+                    changed.as_table_mut().remove("service_tier");
+                }
             }
             fs::write(home.join("config.toml"), changed.to_string()).unwrap();
             // Reattaching must also preserve an explicit removal of Fast mode.
             attach_at(&home, &backup, "http://127.0.0.1:8787").unwrap();
             restore_at(&backup, &home).unwrap();
-            let restored = parse_doc(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
-            assert_eq!(restored.get("service_tier").and_then(Item::as_str), replacement);
+            let restored =
+                parse_doc(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+            assert_eq!(
+                restored.get("service_tier").and_then(Item::as_str),
+                replacement
+            );
         }
     }
 }

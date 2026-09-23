@@ -1,7 +1,19 @@
 use super::*;
-use axum::Json;
 use base64::Engine;
 use serde_json::Value;
+
+fn decode_json_body(headers: &HeaderMap, body: &[u8]) -> Value {
+    let plain = match headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(encoding) if encoding.eq_ignore_ascii_case("zstd") => {
+            zstd::decode_all(body).unwrap_or_else(|_| body.to_vec())
+        }
+        _ => body.to_vec(),
+    };
+    serde_json::from_slice(&plain).unwrap_or(Value::Null)
+}
 
 fn isolated_child(name: &str) -> bool {
     if std::env::var_os("CSK_REUSE_TEST_CHILD").is_some() {
@@ -106,11 +118,12 @@ async fn one_shared_probe_serves_all_models_until_prefetch() {
         let fresh = ticket(0);
         let reply_token = fresh.clone();
         let router =
-            axum::Router::new().fallback(move |headers: HeaderMap, Json(body): Json<Value>| {
+            axum::Router::new().fallback(move |headers: HeaderMap, raw: axum::body::Bytes| {
                 let probes = probes_seen.clone();
                 let sent = sent.clone();
                 let token = reply_token.clone();
                 async move {
+                    let body = decode_json_body(&headers, &raw);
                     if body["test_business"] == true {
                         sent.send((headers, body)).unwrap();
                         Response::new(Body::from("ok"))
@@ -212,10 +225,11 @@ async fn manual_refresh_bypasses_pause_and_cooldown() {
         let fresh = ticket(0);
         let reply_token = fresh.clone();
         let router =
-            axum::Router::new().fallback(move |_headers: HeaderMap, Json(body): Json<Value>| {
+            axum::Router::new().fallback(move |headers: HeaderMap, raw: axum::body::Bytes| {
                 let probes = probes_seen.clone();
                 let token = reply_token.clone();
                 async move {
+                    let body = decode_json_body(&headers, &raw);
                     if body["test_business"] == true {
                         Response::new(Body::from("ok"))
                     } else {
@@ -292,11 +306,12 @@ async fn pinned_donor_is_the_only_model_that_fetches_shared_292() {
         let fresh = ticket(0);
         let reply_token = fresh.clone();
         let router =
-            axum::Router::new().fallback(move |_headers: HeaderMap, Json(body): Json<Value>| {
+            axum::Router::new().fallback(move |headers: HeaderMap, raw: axum::body::Bytes| {
                 let probed = probed_seen.clone();
                 let sent = sent.clone();
                 let token = reply_token.clone();
                 async move {
+                    let body = decode_json_body(&headers, &raw);
                     if body["test_business"] == true {
                         sent.send(body).unwrap();
                         Response::new(Body::from("ok"))
@@ -338,7 +353,9 @@ async fn pinned_donor_is_the_only_model_that_fetches_shared_292() {
         );
         let response = proxy_http(app.clone(), request("a")).await;
         assert_eq!(response.status(), StatusCode::OK);
-        axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body = received.recv().await.unwrap();
         assert_eq!(body["model"], "a");
         server.abort();
@@ -569,7 +586,9 @@ async fn shared_ticket_unblocks_waiter_and_policy_change_cancels_wait() {
 
 #[tokio::test]
 async fn miss_streak_doubles_probe_concurrency_then_resets() {
-    if !isolated_child("proxy::token_reuse_tests::miss_streak_doubles_probe_concurrency_then_resets") {
+    if !isolated_child(
+        "proxy::token_reuse_tests::miss_streak_doubles_probe_concurrency_then_resets",
+    ) {
         return;
     }
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -580,16 +599,13 @@ async fn miss_streak_doubles_probe_concurrency_then_resets() {
         let fresh = ticket(0);
         let reply_token = fresh.clone();
         let router =
-            axum::Router::new().fallback(move |_headers: HeaderMap, Json(body): Json<Value>| {
+            axum::Router::new().fallback(move |headers: HeaderMap, raw: axum::body::Bytes| {
                 let probes = probes_seen.clone();
                 let token = reply_token.clone();
                 async move {
+                    let body = decode_json_body(&headers, &raw);
                     let n = probes.fetch_add(1, Ordering::Relaxed) + 1;
-                    let value = if n <= 3 {
-                        "x".repeat(312)
-                    } else {
-                        token
-                    };
+                    let value = if n <= 3 { "x".repeat(312) } else { token };
                     Response::builder()
                         .header(turn_state::HEADER_NAME, value)
                         .body(completed_probe_body(&body))
@@ -640,9 +656,7 @@ async fn miss_streak_doubles_probe_concurrency_then_resets() {
 
 #[tokio::test]
 async fn max_burst_miss_rests_then_restarts_at_one() {
-    if !isolated_child(
-        "proxy::token_reuse_tests::max_burst_miss_rests_then_restarts_at_one",
-    ) {
+    if !isolated_child("proxy::token_reuse_tests::max_burst_miss_rests_then_restarts_at_one") {
         return;
     }
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -650,16 +664,18 @@ async fn max_burst_miss_rests_then_restarts_at_one() {
         write_login(home.path());
         let probes = Arc::new(AtomicU32::new(0));
         let probes_seen = probes.clone();
-        let router = axum::Router::new().fallback(move |_headers: HeaderMap, Json(body): Json<Value>| {
-            let probes = probes_seen.clone();
-            async move {
-                probes.fetch_add(1, Ordering::Relaxed);
-                Response::builder()
-                    .header(turn_state::HEADER_NAME, "x".repeat(312))
-                    .body(completed_probe_body(&body))
-                    .unwrap()
-            }
-        });
+        let router =
+            axum::Router::new().fallback(move |headers: HeaderMap, raw: axum::body::Bytes| {
+                let probes = probes_seen.clone();
+                async move {
+                    let body = decode_json_body(&headers, &raw);
+                    probes.fetch_add(1, Ordering::Relaxed);
+                    Response::builder()
+                        .header(turn_state::HEADER_NAME, "x".repeat(312))
+                        .body(completed_probe_body(&body))
+                        .unwrap()
+                }
+            });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {

@@ -15,25 +15,33 @@ pub fn run() {
         .setup(|app| {
             let resource_dir = app.path().resource_dir()?;
             let binary_name = if cfg!(windows) { "usque.exe" } else { "usque" };
-            let binary = if cfg!(debug_assertions) {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("resources/warp")
-                    .join(binary_name)
+            let development_binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources/warp")
+                .join(binary_name);
+            let packaged_binary = resource_dir.join("warp").join(binary_name);
+            let binary = if cfg!(debug_assertions) && development_binary.is_file() {
+                development_binary
             } else {
-                resource_dir.join("warp").join(binary_name)
+                packaged_binary
             };
             let mut data_dir = app.path().app_local_data_dir()?;
             if cfg!(debug_assertions) {
                 data_dir.push("dev");
             }
             data_dir.push("warp");
-            let mihomo_name = if cfg!(windows) { "mihomo.exe" } else { "mihomo" };
-            let mihomo_binary = if cfg!(debug_assertions) {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("resources/mihomo")
-                    .join(mihomo_name)
+            let mihomo_name = if cfg!(windows) {
+                "mihomo.exe"
             } else {
-                resource_dir.join("mihomo").join(mihomo_name)
+                "mihomo"
+            };
+            let development_mihomo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources/mihomo")
+                .join(mihomo_name);
+            let packaged_mihomo = resource_dir.join("mihomo").join(mihomo_name);
+            let mihomo_binary = if cfg!(debug_assertions) && development_mihomo.is_file() {
+                development_mihomo
+            } else {
+                packaged_mihomo
             };
             let mut mihomo_data = app.path().app_local_data_dir()?;
             if cfg!(debug_assertions) {
@@ -54,6 +62,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
+            commands::get_billing_summary,
+            commands::get_billing_records,
+            commands::set_billing_pricing,
             commands::set_config,
             commands::refresh_turn_state,
             commands::get_codex_config,

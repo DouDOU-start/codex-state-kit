@@ -370,11 +370,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["cache-control"], "no-store");
         assert!(!response.text().await.unwrap().contains("test-access"));
-        let auth: Value =
-            serde_json::from_slice(
-                &std::fs::read(crate::login::kit_auth_path(f.home.path())).unwrap(),
-            )
-                .unwrap();
+        let auth: Value = serde_json::from_slice(
+            &std::fs::read(crate::login::kit_auth_path(f.home.path())).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(f.home.path().join("auth.json")).unwrap(),
             std::fs::read(crate::login::kit_auth_path(f.home.path())).unwrap()

@@ -10,6 +10,11 @@ import type {
   SettingsPatch,
   Status,
   LatencyReport,
+  BillingRecord,
+  BillingQuery,
+  BillingRecordsPage,
+  BillingSummary,
+  BillingUsageTotals,
 } from "@/types";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
@@ -435,4 +440,174 @@ export async function openUrl(url: string): Promise<ActionResult> {
     return invoke<ActionResult>("open_url", { url });
   }
   return { ok: true, message: "预览模式不发起真实授权" };
+}
+
+const emptyBillingTotals = (): BillingUsageTotals => ({
+  requestCount: 0,
+  measuredRequestCount: 0,
+  unknownUsageCount: 0,
+  inputTokens: 0,
+  cachedInputTokens: 0,
+  outputTokens: 0,
+  costNanos: null,
+});
+
+const mockBillingSummary = (): BillingSummary => {
+  const previous = emptyBillingTotals();
+  previous.requestCount = 1;
+  previous.measuredRequestCount = 1;
+  previous.inputTokens = 1_420;
+  previous.outputTokens = 684;
+  previous.costNanos = 1_240_000;
+  const current = emptyBillingTotals();
+  current.requestCount = 3;
+  current.measuredRequestCount = 2;
+  current.unknownUsageCount = 1;
+  current.inputTokens = 12_480;
+  current.cachedInputTokens = 2_048;
+  current.outputTokens = 2_316;
+  current.costNanos = 8_460_000;
+  return {
+    generatedAt: new Date().toISOString(),
+    from: null,
+    to: null,
+    accounts: [
+      {
+        provider: "chatgpt",
+        accountId: "mock-account-a",
+        email: "previous@example.com",
+        firstSeenAt: new Date(Date.now() - 86_400_000 * 9).toISOString(),
+        lastSeenAt: new Date(Date.now() - 86_400_000).toISOString(),
+        total: previous,
+        business: previous,
+        internal: emptyBillingTotals(),
+      },
+      {
+        provider: "chatgpt",
+        accountId: "mock-account-b",
+        email: "mock@example.com",
+        firstSeenAt: new Date(Date.now() - 86_400_000 * 3).toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        total: current,
+        business: current,
+        internal: emptyBillingTotals(),
+      },
+    ],
+  };
+};
+
+const mockBillingRecords: BillingRecord[] = [
+  {
+    requestId: "mock-billing-3",
+    provider: "chatgpt",
+    accountId: "mock-account-b",
+    email: "mock@example.com",
+    source: "business",
+    startedAt: new Date(Date.now() - 20_000).toISOString(),
+    finishedAt: new Date(Date.now() - 7_000).toISOString(),
+    state: "measured",
+    httpStatus: 200,
+    requestedModel: "gpt-5.6-sol",
+    sentModel: "gpt-6-sol",
+    responseModel: "gpt-6-sol",
+    inputTokens: 4_608,
+    cachedInputTokens: 1_024,
+    outputTokens: 1_024,
+    usageSource: "provider_response",
+    pricingRuleId: 1,
+    costNanos: 4_220_000,
+    currency: "USD",
+  },
+  {
+    requestId: "mock-billing-2",
+    provider: "chatgpt",
+    accountId: "mock-account-b",
+    email: "mock@example.com",
+    source: "token_fetch",
+    startedAt: new Date(Date.now() - 60_000).toISOString(),
+    finishedAt: new Date(Date.now() - 45_000).toISOString(),
+    state: "missing_usage",
+    httpStatus: 200,
+    requestedModel: "gpt-6-astra",
+    sentModel: "gpt-6-astra",
+    usageSource: null,
+    pricingRuleId: null,
+    costNanos: null,
+    currency: "USD",
+  },
+  {
+    requestId: "mock-billing-1",
+    provider: "chatgpt",
+    accountId: "mock-account-a",
+    email: "previous@example.com",
+    source: "business",
+    startedAt: new Date(Date.now() - 86_400_000).toISOString(),
+    finishedAt: new Date(Date.now() - 86_400_000 + 9_000).toISOString(),
+    state: "measured",
+    httpStatus: 200,
+    requestedModel: "gpt-6-astra",
+    sentModel: "gpt-6-astra",
+    responseModel: "gpt-6-astra",
+    inputTokens: 1_420,
+    cachedInputTokens: 0,
+    outputTokens: 684,
+    usageSource: "provider_response",
+    pricingRuleId: 1,
+    costNanos: 1_240_000,
+    currency: "USD",
+  },
+];
+
+function cloneBillingSummary(summary: BillingSummary): BillingSummary {
+  return {
+    ...summary,
+    accounts: summary.accounts.map((account) => ({
+      ...account,
+      total: { ...account.total },
+      business: { ...account.business },
+      internal: { ...account.internal },
+    })),
+  };
+}
+
+function cloneBillingRecord(record: BillingRecord): BillingRecord {
+  return { ...record };
+}
+
+export async function getBillingSummary(period: Pick<BillingQuery, "from" | "to"> = {}): Promise<BillingSummary> {
+  if (isTauri) {
+    return invoke<BillingSummary>("get_billing_summary", {
+      from: period.from ?? null,
+      to: period.to ?? null,
+    });
+  }
+  return cloneBillingSummary(mockBillingSummary());
+}
+
+export async function getBillingRecords(query: BillingQuery = {}): Promise<BillingRecordsPage> {
+  if (isTauri) {
+    return invoke<BillingRecordsPage>("get_billing_records", {
+      accountId: query.accountId ?? null,
+      from: query.from ?? null,
+      to: query.to ?? null,
+      source: query.source ?? null,
+      model: query.model ?? null,
+      limit: query.limit ?? 50,
+      offset: query.offset ?? 0,
+    });
+  }
+  const filtered = mockBillingRecords.filter((record) => {
+    if (query.accountId && record.accountId !== query.accountId) return false;
+    if (query.source && record.source !== query.source) return false;
+    if (query.model && record.sentModel !== query.model && record.requestedModel !== query.model) return false;
+    return true;
+  });
+  const limit = query.limit ?? 50;
+  const offset = query.offset ?? 0;
+  return {
+    records: filtered.slice(offset, offset + limit).map(cloneBillingRecord),
+    total: filtered.length,
+    limit,
+    offset,
+  };
 }

@@ -428,10 +428,7 @@ pub fn apply_kit_auth_headers(headers: &mut HeaderMap, home: &Path) -> Option<Lo
     })
 }
 
-pub(crate) fn credentials_match_headers(
-    headers: &HeaderMap,
-    creds: &ChatGptCredentials,
-) -> bool {
+pub(crate) fn credentials_match_headers(headers: &HeaderMap, creds: &ChatGptCredentials) -> bool {
     request_account_id(headers).is_some_and(|account_id| account_id == creds.account_id)
 }
 
@@ -1164,12 +1161,12 @@ fn is_access_denied(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{HeaderMap, HeaderValue};
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::post;
     use axum::{Json, Router};
+    use http::{HeaderMap, HeaderValue};
     use serde_json::json;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1343,10 +1340,9 @@ mod tests {
         )
         .unwrap();
         assert!(status.refreshable);
-        let auth: Value = serde_json::from_str(
-            &std::fs::read_to_string(kit_auth_path(home.path())).unwrap(),
-        )
-        .unwrap();
+        let auth: Value =
+            serde_json::from_str(&std::fs::read_to_string(kit_auth_path(home.path())).unwrap())
+                .unwrap();
         assert_eq!(auth["tokens"]["refresh_token"], "original-refresh");
     }
 
@@ -1508,9 +1504,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let (_addr, endpoints) = serve(MockMode::Success).await;
         let client = http_client().unwrap();
-        let (_, pending) = start_device_login(&client, &endpoints, home.path().into()).await.unwrap();
+        let (_, pending) = start_device_login(&client, &endpoints, home.path().into())
+            .await
+            .unwrap();
         pending.cancel();
-        assert!(poll_device_login(&client, &endpoints, &pending).await.is_err());
+        assert!(poll_device_login(&client, &endpoints, &pending)
+            .await
+            .is_err());
         assert!(!home.path().join("auth.json").exists());
         assert!(!kit_auth_path(home.path()).exists());
     }
@@ -1659,10 +1659,9 @@ mod tests {
         let (credentials, override_headers) = request_credentials(home.path()).unwrap();
         assert!(override_headers);
         assert_eq!(credentials.access_token, "new-access");
-        let synced: Value = serde_json::from_str(
-            &std::fs::read_to_string(kit_auth_path(home.path())).unwrap(),
-        )
-        .unwrap();
+        let synced: Value =
+            serde_json::from_str(&std::fs::read_to_string(kit_auth_path(home.path())).unwrap())
+                .unwrap();
         assert_eq!(synced["tokens"]["refresh_token"], "rotated-refresh");
     }
 
@@ -1742,14 +1741,7 @@ mod tests {
 }"#,
         )
         .unwrap();
-        write_session_auth(
-            home.path(),
-            "new-id",
-            "new-access",
-            "new-refresh",
-            "acct-1",
-        )
-        .unwrap();
+        write_session_auth(home.path(), "new-id", "new-access", "new-refresh", "acct-1").unwrap();
         let official = std::fs::read_to_string(home.path().join("auth.json")).unwrap();
         assert!(official.contains("official-acct"));
         let value: Value =
@@ -1922,14 +1914,8 @@ mod tests {
             headers.get(http::header::AUTHORIZATION).unwrap(),
             "Bearer kit-access"
         );
-        assert_eq!(
-            headers.get("chatgpt-account-id").unwrap(),
-            "kit"
-        );
-        assert_eq!(
-            headers.get(http::header::COOKIE).unwrap(),
-            "__oailb=route1"
-        );
+        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "kit");
+        assert_eq!(headers.get(http::header::COOKIE).unwrap(), "__oailb=route1");
 
         let mut session_only = HeaderMap::new();
         session_only.insert(
@@ -1940,7 +1926,10 @@ mod tests {
             HeaderName::from_static("chatgpt-account-id"),
             HeaderValue::from_static("kit"),
         );
-        session_only.insert(http::header::COOKIE, HeaderValue::from_static("session=old"));
+        session_only.insert(
+            http::header::COOKIE,
+            HeaderValue::from_static("session=old"),
+        );
         apply_kit_auth_headers(&mut session_only, home.path());
         assert!(session_only.get(http::header::COOKIE).is_none());
     }

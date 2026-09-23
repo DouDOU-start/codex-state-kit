@@ -91,13 +91,7 @@ impl WarpRuntime {
 
     pub fn proxy_url(&self) -> Result<String> {
         let view = self.status();
-        if let Some(endpoint) = self
-            .inner
-            .lock()
-            .expect("warp state")
-            .endpoint
-            .clone()
-        {
+        if let Some(endpoint) = self.inner.lock().expect("warp state").endpoint.clone() {
             return Ok(endpoint);
         }
         bail!(

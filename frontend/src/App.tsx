@@ -15,6 +15,7 @@ import Pause from "lucide-react/dist/esm/icons/pause.js";
 import Play from "lucide-react/dist/esm/icons/play.js";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import { AppShell } from "@/components/AppShell";
+import { BillingPanel } from "@/components/BillingPanel";
 import { NetworkLogDialog } from "@/components/NetworkLogDialog";
 import { WarpPanel } from "@/components/WarpPanel";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
@@ -497,6 +498,11 @@ export default function App() {
             </div>
           </dl>
         </section>
+
+        <BillingPanel
+          currentAccountId={fwd.status.currentAccountId}
+          currentAccountEmail={fwd.status.currentAccountEmail}
+        />
 
         {fwd.status.degraded ? (
           <div className="banner banner--error" role="alert">

@@ -320,7 +320,8 @@ async fn verify_response_metrics() {
         "body_error",
         "cancel_headers",
     ] {
-        let preamble = b"data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.6-sol\"}}\n\n";
+        let preamble =
+            b"data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.6-sol\"}}\n\n";
         let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
         let end = b"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6-sol\",\"usage\":{\"output_tokens\":120}}}\n\ndata: [DONE]\n\n";
         let compressed = outcome.starts_with("zstd");
@@ -362,21 +363,24 @@ async fn verify_response_metrics() {
                 return;
             }
             let framing = if fixed_length {
-                format!(
-                    "Content-Length: {}",
-                    body_length
-                )
+                format!("Content-Length: {}", body_length)
             } else {
                 "Transfer-Encoding: chunked".into()
             };
-            let encoding = if compressed { "Content-Encoding: zstd\r\n" } else { "" };
-            let content_type = if outcome.starts_with("no_content_type") { "" } else { "Content-Type: text/event-stream\r\n" };
+            let encoding = if compressed {
+                "Content-Encoding: zstd\r\n"
+            } else {
+                ""
+            };
+            let content_type = if outcome.starts_with("no_content_type") {
+                ""
+            } else {
+                "Content-Type: text/event-stream\r\n"
+            };
             socket
                 .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\n{content_type}{encoding}{framing}\r\n\r\n"
-                    )
-                    .as_bytes(),
+                    format!("HTTP/1.1 200 OK\r\n{content_type}{encoding}{framing}\r\n\r\n")
+                        .as_bytes(),
                 )
                 .await
                 .unwrap();
@@ -448,7 +452,10 @@ async fn verify_response_metrics() {
         assert!(preamble_log.first_token_ms.is_none());
         assert_eq!(preamble_log.stream_state, "streaming");
         assert!(preamble_log.stream_chunks >= 1);
-        assert_eq!(preamble_log.upstream_response_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            preamble_log.upstream_response_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
         send.send(delta.to_vec()).await.unwrap();
         assert_eq!(&stream.next().await.unwrap().unwrap()[..], delta);
@@ -464,7 +471,12 @@ async fn verify_response_metrics() {
         assert!(live.tokens_per_second.is_none());
         tokio::time::sleep(Duration::from_millis(25)).await;
         match outcome {
-            "complete" | "length" | "zstd" | "zstd_length" | "no_content_type" | "no_content_type_completed_drop" => {
+            "complete"
+            | "length"
+            | "zstd"
+            | "zstd_length"
+            | "no_content_type"
+            | "no_content_type_completed_drop" => {
                 send.send(end.to_vec()).await.unwrap();
                 let mut forwarded = Vec::new();
                 if outcome.ends_with("completed_drop") {
@@ -475,7 +487,9 @@ async fn verify_response_metrics() {
                         while app.logs.lock().await.back().unwrap().in_progress {
                             tokio::task::yield_now().await;
                         }
-                    }).await.unwrap();
+                    })
+                    .await
+                    .unwrap();
                     drop(send);
                 } else {
                     drop(send);
@@ -491,7 +505,10 @@ async fn verify_response_metrics() {
                 assert_eq!(entry.id, initial.id);
                 assert_eq!(entry.output_tokens, Some(120));
                 assert_eq!(entry.upstream_response_model.as_deref(), Some("gpt-6-sol"));
-                assert_eq!(serde_json::to_value(&entry).unwrap()["upstreamResponseModel"], "gpt-6-sol");
+                assert_eq!(
+                    serde_json::to_value(&entry).unwrap()["upstreamResponseModel"],
+                    "gpt-6-sol"
+                );
                 assert!(entry.ms > entry.first_token_ms.unwrap());
                 assert_eq!(
                     entry.tokens_per_second,
@@ -516,7 +533,10 @@ async fn verify_response_metrics() {
                 .unwrap();
                 let entry = app.logs.lock().await.back().unwrap().snapshot();
                 assert_eq!(entry.error_kind.as_deref(), Some("client_cancelled"));
-                assert_eq!(entry.upstream_response_model.as_deref(), Some("gpt-5.6-sol"));
+                assert_eq!(
+                    entry.upstream_response_model.as_deref(),
+                    Some("gpt-5.6-sol")
+                );
                 assert!(entry.first_token_ms.is_some());
                 assert!(entry.tokens_per_second.is_none());
                 assert_eq!(entry.stream_state, "cancelled");
@@ -600,12 +620,17 @@ async fn json_error_response_is_not_reported_as_sse() {
         )
         .await
         .unwrap();
-        assert!(headers.await.unwrap().contains("http://upstream.invalid/responses"));
+        assert!(headers
+            .await
+            .unwrap()
+            .contains("http://upstream.invalid/responses"));
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(details.transport, "http");
         assert!(details.stream_lifecycle.is_none());
         assert_eq!(
-            &axum::body::to_bytes(response.into_body(), 16).await.unwrap()[..],
+            &axum::body::to_bytes(response.into_body(), 16)
+                .await
+                .unwrap()[..],
             b"{}"
         );
         task.await.unwrap();

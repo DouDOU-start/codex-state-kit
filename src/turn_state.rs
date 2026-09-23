@@ -223,7 +223,9 @@ impl TurnStateStore {
                 for (model, ts) in &tokens {
                     eprintln!(
                         "[token] 从磁盘恢复模型 {} 的 token（{}字节，age={}s）",
-                        model, ts.len, now_unix() - ts.issued_unix
+                        model,
+                        ts.len,
+                        now_unix() - ts.issued_unix
                     );
                 }
                 let pool_count: usize = pool.values().map(|v| v.len()).sum();
@@ -318,7 +320,10 @@ impl TurnStateStore {
         // 旧格式：单个 TurnState
         if let Ok(ts) = serde_json::from_str::<TurnState>(&raw) {
             if ts.token.starts_with("gAAAAA") {
-                eprintln!("[token] 从磁盘恢复旧格式 token（{}字节），放入 _default", ts.len);
+                eprintln!(
+                    "[token] 从磁盘恢复旧格式 token（{}字节），放入 _default",
+                    ts.len
+                );
                 let auto = canonical_quality_len(ts.len);
                 let mut tokens = HashMap::new();
                 tokens.insert("_default".to_string(), ts.clone());
@@ -433,8 +438,12 @@ impl TurnStateStore {
     /// 设置模型级绑定覆盖（传 None 清除覆盖，回退到全局）。
     pub fn set_model_bound_len(&mut self, model: &str, len: Option<usize>) {
         match len {
-            Some(l) => { self.model_bound_lens.insert(model.to_string(), l); }
-            None => { self.model_bound_lens.remove(model); }
+            Some(l) => {
+                self.model_bound_lens.insert(model.to_string(), l);
+            }
+            None => {
+                self.model_bound_lens.remove(model);
+            }
         }
         // 仅提升该模型的 token
         let target = self.bound_len_for(model);
@@ -447,8 +456,12 @@ impl TurnStateStore {
                 .cloned()
         });
         match best {
-            Some(ts) => { self.tokens.insert(model.to_string(), ts); }
-            None => { self.tokens.remove(model); }
+            Some(ts) => {
+                self.tokens.insert(model.to_string(), ts);
+            }
+            None => {
+                self.tokens.remove(model);
+            }
         }
         self.persist();
     }
@@ -471,8 +484,12 @@ impl TurnStateStore {
             .collect();
         for (model, maybe_ts) in promotions {
             match maybe_ts {
-                Some(ts) => { self.tokens.insert(model, ts); }
-                None => { self.tokens.remove(&model); }
+                Some(ts) => {
+                    self.tokens.insert(model, ts);
+                }
+                None => {
+                    self.tokens.remove(&model);
+                }
             }
         }
     }
@@ -517,13 +534,15 @@ impl TurnStateStore {
         // 无账号归属的旧缓存不可用于跨模型共享；绑定账号时会清掉旧缓存。
         self.account_id.as_ref()?;
         let now = now_unix();
-        self.pool.iter()
+        self.pool
+            .iter()
             .flat_map(|(model, entries)| entries.iter().map(move |ts| (model.as_str(), ts)))
             .filter(|(_, ts)| ts.len == QUALITY_TOKEN_LEN && ts.token.len() == QUALITY_TOKEN_LEN)
             .filter(|(_, ts)| issued_unix(&ts.token) == Some(ts.issued_unix))
             .filter(|(_, ts)| now.saturating_sub(ts.issued_unix) >= -MAX_FUTURE_SKEW_SECS)
             .max_by(|(a_model, a), (b_model, b)| {
-                a.issued_unix.cmp(&b.issued_unix)
+                a.issued_unix
+                    .cmp(&b.issued_unix)
                     .then_with(|| a.captured_at.cmp(&b.captured_at))
                     .then_with(|| a_model.cmp(b_model))
             })
@@ -533,14 +552,17 @@ impl TurnStateStore {
         if self.shares_292_for(model) && self.account_id.is_some() {
             self.shared_292_state()
         } else {
-            self.tokens.get_key_value(model).map(|(model, ts)| (model.as_str(), ts))
+            self.tokens
+                .get_key_value(model)
+                .map(|(model, ts)| (model.as_str(), ts))
         }
     }
 
     /// 按复用策略取票（不消费）。仅返回未过期的 token。
     pub fn peek_for_model(&self, model: &str) -> Option<String> {
         self.state_for_model(model).and_then(|(_, ts)| {
-            self.is_fresh_issued(ts.issued_unix).then(|| ts.token.clone())
+            self.is_fresh_issued(ts.issued_unix)
+                .then(|| ts.token.clone())
         })
     }
 
@@ -928,13 +950,13 @@ impl TurnStateStore {
                             status: status.into(),
                             age_secs: Some(age),
                             len: Some(state.len),
-                            captured_at: Some(state.captured_at.clone())
-                                .filter(|v| !v.is_empty()),
+                            captured_at: Some(state.captured_at.clone()).filter(|v| !v.is_empty()),
                             distribution: dist,
                             pool_tokens,
                             bound_override: model_override,
-                            shared_from_model: (self.shares_292_for(model) && self.account_id.is_some())
-                                .then(|| source_model.to_string()),
+                            shared_from_model: (self.shares_292_for(model)
+                                && self.account_id.is_some())
+                            .then(|| source_model.to_string()),
                         }
                     }
                     None => ModelTokenView {
@@ -973,7 +995,8 @@ impl TurnStateStore {
         // The headline describes the shared ticket, not a newer independent
         // 332 override whose age could conceal an aging shared pool.
         let freshest = shared_state.map(|(_, ts)| ts).or_else(|| {
-            models.iter()
+            models
+                .iter()
                 .filter_map(|model| self.state_for_model(model).map(|(_, ts)| ts))
                 .max_by_key(|ts| ts.issued_unix)
         });
@@ -1073,9 +1096,7 @@ pub fn is_same_turn_follow_up(bytes: &[u8]) -> bool {
     {
         return true;
     }
-    input_items(&value)
-        .last()
-        .is_some_and(is_tool_output_item)
+    input_items(&value).last().is_some_and(is_tool_output_item)
 }
 
 fn request_json(bytes: &[u8]) -> Option<Value> {
@@ -1086,7 +1107,12 @@ fn request_json(bytes: &[u8]) -> Option<Value> {
 }
 
 fn decode_request_json_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
-    if bytes.len() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xB5 && bytes[2] == 0x2F && bytes[3] == 0xFD {
+    if bytes.len() >= 4
+        && bytes[0] == 0x28
+        && bytes[1] == 0xB5
+        && bytes[2] == 0x2F
+        && bytes[3] == 0xFD
+    {
         if let Ok(plain) = zstd::decode_all(std::io::Cursor::new(bytes)) {
             return Some(plain);
         }
@@ -1185,7 +1211,12 @@ pub fn extract_model_from_body(bytes: &[u8]) -> Option<String> {
         return Some(model);
     }
     // zstd（magic: 0x28 0xB5 0x2F 0xFD）—— Codex CLI 默认使用 zstd
-    if bytes.len() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xB5 && bytes[2] == 0x2F && bytes[3] == 0xFD {
+    if bytes.len() >= 4
+        && bytes[0] == 0x28
+        && bytes[1] == 0xB5
+        && bytes[2] == 0x2F
+        && bytes[3] == 0xFD
+    {
         if let Ok(decompressed) = zstd::decode_all(std::io::Cursor::new(bytes)) {
             if let Some(model) = extract_model_from_json(&decompressed) {
                 return Some(model);
@@ -1299,9 +1330,7 @@ fn wrap_json_as_second_packet(bytes: &[u8], token: &str) -> Result<Vec<u8>, Stri
         return Err("请求体不是 JSON 对象，不能包装为同轮第二包".into());
     };
     object.remove("previous_response_id");
-    let metadata = object
-        .entry("client_metadata")
-        .or_insert_with(|| json!({}));
+    let metadata = object.entry("client_metadata").or_insert_with(|| json!({}));
     if let Some(metadata) = metadata.as_object_mut() {
         metadata.insert(HEADER_NAME.to_string(), json!(token));
     }
@@ -1311,7 +1340,11 @@ fn wrap_json_as_second_packet(bytes: &[u8], token: &str) -> Result<Vec<u8>, Stri
 fn detect_body_compression(bytes: &[u8], encoding: Option<&str>) -> Option<&'static str> {
     let encoding = encoding.unwrap_or("").to_ascii_lowercase();
     if encoding.contains("zstd")
-        || (bytes.len() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xB5 && bytes[2] == 0x2F && bytes[3] == 0xFD)
+        || (bytes.len() >= 4
+            && bytes[0] == 0x28
+            && bytes[1] == 0xB5
+            && bytes[2] == 0x2F
+            && bytes[3] == 0xFD)
     {
         return Some("zstd");
     }
@@ -1325,8 +1358,8 @@ fn detect_body_compression(bytes: &[u8], encoding: Option<&str>) -> Option<&'sta
 }
 
 fn rewrite_json_model(bytes: &[u8], model: &str) -> Result<Vec<u8>, String> {
-    let mut value: Value =
-        serde_json::from_slice(bytes).map_err(|_| "请求体不是 JSON，不能强制绑定模型".to_string())?;
+    let mut value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| "请求体不是 JSON，不能强制绑定模型".to_string())?;
     let Some(object) = value.as_object_mut() else {
         return Err("请求体不是 JSON 对象，不能强制绑定模型".into());
     };
@@ -1489,7 +1522,10 @@ fn infer_auto_quality_len(
     tokens
         .values()
         .map(|ts| ts.len)
-        .chain(pool.values().flat_map(|entries| entries.iter().map(|ts| ts.len)))
+        .chain(
+            pool.values()
+                .flat_map(|entries| entries.iter().map(|ts| ts.len)),
+        )
         .find_map(canonical_quality_len)
 }
 
@@ -1544,7 +1580,10 @@ mod tests {
         store.register_model("consumer");
         let token = token_for(now_unix() - 20);
         assert!(store.capture("donor", &token, "fetch"));
-        assert_eq!(store.peek_for_model("consumer").as_deref(), Some(token.as_str()));
+        assert_eq!(
+            store.peek_for_model("consumer").as_deref(),
+            Some(token.as_str())
+        );
         store.register_model("new-model");
         assert!(!store.needs_refresh("new-model"));
         assert_eq!(store.tokens.len(), 1);
@@ -1552,17 +1591,32 @@ mod tests {
         let view = store.view();
         assert_eq!(view.status, "active");
         assert_eq!(view.shared_source_model.as_deref(), Some("donor"));
-        assert!(view.models.iter().all(|m| m.shared_from_model.as_deref() == Some("donor")));
-        assert!(view.models.iter().find(|m| m.model == "consumer").unwrap().pool_tokens.is_empty());
+        assert!(view
+            .models
+            .iter()
+            .all(|m| m.shared_from_model.as_deref() == Some("donor")));
+        assert!(view
+            .models
+            .iter()
+            .find(|m| m.model == "consumer")
+            .unwrap()
+            .pool_tokens
+            .is_empty());
 
         store.set_reuse_policy(TokenReusePolicy::PerModel);
         assert!(store.peek_for_model("consumer").is_none());
         assert!(store.needs_refresh("consumer"));
-        assert_eq!(store.peek_for_model("donor").as_deref(), Some(token.as_str()));
+        assert_eq!(
+            store.peek_for_model("donor").as_deref(),
+            Some(token.as_str())
+        );
         assert_eq!(store.view().status, "partial");
         assert!(store.view().shared_source_model.is_none());
         store.set_reuse_policy(TokenReusePolicy::Shared292);
-        assert_eq!(store.peek_for_model("consumer").as_deref(), Some(token.as_str()));
+        assert_eq!(
+            store.peek_for_model("consumer").as_deref(),
+            Some(token.as_str())
+        );
         assert_eq!(store.pool.len(), 1);
     }
 
@@ -1591,21 +1645,38 @@ mod tests {
     fn shared_292_rejects_other_lengths_future_and_malformed_cached_tickets() {
         let mut store = shared_store();
         for len in [288, 296, 312, 332] {
-            store.capture(&format!("source-{len}"), &token_for_len(now_unix() - 10, len), "fetch");
+            store.capture(
+                &format!("source-{len}"),
+                &token_for_len(now_unix() - 10, len),
+                "fetch",
+            );
         }
-        store.capture("future", &token_for(now_unix() + MAX_FUTURE_SKEW_SECS + 60), "fetch");
-        store.pool.insert("bad-cache".into(), vec![TurnState {
-            token: "gAAAAA".to_string() + &"!".repeat(286),
-            len: QUALITY_TOKEN_LEN, issued_unix: now_unix(), source: "fetch".into(), captured_at: String::new(),
-            proxy_session: String::new(),
-            previous_response_id: String::new(),
-            routing_cookies: Vec::new(),
-        }]);
+        store.capture(
+            "future",
+            &token_for(now_unix() + MAX_FUTURE_SKEW_SECS + 60),
+            "fetch",
+        );
+        store.pool.insert(
+            "bad-cache".into(),
+            vec![TurnState {
+                token: "gAAAAA".to_string() + &"!".repeat(286),
+                len: QUALITY_TOKEN_LEN,
+                issued_unix: now_unix(),
+                source: "fetch".into(),
+                captured_at: String::new(),
+                proxy_session: String::new(),
+                previous_response_id: String::new(),
+                routing_cookies: Vec::new(),
+            }],
+        );
         assert!(store.peek_for_model("consumer").is_none());
         assert!(store.needs_refresh("consumer"));
         let token = token_for(now_unix() - 10);
         store.capture("donor", &token, "fetch");
-        assert_eq!(store.peek_for_model("consumer").as_deref(), Some(token.as_str()));
+        assert_eq!(
+            store.peek_for_model("consumer").as_deref(),
+            Some(token.as_str())
+        );
     }
 
     #[test]
@@ -1617,8 +1688,14 @@ mod tests {
         store.set_model_bound_len("independent", Some(QUALITY_TOKEN_LEN_332));
         assert!(store.peek_for_model("independent").is_none());
         store.capture("independent", &independent, "fetch");
-        assert_eq!(store.peek_for_model("independent").as_deref(), Some(independent.as_str()));
-        assert_eq!(store.peek_for_model("consumer").as_deref(), Some(shared.as_str()));
+        assert_eq!(
+            store.peek_for_model("independent").as_deref(),
+            Some(independent.as_str())
+        );
+        assert_eq!(
+            store.peek_for_model("consumer").as_deref(),
+            Some(shared.as_str())
+        );
         store.set_model_bound_len("other-independent", Some(QUALITY_TOKEN_LEN_332));
         assert!(store.peek_for_model("other-independent").is_none());
         store.bind_account("another-account");
@@ -1637,11 +1714,18 @@ mod tests {
         store.register_model("donor");
         store.register_model("independent");
         store.set_model_bound_len("independent", Some(QUALITY_TOKEN_LEN_332));
-        store.capture("independent", &token_for_len(now_unix() - 5, QUALITY_TOKEN_LEN_332), "fetch");
+        store.capture(
+            "independent",
+            &token_for_len(now_unix() - 5, QUALITY_TOKEN_LEN_332),
+            "fetch",
+        );
         assert_eq!(store.bound_len(), QUALITY_TOKEN_LEN);
         assert_eq!(store.view().len, Some(QUALITY_TOKEN_LEN));
         assert_eq!(store.view().shared_source_model.as_deref(), Some("donor"));
-        assert_eq!(store.peek_for_model("new-model").as_deref(), Some(token.as_str()));
+        assert_eq!(
+            store.peek_for_model("new-model").as_deref(),
+            Some(token.as_str())
+        );
         assert!(!store.needs_refresh("new-model"));
         store.set_reuse_policy(TokenReusePolicy::PerModel);
         assert!(store.peek_for_model("new-model").is_none());
@@ -1655,7 +1739,11 @@ mod tests {
         store.capture("b", &token_for(now_unix() - 60), "fetch");
         store.register_model("consumer");
         store.set_model_bound_len("independent", Some(QUALITY_TOKEN_LEN_332));
-        store.capture("independent", &token_for_len(now_unix() - 10, QUALITY_TOKEN_LEN_332), "fetch");
+        store.capture(
+            "independent",
+            &token_for_len(now_unix() - 10, QUALITY_TOKEN_LEN_332),
+            "fetch",
+        );
         store.invalidate_model("consumer");
         for model in ["a", "b", "consumer"] {
             assert!(store.peek_for_model(model).is_none());
@@ -1743,10 +1831,7 @@ mod tests {
             store.peek_for_model("gpt-6-astra").as_deref(),
             Some(t1.as_str())
         );
-        assert_eq!(
-            store.peek_for_model("o3-pro").as_deref(),
-            Some(t2.as_str())
-        );
+        assert_eq!(store.peek_for_model("o3-pro").as_deref(), Some(t2.as_str()));
         assert_eq!(store.peek_freshest().as_deref(), Some(t1.as_str()));
     }
 
@@ -1763,7 +1848,10 @@ mod tests {
         let due = token_for(now_unix() - 30);
         store.capture("gpt-6-astra", &due, "fetch");
         assert!(store.needs_refresh("gpt-6-astra"));
-        assert_eq!(store.peek_for_model("gpt-6-astra").as_deref(), Some(due.as_str()));
+        assert_eq!(
+            store.peek_for_model("gpt-6-astra").as_deref(),
+            Some(due.as_str())
+        );
 
         // 超过 240 秒 → 停止注入
         let old = token_for(now_unix() - 241);
@@ -1775,7 +1863,10 @@ mod tests {
         let mid = token_for(now_unix() - 15 * 60);
         store.capture("gpt-6-astra", &mid, "fetch");
         assert!(store.needs_refresh("gpt-6-astra"));
-        assert_eq!(store.peek_for_model("gpt-6-astra").as_deref(), Some(mid.as_str()));
+        assert_eq!(
+            store.peek_for_model("gpt-6-astra").as_deref(),
+            Some(mid.as_str())
+        );
         store.set_lifetime(12 * 60, 8 * 60);
         assert!(store.peek_for_model("gpt-6-astra").is_none());
     }
@@ -1822,10 +1913,7 @@ mod tests {
         let token = token_for(now_unix() - 30);
         store.register_model("gpt-6-astra");
         store.capture("gpt-6-astra", &token, "fetch");
-        store.record_distribution(
-            "gpt-6-astra",
-            vec![TokenLenCount { len: 292, count: 1 }],
-        );
+        store.record_distribution("gpt-6-astra", vec![TokenLenCount { len: 292, count: 1 }]);
 
         assert!(store.bind_account("acct-a"));
         assert_eq!(store.fresh_count(), 0);
@@ -1895,7 +1983,11 @@ mod tests {
         assert_eq!(view.status, "partial"); // one active, one empty
         assert_eq!(view.models.len(), 2);
 
-        let astra = view.models.iter().find(|m| m.model == "gpt-6-astra").unwrap();
+        let astra = view
+            .models
+            .iter()
+            .find(|m| m.model == "gpt-6-astra")
+            .unwrap();
         assert_eq!(astra.status, "active");
         let o3 = view.models.iter().find(|m| m.model == "o3-pro").unwrap();
         assert_eq!(o3.status, "empty");
@@ -1990,17 +2082,21 @@ mod tests {
         assert!(!is_same_turn_follow_up(
             br#"{"model":"gpt-6-astra","input":[{"role":"user","content":"hi"}]}"#
         ));
-        assert!(!is_same_turn_follow_up(br#"{"model":"gpt-6-astra","input":[
+        assert!(!is_same_turn_follow_up(
+            br#"{"model":"gpt-6-astra","input":[
             {"type":"function_call_output","call_id":"c1","output":"old"},
             {"role":"user","content":"next turn"}
-        ]}"#));
+        ]}"#
+        ));
         assert!(is_same_turn_follow_up(
             br#"{"model":"gpt-6-astra","previous_response_id":"resp_1"}"#
         ));
-        assert!(is_same_turn_follow_up(br#"{"model":"gpt-6-astra","input":[
+        assert!(is_same_turn_follow_up(
+            br#"{"model":"gpt-6-astra","input":[
             {"role":"user","content":"hi"},
             {"type":"function_call_output","call_id":"c1","output":"ok"}
-        ]}"#));
+        ]}"#
+        ));
         assert!(has_body_turn_state(
             br#"{"client_metadata":{"x-codex-turn-state":"gAAAAAexample"}}"#
         ));
@@ -2054,12 +2150,9 @@ mod tests {
 
     #[test]
     fn rewrite_model_inserts_and_replaces_json() {
-        let replaced = rewrite_model_in_body(
-            br#"{"model":"gpt-5.4","stream":true}"#,
-            None,
-            "gpt-6-astra",
-        )
-        .unwrap();
+        let replaced =
+            rewrite_model_in_body(br#"{"model":"gpt-5.4","stream":true}"#, None, "gpt-6-astra")
+                .unwrap();
         assert_eq!(
             extract_model_from_body(&replaced).as_deref(),
             Some("gpt-6-astra")
@@ -2077,7 +2170,8 @@ mod tests {
         let json = br#"{"model":"other","input":[]}"#;
         let gzip = {
             use std::io::Write;
-            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             encoder.write_all(json).unwrap();
             encoder.finish().unwrap()
         };
@@ -2139,7 +2233,9 @@ mod tests {
             &cookies
         ));
         assert_eq!(
-            store.previous_response_id_for_token(Some(&token)).as_deref(),
+            store
+                .previous_response_id_for_token(Some(&token))
+                .as_deref(),
             Some("resp_probe")
         );
         let cookie_names = store
@@ -2154,7 +2250,10 @@ mod tests {
             store.proxy_session_for_token(Some(&token)).as_deref(),
             Some("1Z5jzVPs")
         );
-        assert_eq!(store.view().bound_proxy_session.as_deref(), Some("1Z5jzVPs"));
+        assert_eq!(
+            store.view().bound_proxy_session.as_deref(),
+            Some("1Z5jzVPs")
+        );
 
         let persisted = serde_json::to_string(&PersistedStore {
             version: PERSIST_VERSION,
@@ -2170,7 +2269,10 @@ mod tests {
         .unwrap();
         let restored: PersistedStore = serde_json::from_str(&persisted).unwrap();
         assert_eq!(
-            restored.tokens.get("m1").map(|ts| ts.proxy_session.as_str()),
+            restored
+                .tokens
+                .get("m1")
+                .map(|ts| ts.proxy_session.as_str()),
             Some("1Z5jzVPs")
         );
         assert_eq!(
@@ -2181,10 +2283,11 @@ mod tests {
             Some("resp_probe")
         );
         assert_eq!(
-            restored
-                .tokens
-                .get("m1")
-                .map(|ts| ts.routing_cookies.iter().map(|cookie| cookie.name.as_str()).collect::<Vec<_>>()),
+            restored.tokens.get("m1").map(|ts| ts
+                .routing_cookies
+                .iter()
+                .map(|cookie| cookie.name.as_str())
+                .collect::<Vec<_>>()),
             Some(vec!["__oailb"])
         );
         let legacy: TurnState = serde_json::from_value(serde_json::json!({
@@ -2260,12 +2363,12 @@ mod tests {
         let t323 = token_for_len(now_unix() - 10, 323);
         assert!(store.capture("m2", &t323, "fetch")); // 入池成功
         assert!(store.peek_for_model("m2").is_none()); // 但 peek 不返回（绑定是 292）
-        // 池中应该有这个 token
+                                                       // 池中应该有这个 token
         let pool_m2 = store.pool_summary("m2");
         assert_eq!(pool_m2.len(), 1);
         let actual_len_323 = t323.trim().len();
         assert_eq!(pool_m2[0].0, actual_len_323); // 实际 token 长度
-        assert!(!pool_m2[0].1);                    // is_bound = false
+        assert!(!pool_m2[0].1); // is_bound = false
 
         // 切换绑定到 323 → 从池中自动提升，无需重新获取
         store.set_bound_len(Some(323));

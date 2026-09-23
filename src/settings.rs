@@ -214,7 +214,8 @@ pub struct SettingsPatch {
 impl SettingsPatch {
     pub fn into_settings(self) -> Result<Settings> {
         let models = self.models;
-        let lifetime = normalize_token_lifetime(self.token_max_age_mins, self.token_prefetch_age_mins)?;
+        let lifetime =
+            normalize_token_lifetime(self.token_max_age_mins, self.token_prefetch_age_mins)?;
         let settings = Settings {
             proxy_listen: self.proxy_listen.trim().to_string(),
             upstream: self.upstream.trim().to_string(),
@@ -232,7 +233,11 @@ impl SettingsPatch {
             token_fetch_paused: self.token_fetch_paused,
             token_max_age_mins: lifetime.0,
             token_prefetch_age_mins: lifetime.1,
-            mihomo_subscription: normalize_mihomo_text(&self.mihomo_subscription, 8192, "订阅地址")?,
+            mihomo_subscription: normalize_mihomo_text(
+                &self.mihomo_subscription,
+                8192,
+                "订阅地址",
+            )?,
             mihomo_node: normalize_mihomo_text(&self.mihomo_node, 128, "节点名")?,
         };
         if settings.proxy_listen.is_empty()
@@ -317,7 +322,9 @@ pub fn normalize_proxy(raw: &str, label: &str) -> Result<String> {
     if raw.is_empty() {
         return Ok(String::new());
     }
-    let parsed = raw.replace("{session}", "sessionid").replace("{SESSION}", "sessionid");
+    let parsed = raw
+        .replace("{session}", "sessionid")
+        .replace("{SESSION}", "sessionid");
     let url = Url::parse(&parsed).with_context(|| format!("{label}地址无效"))?;
     match url.scheme() {
         "http" | "https" | "socks5" | "socks5h" | "socks4" | "socks4a" => {}
@@ -335,10 +342,15 @@ mod tests {
 
     #[test]
     fn state_policy_defaults_and_round_trips_without_losing_other_settings() {
-        assert_eq!(settings_from_json("{}").unwrap().state_miss_policy, StateMissPolicy::Preserve);
+        assert_eq!(
+            settings_from_json("{}").unwrap().state_miss_policy,
+            StateMissPolicy::Preserve
+        );
         for (name, policy) in [
-            ("preserve", StateMissPolicy::Preserve), ("wait", StateMissPolicy::Wait),
-            ("strip", StateMissPolicy::Strip), ("passthrough", StateMissPolicy::Passthrough),
+            ("preserve", StateMissPolicy::Preserve),
+            ("wait", StateMissPolicy::Wait),
+            ("strip", StateMissPolicy::Strip),
+            ("passthrough", StateMissPolicy::Passthrough),
             ("strip_all", StateMissPolicy::StripAll),
         ] {
             let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
@@ -356,11 +368,18 @@ mod tests {
 
     #[test]
     fn token_reuse_policy_defaults_and_round_trips() {
-        assert_eq!(Settings::default().token_reuse_policy, TokenReusePolicy::Shared292);
-        let legacy = settings_from_json(r#"{"models":["a","b"],"outbound_mode":"manual"}"#).unwrap();
+        assert_eq!(
+            Settings::default().token_reuse_policy,
+            TokenReusePolicy::Shared292
+        );
+        let legacy =
+            settings_from_json(r#"{"models":["a","b"],"outbound_mode":"manual"}"#).unwrap();
         assert_eq!(legacy.token_reuse_policy, TokenReusePolicy::Shared292);
         assert_eq!(legacy.models, ["a", "b"]);
-        for (name, policy) in [("shared_292", TokenReusePolicy::Shared292), ("per_model", TokenReusePolicy::PerModel)] {
+        for (name, policy) in [
+            ("shared_292", TokenReusePolicy::Shared292),
+            ("per_model", TokenReusePolicy::PerModel),
+        ] {
             let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
                 "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
                 "tokenReusePolicy":name, "stateMissPolicy":"wait", "models":["a","b"]
@@ -373,7 +392,8 @@ mod tests {
         }
         let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
             "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(patch.token_reuse_policy, TokenReusePolicy::Shared292);
         assert!(serde_json::from_str::<TokenReusePolicy>("\"unknown\"").is_err());
     }
@@ -466,7 +486,10 @@ mod tests {
         .into_settings()
         .unwrap();
         assert_eq!(settings.outbound_proxy, "socks5://127.0.0.1:1080");
-        assert_eq!(settings.network_route_policy, NetworkRoutePolicy::SameNetwork);
+        assert_eq!(
+            settings.network_route_policy,
+            NetworkRoutePolicy::SameNetwork
+        );
     }
 
     #[test]
@@ -480,7 +503,10 @@ mod tests {
             r#"{"outbound_proxy":"socks5://localhost:1080","upstream_proxy":"http://127.0.0.1:7897"}"#,
         )
         .unwrap();
-        assert_eq!(legacy_split.network_route_policy, NetworkRoutePolicy::Separate);
+        assert_eq!(
+            legacy_split.network_route_policy,
+            NetworkRoutePolicy::Separate
+        );
         let explicit = settings_from_json(
             r#"{"upstream_proxy":"http://127.0.0.1:7897","network_route_policy":"same_network"}"#,
         )
@@ -522,7 +548,10 @@ mod tests {
     #[test]
     fn state_fetch_model_defaults_and_only_pins_shared_292() {
         assert!(Settings::default().shared_state_donor().is_none());
-        assert!(settings_from_json("{}").unwrap().state_fetch_model().is_none());
+        assert!(settings_from_json("{}")
+            .unwrap()
+            .state_fetch_model()
+            .is_none());
         let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
             "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
             "stateFetchModel":" gpt-5.5 ", "tokenReusePolicy":"shared_292"
@@ -630,7 +659,11 @@ mod tests {
             "tokenMaxAgeMins":20, "tokenPrefetchAgeMins":20
         }))
         .unwrap();
-        assert!(equal.into_settings().unwrap_err().to_string().contains("预取时间必须早于过期时间"));
+        assert!(equal
+            .into_settings()
+            .unwrap_err()
+            .to_string()
+            .contains("预取时间必须早于过期时间"));
         let short: SettingsPatch = serde_json::from_value(serde_json::json!({
             "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
             "tokenMaxAgeMins":3, "tokenPrefetchAgeMins":1

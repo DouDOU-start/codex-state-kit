@@ -79,7 +79,7 @@ target/release/bundle/nsis/
 target/release/bundle/msi/
 ```
 
-构建前会下载并校验当前平台的 Mihomo 内核，再重新生成图标与前端资源。内核二进制不提交到仓库。优先分发安装包；单独分发主程序时必须附带 `warp/` 与 `mihomo/` 资源目录。内核更新步骤见 [WARP 来源记录](../src-tauri/resources/warp/PROVENANCE.md) 与 [Mihomo 来源记录](../src-tauri/resources/mihomo/PROVENANCE.md)。
+构建前会下载并校验当前目标平台的 Mihomo 内核，再重新生成图标与前端资源；内核会随 Tauri 安装包放进应用 Resources，运行时不再下载。macOS Apple Silicon 与 Intel 安装包分别内置对应架构的二进制，不能交叉复用。内核二进制不提交到仓库。优先分发安装包；单独分发主程序时必须附带 `warp/` 与 `mihomo/` 资源目录。内核更新步骤见 [WARP 来源记录](../src-tauri/resources/warp/PROVENANCE.md) 与 [Mihomo 来源记录](../src-tauri/resources/mihomo/PROVENANCE.md)。
 
 ## 代码结构
 

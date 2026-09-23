@@ -27,7 +27,12 @@ pub fn token_fp(token: &str) -> String {
         return "none".into();
     }
     let issued = crate::turn_state::issued_unix(token).unwrap_or(0);
-    format!("{}:{}:{:016x}", token.len(), issued, fnv1a64(token.as_bytes()))
+    format!(
+        "{}:{}:{:016x}",
+        token.len(),
+        issued,
+        fnv1a64(token.as_bytes())
+    )
 }
 
 pub fn token_age_secs(token: &str) -> Option<i64> {
@@ -141,5 +146,4 @@ mod tests {
         assert!(!first.contains(&token));
         assert_ne!(token_fp(&token_for(1_700_000_001)), first);
     }
-
 }

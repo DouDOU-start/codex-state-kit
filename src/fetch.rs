@@ -33,9 +33,11 @@ pub fn fetch_burst_concurrency(miss_streak: u32) -> usize {
     1usize << miss_streak.min(MAX_FETCH_BURST.ilog2())
 }
 
-const CODEX_IDENTITY_VERSION: &str = "0.153.4";
-const CODEX_ORIGINATOR: &str = "codex-tui";
-const CODEX_USER_AGENT_SUFFIX: &str = " (Ubuntu 22.4.0; x86_64) xterm-256color";
+/// 对齐 Codex CLI `get_codex_user_agent()`：`{originator}/{version} ({os_type} {version}; {arch}) {terminal}`。
+/// `os_info` 在 macOS 上打印 `Mac OS 15.5.0`，不是 `macOS 15.5`。
+const CODEX_IDENTITY_VERSION: &str = "0.155.0";
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_USER_AGENT_SUFFIX: &str = " (Mac OS 15.5.0; arm64) xterm-256color";
 
 const SESSION_PLACEHOLDER_LC: &str = "{session}";
 const SESSION_PLACEHOLDER_UC: &str = "{SESSION}";
@@ -93,10 +95,7 @@ pub fn resolve_probe_proxy(raw: &str) -> (String, Option<String>) {
         return (raw.to_string(), None);
     }
     let session = generate_proxy_session();
-    (
-        replace_session_placeholder(raw, &session),
-        Some(session),
-    )
+    (replace_session_placeholder(raw, &session), Some(session))
 }
 
 /// 业务发送使用已绑定的 session。模板含 `{session}` 但还没绑定时失败，避免误走未解析地址。
@@ -119,10 +118,8 @@ pub fn randomize_proxy_session(raw: &str) -> String {
     // 匹配 -sid-XXXX 部分，替换为随机 8 字符
     if let Some(sid_start) = raw.find("-sid-") {
         let after_sid = &raw[sid_start + 5..]; // skip "-sid-"
-        // 找到下一个 '-' 或 ':' 或 '@' 作为 session ID 结束
-        let sid_end = after_sid
-            .find(['-', ':', '@'])
-            .unwrap_or(after_sid.len());
+                                               // 找到下一个 '-' 或 ':' 或 '@' 作为 session ID 结束
+        let sid_end = after_sid.find(['-', ':', '@']).unwrap_or(after_sid.len());
         let rng_id: String = rand::rng()
             .sample_iter(rand::distr::Alphanumeric)
             .take(8)
@@ -141,9 +138,7 @@ pub fn randomize_proxy_session(raw: &str) -> String {
         if let Some(region_start) = raw.find("-region-") {
             let after_region = &raw[region_start + 8..];
             // 跳过 region 值（到下一个 '-' 或 ':' 或 '@'）
-            let region_end = after_region
-                .find([':', '@'])
-                .unwrap_or(after_region.len());
+            let region_end = after_region.find([':', '@']).unwrap_or(after_region.len());
             let rng_id: String = rand::rng()
                 .sample_iter(rand::distr::Alphanumeric)
                 .take(8)
@@ -178,12 +173,14 @@ pub fn proxy_auth_hint(raw: &str) -> Option<String> {
 }
 
 pub fn http_client(outbound_proxy: &str) -> Result<reqwest::Client> {
+    // 与官方 CLI 一样走 TLS ALPN，由对端协商 HTTP/2。
+    // 不用 http2_prior_knowledge：那是明文 h2c，HTTPS 和经 CONNECT 的隧道都会失败。
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(25))
         .connect_timeout(Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::none())
-        .http1_only()
-        .pool_max_idle_per_host(0);
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(4);
     let proxy = outbound_proxy_for_client(outbound_proxy);
     if !proxy.is_empty() {
         builder = builder.proxy(reqwest::Proxy::all(&proxy).context("出站代理")?);
@@ -221,6 +218,39 @@ pub fn probe_body(model: &str) -> serde_json::Value {
 
 fn codex_user_agent() -> String {
     format!("{CODEX_ORIGINATOR}/{CODEX_IDENTITY_VERSION}{CODEX_USER_AGENT_SUFFIX}")
+}
+
+/// 探针请求头按抓包顺序写入。HTTP/2 的 HEADERS 帧顺序仍由 hyper 决定，这里只保证 HTTP/1.1 与 HeaderMap 插入序。
+fn codex_probe_request(
+    client: &reqwest::Client,
+    url: &str,
+    creds: &ChatGptCredentials,
+    probe: &serde_json::Value,
+    turn_state: Option<&str>,
+) -> Result<(reqwest::RequestBuilder, usize)> {
+    let plain = serde_json::to_vec(probe).context("encode probe json")?;
+    let body = zstd::encode_all(plain.as_slice(), 3).context("compress probe body")?;
+    let wire_len = body.len();
+    let mut request = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("authorization", format!("Bearer {}", creds.access_token))
+        .header("openai-beta", "responses=experimental")
+        .header("user-agent", codex_user_agent())
+        .header("chatgpt-account-id", &creds.account_id)
+        .header("originator", CODEX_ORIGINATOR)
+        .header("version", CODEX_IDENTITY_VERSION)
+        .header("session_id", Uuid::new_v4().to_string());
+    if let Some(state) = turn_state {
+        request = request.header(HEADER_NAME, state);
+    }
+    // 不手写 accept-encoding。reqwest 在启用 gzip/zstd 后会自己加上并解压响应；
+    // 手动设置会关掉自动解压，SSE 正文会变成压缩字节。
+    Ok((
+        request.header("content-encoding", "zstd").body(body),
+        wire_len,
+    ))
 }
 
 #[cfg(test)]
@@ -269,32 +299,20 @@ pub(crate) async fn fetch_turn_state_with_cookies(
     }
     let probe = probe_body(model);
     details.account_id = Some(logs::safe_text(&creds.account_id, 128));
-    details.account_email = creds.email.as_deref().map(|email| logs::safe_text(email, 254));
-    details.body_bytes = serde_json::to_vec(&probe)
-        .map(|body| body.len())
-        .unwrap_or(0);
+    details.account_email = creds
+        .email
+        .as_deref()
+        .map(|email| logs::safe_text(email, 254));
+    let (mut request, wire_len) = codex_probe_request(client, &url, creds, &probe, None)?;
+    details.body_bytes = wire_len;
     let request_started = Instant::now();
-    let mut request = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", creds.access_token))
-        .header("ChatGPT-Account-ID", &creds.account_id)
-        .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream")
-        .header("OpenAI-Beta", "responses=experimental")
-        .header("Connection", "close")
-        .header("session_id", Uuid::new_v4().to_string())
-        .header("originator", CODEX_ORIGINATOR)
-        .header("version", CODEX_IDENTITY_VERSION)
-        .header("User-Agent", codex_user_agent())
-        .json(&probe);
     if let Some(cookie) = chatgpt_cookies::request_header(
         request_cookies,
         chatgpt_cookies::is_chatgpt_https_url(&url),
     ) {
         request = request.header(http::header::COOKIE, cookie);
     }
-    let response = match request.send().await
-    {
+    let response = match request.send().await {
         Ok(response) => response,
         Err(err) => {
             details.response_header_ms = Some(request_started.elapsed().as_millis());
@@ -357,7 +375,9 @@ pub(crate) async fn fetch_turn_state_with_cookies(
         details.turn_state_action = "rejected_invalid".into();
         bail!("上游返回的 {HEADER_NAME} 无法解析");
     };
-    let age = chrono::Utc::now().timestamp().saturating_sub(parsed.issued_unix);
+    let age = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(parsed.issued_unix);
     if age < -MAX_FUTURE_SKEW_SECS {
         details.turn_state_action = "rejected_future".into();
         bail!("上游返回的 {HEADER_NAME} 时间戳超前");
@@ -408,22 +428,14 @@ pub(crate) async fn validate_carried_ticket(
     }
     let probe = probe_body(model);
     details.account_id = Some(logs::safe_text(&creds.account_id, 128));
-    details.account_email = creds.email.as_deref().map(|email| logs::safe_text(email, 254));
+    details.account_email = creds
+        .email
+        .as_deref()
+        .map(|email| logs::safe_text(email, 254));
+    let (mut request, wire_len) =
+        codex_probe_request(client, &url, creds, &probe, Some(carried_state))?;
+    details.body_bytes = wire_len;
     let request_started = Instant::now();
-    let mut request = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", creds.access_token))
-        .header("ChatGPT-Account-ID", &creds.account_id)
-        .header(HEADER_NAME, carried_state)
-        .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream")
-        .header("OpenAI-Beta", "responses=experimental")
-        .header("Connection", "close")
-        .header("session_id", Uuid::new_v4().to_string())
-        .header("originator", CODEX_ORIGINATOR)
-        .header("version", CODEX_IDENTITY_VERSION)
-        .header("User-Agent", codex_user_agent())
-        .json(&probe);
     if let Some(cookie) = chatgpt_cookies::request_header(
         request_cookies,
         chatgpt_cookies::is_chatgpt_https_url(&url),
@@ -431,8 +443,7 @@ pub(crate) async fn validate_carried_ticket(
         request = request.header(http::header::COOKIE, cookie);
     }
     let response = request.send().await.with_context(|| {
-        proxy_auth_hint(&settings.outbound_proxy)
-            .unwrap_or_else(|| "业务出口复验连不上".into())
+        proxy_auth_hint(&settings.outbound_proxy).unwrap_or_else(|| "业务出口复验连不上".into())
     })?;
     details.response_header_ms = Some(request_started.elapsed().as_millis());
     details.response_status = Some(response.status().as_u16());
@@ -447,7 +458,10 @@ pub(crate) async fn validate_carried_ticket(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    if returned.as_deref().is_some_and(turn_state::is_degraded_token) {
+    if returned
+        .as_deref()
+        .is_some_and(turn_state::is_degraded_token)
+    {
         details.turn_state_action = "rejected_degraded".into();
         bail!("业务出口复验返回降级 turn-state");
     }
@@ -475,7 +489,11 @@ fn is_response_id(id: &str) -> bool {
 fn response_id_from_value(value: &serde_json::Value) -> Option<String> {
     const KEYS: [&str; 2] = ["id", "response_id"];
     for key in KEYS {
-        if let Some(id) = value.get(key).and_then(serde_json::Value::as_str).filter(|id| is_response_id(id)) {
+        if let Some(id) = value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| is_response_id(id))
+        {
             return Some(id.trim().to_string());
         }
     }
@@ -502,7 +520,10 @@ pub(crate) fn parse_probe_response_id(body: &str) -> Option<String> {
     }
     for block in body.split("\n\n") {
         for line in block.lines() {
-            let data = line.strip_prefix("data:").map(str::trim).unwrap_or(line.trim());
+            let data = line
+                .strip_prefix("data:")
+                .map(str::trim)
+                .unwrap_or(line.trim());
             if data.is_empty() || data == "[DONE]" {
                 continue;
             }
@@ -607,7 +628,7 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use axum::routing::post;
-    use axum::{Json, Router};
+    use axum::Router;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
     use std::sync::{Arc, Mutex};
@@ -645,8 +666,19 @@ mod tests {
     async fn mock_response(
         State(state): State<MockState>,
         headers: HeaderMap,
-        Json(body): Json<serde_json::Value>,
+        body: axum::body::Bytes,
     ) -> impl IntoResponse {
+        let encoding = headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let plain = if encoding.eq_ignore_ascii_case("zstd") {
+            zstd::decode_all(body.as_ref()).expect("zstd probe body")
+        } else {
+            body.to_vec()
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(&plain).unwrap_or(serde_json::Value::Null);
         state
             .requests
             .lock()
@@ -676,12 +708,7 @@ mod tests {
             "type": "response.completed",
             "response": { "model": model }
         });
-        (
-            state.status,
-            headers,
-            format!("data: {payload}\n\n"),
-        )
-            .into_response()
+        (state.status, headers, format!("data: {payload}\n\n")).into_response()
     }
 
     async fn serve(
@@ -743,6 +770,14 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_matches_codex_cli_shape() {
+        assert_eq!(
+            codex_user_agent(),
+            "codex_cli_rs/0.155.0 (Mac OS 15.5.0; arm64) xterm-256color"
+        );
+    }
+
+    #[test]
     fn probe_matches_sub2api_profile() {
         assert_eq!(
             probe_body("gpt-6-astra"),
@@ -801,8 +836,7 @@ mod tests {
 
     #[test]
     fn session_placeholder_rotates_then_binds() {
-        let template =
-            "socks5://xmtt1126849-region-DE-sid-{session}-t-120:pass@us.arxlabs.io:3010";
+        let template = "socks5://xmtt1126849-region-DE-sid-{session}-t-120:pass@us.arxlabs.io:3010";
         assert!(has_session_placeholder(template));
         let (probe_a, session_a) = resolve_probe_proxy(template);
         let (_probe_b, session_b) = resolve_probe_proxy(template);
@@ -816,7 +850,10 @@ mod tests {
             apply_bound_session(template, Some(&session_a)).unwrap(),
             probe_a
         );
-        assert!(apply_bound_session(template, None).unwrap_err().to_string().contains("{session}"));
+        assert!(apply_bound_session(template, None)
+            .unwrap_err()
+            .to_string()
+            .contains("{session}"));
         assert_eq!(
             apply_bound_session("socks5://127.0.0.1:1080", None).unwrap(),
             "socks5://127.0.0.1:1080"
@@ -832,7 +869,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("config.toml"), "model = \"gpt-6-astra\"\n").unwrap();
         assert_eq!(preferred_model(root.path()), "gpt-6-astra");
-        assert_eq!(preferred_model(root.path().join("missing").as_path()), "gpt-6-astra");
+        assert_eq!(
+            preferred_model(root.path().join("missing").as_path()),
+            "gpt-6-astra"
+        );
     }
 
     #[tokio::test]
@@ -862,7 +902,10 @@ mod tests {
         assert!(details.response_header_ms.is_some());
         assert_eq!(details.turn_state_action, "received");
         assert_eq!(details.returned_turn_state_len, Some(fetched.token.len()));
-        assert_eq!(details.peer_addr.as_deref(), upstream.strip_prefix("http://"));
+        assert_eq!(
+            details.peer_addr.as_deref(),
+            upstream.strip_prefix("http://")
+        );
         assert_eq!(details.final_origin.as_deref(), Some(upstream.as_str()));
         assert_eq!(details.http_version.as_deref(), Some("HTTP/1.1"));
 
@@ -872,8 +915,26 @@ mod tests {
         assert_eq!(request.headers["originator"], CODEX_ORIGINATOR);
         assert_eq!(request.headers["version"], CODEX_IDENTITY_VERSION);
         assert_eq!(request.headers["user-agent"], codex_user_agent());
-        assert_eq!(request.headers["connection"], "close");
+        assert!(request.headers.get("connection").is_none());
+        assert_eq!(request.headers["content-encoding"], "zstd");
         assert_eq!(request.headers["openai-beta"], "responses=experimental");
+        let names: Vec<&str> = request.headers.keys().map(|name| name.as_str()).collect();
+        let wanted = [
+            "content-type",
+            "accept",
+            "authorization",
+            "openai-beta",
+            "user-agent",
+            "chatgpt-account-id",
+            "originator",
+            "version",
+            "session_id",
+        ];
+        let positions: Vec<usize> = wanted
+            .iter()
+            .map(|name| names.iter().position(|key| key == name).expect(name))
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(request.headers["authorization"], "Bearer access");
         assert_eq!(request.headers["chatgpt-account-id"], "acct");
         assert!(request.headers.get(HEADER_NAME).is_none());
@@ -962,8 +1023,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_degraded_and_invalid_tickets() {
         for (token, action) in [
-            (token_for_len(turn_state::DEGRADED_TOKEN_LEN), "rejected_degraded"),
-            ("X".repeat(turn_state::QUALITY_TOKEN_LEN), "rejected_invalid"),
+            (
+                token_for_len(turn_state::DEGRADED_TOKEN_LEN),
+                "rejected_degraded",
+            ),
+            (
+                "X".repeat(turn_state::QUALITY_TOKEN_LEN),
+                "rejected_invalid",
+            ),
         ] {
             let (upstream, _) = serve(StatusCode::OK, Some(token)).await;
             let settings = Settings {
@@ -1013,8 +1080,14 @@ mod tests {
                 ),
                 "rejected_stale",
             ),
-            (token_for_len_at(turn_state::QUALITY_TOKEN_LEN, i64::MAX), "rejected_invalid"),
-            (token_for_len_at(turn_state::QUALITY_TOKEN_LEN, i64::MIN), "rejected_invalid"),
+            (
+                token_for_len_at(turn_state::QUALITY_TOKEN_LEN, i64::MAX),
+                "rejected_invalid",
+            ),
+            (
+                token_for_len_at(turn_state::QUALITY_TOKEN_LEN, i64::MIN),
+                "rejected_invalid",
+            ),
         ];
         for (token, action) in cases {
             let (upstream, _) = serve(StatusCode::OK, Some(token)).await;
@@ -1139,12 +1212,8 @@ mod tests {
             ),
         ];
         for (body, action) in cases {
-            let (upstream, _) = serve_with_body(
-                StatusCode::OK,
-                Some(expected.clone()),
-                Some(body.into()),
-            )
-            .await;
+            let (upstream, _) =
+                serve_with_body(StatusCode::OK, Some(expected.clone()), Some(body.into())).await;
             let settings = Settings {
                 upstream,
                 ..Settings::default()
