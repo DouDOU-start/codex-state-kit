@@ -38,9 +38,13 @@ export interface LogEntry {
   currentIdleMs?: number | null;
 }
 
+/** The system a virtual device reports; version, arch and terminal follow it. */
+export type DevicePlatform = "mac" | "windows" | "linux";
+
 export interface VmIdentityView {
   installationId: string;
   sessionId: string;
+  platform: DevicePlatform;
   cliVersion: string;
   originator: string;
   osType: string;
@@ -48,16 +52,10 @@ export interface VmIdentityView {
   arch: string;
   terminal: string;
   userAgent: string;
-  versionLocked: boolean;
 }
 
 export interface VmProfile {
-  cliVersion: string;
-  originator: string;
-  osType: string;
-  osVersion: string;
-  arch: string;
-  terminal: string;
+  platform: DevicePlatform;
 }
 
 export interface Status {
@@ -218,7 +216,7 @@ export interface ActionResult {
 }
 
 export interface Banner {
-  kind: "ok" | "error";
+  kind: "ok" | "warn" | "error";
   text: string;
 }
 
@@ -342,6 +340,8 @@ export interface PricingCatalogInfo {
   sha256: string;
   modelCount: number;
   remoteUrl: string;
+  /** When the prices in use were downloaded from the price repo. */
+  fetchedAt?: string | null;
   lastCheckedAt?: string | null;
   lastUpdatedAt?: string | null;
   lastError?: string | null;
@@ -355,7 +355,6 @@ export interface PricingView {
 export interface SavedAccount {
   accountId: string;
   email?: string | null;
-  label?: string | null;
   authMode?: string | null;
   /** Access-token imports cannot refresh and must be re-imported on expiry. */
   refreshable: boolean;

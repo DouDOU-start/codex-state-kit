@@ -106,6 +106,7 @@ export function PricingPanel({ active }: PricingPanelProps) {
       </header>
       <div className="pricing-sync">
         <span>每 10 分钟比对 sub2api 价格仓库的 sha256，有变化自动下载并校验</span>
+        <span>价格数据 {formatTime(info?.fetchedAt)}</span>
         <span>上次检查 {formatTime(info?.lastCheckedAt)}</span>
         <span>上次更新 {formatTime(info?.lastUpdatedAt)}</span>
       </div>

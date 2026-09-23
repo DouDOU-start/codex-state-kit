@@ -4,11 +4,14 @@ import { useNotice } from "@/components/Notifier";
 import { RefreshControl } from "@/components/RefreshControl";
 import { usePolling } from "@/hooks/usePolling";
 import { getBillingRecords, getBillingRevision, getBillingSummary, isTauri } from "@/lib/api";
-import type { BillingRecord, BillingSummary } from "@/types";
+import { accountLabel } from "@/components/UsageRecordsPanel";
+import type { BillingRecord, BillingSummary, SavedAccount } from "@/types";
 
 interface BillingPanelProps {
   currentAccountId?: string | null;
   currentAccountEmail?: string | null;
+  /** Saved logins; label accounts whose records carry no email. */
+  savedAccounts: SavedAccount[];
   /** Whether the overview is on screen; auto-refresh only runs then. */
   active: boolean;
   /** Auto-refresh interval; 0 turns it off. */
@@ -69,7 +72,7 @@ function tokenSum(records: BillingRecord[]): number {
   return records.reduce((sum, record) => sum + (record.inputTokens ?? 0) + (record.outputTokens ?? 0), 0);
 }
 
-export function BillingPanel({ currentAccountId, currentAccountEmail, active, refreshMs, onRefreshMsChange }: BillingPanelProps) {
+export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccounts, active, refreshMs, onRefreshMsChange }: BillingPanelProps) {
   const [summary, setSummary] = useState<BillingSummary | null>(null);
   const [records, setRecords] = useState<BillingRecord[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState(currentAccountId ?? "");
@@ -176,7 +179,7 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, active, re
       <header className="usage-dash__header">
         <div>
           <h2>使用统计</h2>
-          <p>{selected ? `${selected.email || currentAccountEmail || selected.accountId} · 近 30 天用量 · ChatGPT` : "近 30 天用量"}{!isTauri ? " · 浏览器示例" : ""}</p>
+          <p>{selected ? `${accountLabel(selected.accountId, selected.email || (selected.accountId === currentAccountId ? currentAccountEmail : null), savedAccounts)} · 近 30 天用量 · ChatGPT` : "近 30 天用量"}{!isTauri ? " · 浏览器示例" : ""}</p>
         </div>
         <div className="usage-dash__tools">
           {accounts.length > 1 ? (
@@ -184,7 +187,7 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, active, re
               variant="compact"
               ariaLabel="统计账号"
               value={selected?.accountId ?? ""}
-              options={accounts.map((account) => ({ value: account.accountId, label: account.email || account.accountId }))}
+              options={accounts.map((account) => ({ value: account.accountId, label: accountLabel(account.accountId, account.email, savedAccounts) }))}
               onChange={setSelectedAccountId}
             />
           ) : null}

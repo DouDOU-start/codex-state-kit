@@ -76,7 +76,6 @@ pub fn run() {
             commands::list_accounts,
             commands::switch_account,
             commands::remove_account,
-            commands::rename_account,
             commands::import_chatgpt_refresh_token,
             commands::import_chatgpt_access_token,
             commands::start_chatgpt_login,

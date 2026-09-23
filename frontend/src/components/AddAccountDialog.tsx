@@ -4,13 +4,16 @@ import ExternalLink from "lucide-react/dist/esm/icons/external-link.js";
 import LogIn from "lucide-react/dist/esm/icons/log-in.js";
 import Radio from "lucide-react/dist/esm/icons/radio.js";
 import Shield from "lucide-react/dist/esm/icons/shield.js";
+import KeyRound from "lucide-react/dist/esm/icons/key-round.js";
 import UserPlus from "lucide-react/dist/esm/icons/user-plus.js";
 import X from "lucide-react/dist/esm/icons/x.js";
 import type { useCodexStateKit } from "@/hooks/useCodexStateKit";
-import type { LoginMode } from "@/types";
+import type { LoginMode, SavedAccount } from "@/types";
 
 interface AddAccountDialogProps {
   open: boolean;
+  /** A saved account to sign in again; null adds a new account. */
+  target: SavedAccount | null;
   onClose: () => void;
   fwd: ReturnType<typeof useCodexStateKit>;
   codexHome: string;
@@ -23,8 +26,11 @@ const METHODS: { mode: LoginMode; label: string; Icon: typeof Copy }[] = [
   { mode: "access", label: "Access Token", Icon: Shield },
 ];
 
-/** Signs in a new ChatGPT account; closes itself once the login succeeds. */
-export function AddAccountDialog({ open, onClose, fwd, codexHome }: AddAccountDialogProps) {
+/**
+ * Signs in a new ChatGPT account, or signs a saved one in again when its
+ * authorization expired. Closes itself once the login succeeds.
+ */
+export function AddAccountDialog({ open, target, onClose, fwd, codexHome }: AddAccountDialogProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [mode, setMode] = useState<LoginMode>("browser");
   const [refreshToken, setRefreshToken] = useState("");
@@ -32,13 +38,19 @@ export function AddAccountDialog({ open, onClose, fwd, codexHome }: AddAccountDi
   const pending = fwd.device;
   const busy = fwd.busy !== null;
   const wasPending = useRef(false);
+  const targetId = target?.accountId;
+  const targetName = target ? target.email || target.accountId : "";
 
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
-    if (open && !dialog.open) dialog.showModal();
+    if (open && !dialog.open) {
+      // An Access Token account can only be renewed with a new token.
+      setMode(target?.authMode === "chatgptAuthTokens" ? "access" : "browser");
+      dialog.showModal();
+    }
     if (!open && dialog.open) dialog.close();
-  }, [open]);
+  }, [open, target]);
 
   // A browser or device-code login finished: close when it succeeded.
   useEffect(() => {
@@ -50,7 +62,7 @@ export function AddAccountDialog({ open, onClose, fwd, codexHome }: AddAccountDi
       wasPending.current = true;
     } else if (wasPending.current) {
       wasPending.current = false;
-      if (fwd.banner?.kind === "ok") onClose();
+      if (fwd.banner && fwd.banner.kind !== "error") onClose();
     }
   }, [open, pending, fwd.banner, onClose]);
 
@@ -71,7 +83,7 @@ export function AddAccountDialog({ open, onClose, fwd, codexHome }: AddAccountDi
   const submitRefresh = async () => {
     const token = refreshToken.trim();
     if (!token) return;
-    if (await fwd.importRefreshLogin(codexHome, token)) {
+    if (await fwd.importRefreshLogin(codexHome, token, targetId)) {
       setRefreshToken("");
       onClose();
     }
@@ -80,7 +92,7 @@ export function AddAccountDialog({ open, onClose, fwd, codexHome }: AddAccountDi
   const submitAccess = async () => {
     const token = accessToken.trim();
     if (!token) return;
-    if (await fwd.importAccessLogin(codexHome, token)) {
+    if (await fwd.importAccessLogin(codexHome, token, targetId)) {
       setAccessToken("");
       onClose();
     }
@@ -102,10 +114,10 @@ export function AddAccountDialog({ open, onClose, fwd, codexHome }: AddAccountDi
       <div className="modal__surface">
         <header className="modal__header">
           <div className="section-heading">
-            <span className="section-icon"><UserPlus size={19} /></span>
+            <span className="section-icon">{target ? <KeyRound size={19} /> : <UserPlus size={19} />}</span>
             <div>
-              <h2 id="add-account-title">添加账号</h2>
-              <p>登录后自动加入账号列表并切换为当前账号</p>
+              <h2 id="add-account-title">{target ? "重新授权" : "添加账号"}</h2>
+              <p>{target ? `用 ${targetName} 重新登录，更新保存的凭据并切换为当前账号` : "登录后自动加入账号列表并切换为当前账号"}</p>
             </div>
           </div>
           <button className="modal__close" type="button" aria-label="关闭" onClick={close}>
@@ -201,7 +213,7 @@ export function AddAccountDialog({ open, onClose, fwd, codexHome }: AddAccountDi
             ) : (
               <div className="login-current">
                 <span>{mode === "browser" ? "在浏览器中登录 ChatGPT，完成后自动返回。" : "获取授权码后，在浏览器验证页输入即可。"}</span>
-                <button className="button button--primary" type="button" disabled={busy} onClick={() => void fwd.startLogin(codexHome, mode)}>
+                <button className="button button--primary" type="button" disabled={busy} onClick={() => void fwd.startLogin(codexHome, mode, targetId)}>
                   {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
                   {mode === "browser" ? "打开浏览器登录" : "获取授权码"}
                 </button>
@@ -209,7 +221,10 @@ export function AddAccountDialog({ open, onClose, fwd, codexHome }: AddAccountDi
             )}
           </div>
           <p className="panel__hint">
-            新账号会分配独立的虚拟设备，并沿用当前出站线路（登录请求也走这条线路）。凭据提交后不回显、不写日志；关闭 Kit 时还原原来的官方账号、路由和本地模型配置。
+            {target
+              ? "账号保留原来的虚拟设备和出站线路；登录请求走它自己的手动代理，订阅节点账号走当前线路。请登录同一个账号，否则会作为另一个账号保存。"
+              : "新账号会分配独立的虚拟设备，并沿用当前出站线路（登录请求也走这条线路）。已添加过的账号再次登录会直接更新它的凭据。"}
+            凭据提交后不回显、不写日志；关闭 Kit 时还原原来的官方账号、路由和本地模型配置。
           </p>
         </div>
       </div>

@@ -16,6 +16,7 @@
 //! applied the same way sub2api does.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -349,6 +350,8 @@ pub struct Catalog {
     models: HashMap<String, ModelPrice>,
     source: CatalogSource,
     sha256: String,
+    /// When the prices were downloaded from the price repo.
+    fetched_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -365,11 +368,16 @@ impl Catalog {
     }
 
     /// Accepts both the upstream LiteLLM catalog and the trimmed
-    /// `{ "source_sha256": ..., "models": { ... } }` form written by
-    /// `tools/update-bundled-prices.mjs` and the local cache.
+    /// `{ "source_sha256": ..., "fetched_at": ..., "models": { ... } }` form
+    /// written by `tools/update-bundled-prices.mjs` and the local cache.
     fn parse(bytes: &[u8], source: CatalogSource, sha256: Option<String>) -> Result<Self> {
         let value: Value = serde_json::from_slice(bytes).context("价格表不是 JSON")?;
         let object = value.as_object().context("价格表不是 JSON 对象")?;
+        let fetched_at = object
+            .get("fetched_at")
+            .and_then(Value::as_str)
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&Utc));
         let (entries, sha256) = match object.get("models").and_then(Value::as_object) {
             Some(models) => (
                 models,
@@ -397,6 +405,7 @@ impl Catalog {
             models,
             source,
             sha256: sha256.unwrap_or_default(),
+            fetched_at,
         })
     }
 
@@ -503,6 +512,8 @@ pub struct CatalogInfo {
     pub sha256: String,
     pub model_count: usize,
     pub remote_url: &'static str,
+    /// When the prices in use were downloaded from the price repo.
+    pub fetched_at: Option<String>,
     #[serde(flatten)]
     pub sync: SyncStatus,
 }
@@ -532,13 +543,30 @@ impl PriceBook {
         }
     }
 
-    /// Loads the local cache when it is valid, otherwise the bundled catalog.
+    /// Loads the newer of the local cache and the bundled catalog, which is
+    /// refreshed whenever the app is packaged: after an update the bundled
+    /// prices can be newer than a cache from an earlier run.
     pub fn load(cache_path: PathBuf) -> Self {
+        let bundled = Catalog::bundled();
         let cached = std::fs::read(&cache_path)
             .ok()
-            .and_then(|bytes| Catalog::parse(&bytes, CatalogSource::Cache, None).ok());
+            .and_then(|bytes| Catalog::parse(&bytes, CatalogSource::Cache, None).ok())
+            .map(|mut cached| {
+                // Caches written before `fetched_at` existed: use the file time.
+                if cached.fetched_at.is_none() {
+                    cached.fetched_at = std::fs::metadata(&cache_path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .map(DateTime::<Utc>::from);
+                }
+                cached
+            });
+        let catalog = match cached {
+            Some(cached) if cached.fetched_at >= bundled.fetched_at => cached,
+            _ => bundled,
+        };
         Self {
-            catalog: RwLock::new(Arc::new(cached.unwrap_or_else(Catalog::bundled))),
+            catalog: RwLock::new(Arc::new(catalog)),
             status: RwLock::default(),
             cache_path: Some(cache_path),
         }
@@ -558,6 +586,7 @@ impl PriceBook {
             sha256: catalog.sha256().to_string(),
             model_count: catalog.len(),
             remote_url: REMOTE_URL,
+            fetched_at: catalog.fetched_at.map(|at| at.to_rfc3339()),
             sync: self
                 .status
                 .read()
@@ -619,9 +648,10 @@ impl PriceBook {
             actual == remote_hash,
             "价格表 sha256 不匹配（期望 {remote_hash}，实际 {actual}）"
         );
-        let catalog = Catalog::parse(&body, CatalogSource::Remote, Some(remote_hash))?;
+        let mut catalog = Catalog::parse(&body, CatalogSource::Remote, Some(remote_hash))?;
+        catalog.fetched_at = Some(Utc::now());
         if let Some(path) = &self.cache_path {
-            if let Err(error) = write_cache(path, &body, catalog.sha256()) {
+            if let Err(error) = write_cache(path, &body, &catalog) {
                 eprintln!("[pricing] 写入价格缓存失败: {error:#}");
             }
         }
@@ -649,7 +679,7 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
 
 /// Caches only the OpenAI entries the billing code reads, in the same shape
 /// as the bundled file, so the cache stays small.
-fn write_cache(path: &std::path::Path, body: &[u8], sha256: &str) -> Result<()> {
+fn write_cache(path: &std::path::Path, body: &[u8], catalog: &Catalog) -> Result<()> {
     let value: Value = serde_json::from_slice(body)?;
     let models: Map<String, Value> = value
         .as_object()
@@ -663,7 +693,11 @@ fn write_cache(path: &std::path::Path, body: &[u8], sha256: &str) -> Result<()> 
         })
         .map(|(key, entry)| (key.clone(), entry.clone()))
         .collect();
-    let cache = serde_json::json!({ "source_sha256": sha256, "models": models });
+    let cache = serde_json::json!({
+        "source_sha256": catalog.sha256(),
+        "fetched_at": catalog.fetched_at.map(|at| at.to_rfc3339()),
+        "models": models,
+    });
     let temp = path.with_extension("json.tmp");
     std::fs::write(&temp, serde_json::to_vec(&cache)?)?;
     std::fs::rename(&temp, path)?;
@@ -867,7 +901,14 @@ mod tests {
                 "input_cost_per_token": 1e-6, "output_cost_per_token": 1e-6 }
         })
         .to_string();
-        write_cache(&path, body.as_bytes(), &"cd".repeat(32)).unwrap();
+        let mut downloaded = Catalog::parse(
+            body.as_bytes(),
+            CatalogSource::Remote,
+            Some("cd".repeat(32)),
+        )
+        .unwrap();
+        downloaded.fetched_at = Some(Utc::now());
+        write_cache(&path, body.as_bytes(), &downloaded).unwrap();
         let book = PriceBook::load(path);
         let info = book.info();
         assert_eq!(info.source, CatalogSource::Cache);
@@ -878,6 +919,31 @@ mod tests {
             per_million(catalog.resolve("gpt-5.4").unwrap().price.standard.input),
             3.0
         );
+    }
+
+    #[test]
+    fn a_cache_older_than_the_bundled_prices_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pricing.json");
+        let cache = |fetched_at: &str| {
+            serde_json::json!({
+                "source_sha256": "ef".repeat(32),
+                "fetched_at": fetched_at,
+                "models": { "gpt-5.4": {
+                    "litellm_provider": "openai", "mode": "chat",
+                    "input_cost_per_token": 3e-6, "output_cost_per_token": 1.5e-5
+                } }
+            })
+            .to_string()
+        };
+        assert!(Catalog::bundled().fetched_at.is_some());
+        std::fs::write(&path, cache("2000-01-01T00:00:00Z")).unwrap();
+        assert_eq!(
+            PriceBook::load(path.clone()).info().source,
+            CatalogSource::Bundled
+        );
+        std::fs::write(&path, cache("2999-01-01T00:00:00Z")).unwrap();
+        assert_eq!(PriceBook::load(path).info().source, CatalogSource::Cache);
     }
 
     #[test]
