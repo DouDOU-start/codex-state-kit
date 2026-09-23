@@ -12,6 +12,7 @@ import Route from "lucide-react/dist/esm/icons/route.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
 import { getBillingRecords, getBillingSummary, isTauri } from "@/lib/api";
 import { Select } from "@/components/Select";
+import { useNotify } from "@/components/Notifier";
 import type { BillingRecord, LogEntry, Status } from "@/types";
 
 interface UsageRecordsPanelProps {
@@ -127,7 +128,10 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
   const [accounts, setAccounts] = useState<[string, string][]>([]);
   /** 空字符串表示全部账号。 */
   const [accountId, setAccountId] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const { notify } = useNotify();
+  const reportError = useCallback((cause: unknown) => {
+    notify({ kind: "error", title: "读取使用记录失败", message: cause instanceof Error ? cause.message : String(cause) });
+  }, [notify]);
   const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
   const accountChosen = useRef(false);
   const requestSeq = useRef(0);
@@ -152,13 +156,12 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
       setRecords(result.records);
       setTotal(result.total);
       tableRef.current?.scrollTo({ top: 0 });
-      setError(null);
     } catch (cause) {
-      if (seq === requestSeq.current) setError(cause instanceof Error ? cause.message : String(cause));
+      if (seq === requestSeq.current) reportError(cause);
     } finally {
       if (seq === requestSeq.current) setLoading(false);
     }
-  }, []);
+  }, [reportError]);
 
   const loadAccounts = useCallback(async () => {
     try {
@@ -172,9 +175,9 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
         if (current && list.some(([id]) => id === current)) setAccountId(current);
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportError(cause);
     }
-  }, [status.currentAccountId]);
+  }, [status.currentAccountId, reportError]);
 
   useEffect(() => {
     if (active) void loadAccounts();
@@ -263,7 +266,7 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
             }}
           />
         </div>
-        {error ? <span className="usage-record-error">{error}</span> : <span>按请求开始时间排列</span>}
+        <span>按请求开始时间排列</span>
       </div>
       <div className="usage-records__table" ref={tableRef}>
         {visible.length ? (

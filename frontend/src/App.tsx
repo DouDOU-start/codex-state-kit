@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import Shield from "lucide-react/dist/esm/icons/shield.js";
-import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import Activity from "lucide-react/dist/esm/icons/activity.js";
 import Monitor from "lucide-react/dist/esm/icons/monitor.js";
 import Network from "lucide-react/dist/esm/icons/network.js";
@@ -20,6 +19,7 @@ import { PricingPanel } from "@/components/PricingPanel";
 import { AccountsPanel, accountName } from "@/components/AccountsPanel";
 import { AddAccountDialog } from "@/components/AddAccountDialog";
 import { Select } from "@/components/Select";
+import { useNotice, useNotify } from "@/components/Notifier";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
 import type { Status, LatencySample, VmIdentityView } from "@/types";
@@ -85,6 +85,23 @@ export default function App() {
   const [tab, setTab] = useState<TabId>(initialTab);
   const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
   const hydrated = useRef(false);
+  const { notify, confirm } = useNotify();
+
+  // Action results from the backend hook become themed notices.
+  useEffect(() => {
+    if (fwd.banner) notify({ kind: fwd.banner.kind, message: fwd.banner.text });
+  }, [fwd.banner, notify]);
+
+  const proxyError = fwd.status?.proxyError ?? null;
+  useNotice("proxy-error", proxyError, () => ({ kind: "error", title: "本地代理异常", message: proxyError }));
+  const attachError = fwd.status?.attachError ?? null;
+  useNotice("attach-error", attachError, () => ({ kind: "error", title: "Codex 接入失败", message: attachError }));
+  const degradedKey = fwd.status?.degraded ? fwd.status.degradedAt ?? "degraded" : null;
+  useNotice("degraded", degradedKey, () => ({
+    kind: "warn",
+    title: "检测到 312 降智信号",
+    message: fwd.status?.degradedAt ? `出现时间：${fwd.status.degradedAt}` : "上游返回了降智信号，Kit 正在重新获取 Token。",
+  }));
 
   useEffect(() => {
     if (!fwd.status || hydrated.current) return;
@@ -257,31 +274,6 @@ export default function App() {
           </div>
         </div>
 
-        {fwd.status.proxyError ? (
-          <div className="banner banner--error" role="alert">
-            <span>{fwd.status.proxyError}</span>
-          </div>
-        ) : null}
-
-        {fwd.status.attachError ? <div className="banner banner--error" role="alert">{fwd.status.attachError}</div> : null}
-
-        {fwd.banner ? (
-          <div className={`banner banner--${fwd.banner.kind}`} role="status">
-            <span>{fwd.banner.text}</span>
-            <button type="button" onClick={fwd.dismissBanner}>
-              关闭
-            </button>
-          </div>
-        ) : null}
-
-        {fwd.status.degraded ? (
-          <div className="banner banner--error" role="alert">
-            <span>
-              <TriangleAlert size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
-              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}。
-            </span>
-          </div>
-        ) : null}
 
 
         <div className="tab-panel" role="tabpanel" id="tabpanel-overview" aria-labelledby="tab-overview" hidden={tab !== "overview"}>
@@ -571,9 +563,14 @@ export default function App() {
               type="button"
               className="button button--ghost"
               disabled={fwd.busy !== null}
-              onClick={() => {
-                if (!window.confirm("重新生成 Installation ID 后，上游会把 Kit 看成一台新设备。确定继续？")) return;
-                void fwd.regenerateVmInstallation();
+              onClick={async () => {
+                const ok = await confirm({
+                  title: "换一台新机器？",
+                  message: "重新生成 Installation ID 后，上游会把当前账号看成一台新设备。",
+                  confirmText: "换新机器",
+                  danger: true,
+                });
+                if (ok) void fwd.regenerateVmInstallation();
               }}
             >
               换一台新机器

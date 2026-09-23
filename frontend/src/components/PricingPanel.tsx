@@ -3,6 +3,7 @@ import BadgeDollarSign from "lucide-react/dist/esm/icons/badge-dollar-sign.js";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import { getPricing, isTauri, syncPricing } from "@/lib/api";
 import type { ModelPriceRow, PricingCatalogInfo, PricingView } from "@/types";
+import { useNotify } from "@/components/Notifier";
 
 interface PricingPanelProps {
   /** 所在 tab 是否可见；切到该 tab 时重新读取价格表。 */
@@ -39,18 +40,17 @@ function longContextLabel(row: ModelPriceRow): string {
 export function PricingPanel({ active }: PricingPanelProps) {
   const [view, setView] = useState<PricingView | null>(null);
   const [syncing, setSyncing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { notify } = useNotify();
   const [query, setQuery] = useState("");
   const [showAll, setShowAll] = useState(false);
 
   const load = useCallback(async () => {
     try {
       setView(await getPricing());
-      setError(null);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      notify({ kind: "error", title: "读取模型价格失败", message: cause instanceof Error ? cause.message : String(cause) });
     }
-  }, []);
+  }, [notify]);
 
   useEffect(() => {
     if (active) void load();
@@ -60,9 +60,8 @@ export function PricingPanel({ active }: PricingPanelProps) {
     setSyncing(true);
     try {
       setView(await syncPricing());
-      setError(null);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      notify({ kind: "error", title: "同步模型价格失败", message: cause instanceof Error ? cause.message : String(cause) });
       void load();
     } finally {
       setSyncing(false);
@@ -77,7 +76,6 @@ export function PricingPanel({ active }: PricingPanelProps) {
   }, [view, query, showAll]);
 
   const info = view?.info;
-  const failure = error ?? info?.lastError ?? null;
 
   return (
     <div className="usage-records">
@@ -104,7 +102,7 @@ export function PricingPanel({ active }: PricingPanelProps) {
         <span>每 10 分钟比对 sub2api 价格仓库的 sha256，有变化自动下载并校验</span>
         <span>上次检查 {formatTime(info?.lastCheckedAt)}</span>
         <span>上次更新 {formatTime(info?.lastUpdatedAt)}</span>
-        {failure ? <span className="usage-record-error">同步失败：{failure}</span> : null}
+        {info?.lastError ? <span>最近一次检查失败：{info.lastError}</span> : null}
       </div>
       <div className="usage-record-filter">
         <label>

@@ -8,6 +8,7 @@ import UserPlus from "lucide-react/dist/esm/icons/user-plus.js";
 import Users from "lucide-react/dist/esm/icons/users.js";
 import X from "lucide-react/dist/esm/icons/x.js";
 import type { SavedAccount } from "@/types";
+import { useNotify } from "@/components/Notifier";
 
 interface AccountsPanelProps {
   accounts: SavedAccount[];
@@ -41,6 +42,7 @@ function shortId(accountId: string): string {
 export function AccountsPanel({ accounts, busy, onSwitch, onRemove, onRename, onAdd }: AccountsPanelProps) {
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const { confirm } = useNotify();
 
   const startEdit = (account: SavedAccount) => {
     setEditing(account.accountId);
@@ -136,8 +138,14 @@ export function AccountsPanel({ accounts, busy, onSwitch, onRemove, onRename, on
                     aria-label={`删除 ${name}`}
                     title={account.active ? "正在使用的账号不能删除" : "删除账号"}
                     disabled={account.active || busy}
-                    onClick={() => {
-                      if (window.confirm(`删除账号 ${name}？删除后需要重新登录才能再次使用。`)) onRemove(account.accountId);
+                    onClick={async () => {
+                      const ok = await confirm({
+                        title: `删除账号 ${name}？`,
+                        message: "账号的凭据、虚拟设备和出站线路绑定都会删除，之后需要重新登录才能再次使用。",
+                        confirmText: "删除",
+                        danger: true,
+                      });
+                      if (ok) onRemove(account.accountId);
                     }}
                   >
                     <Trash2 size={13} />
