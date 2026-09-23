@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "corepack pnpm dev:renderer",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "corepack pnpm icons && corepack pnpm build:renderer",
+    "beforeBuildCommand": "corepack pnpm prepare:mihomo && corepack pnpm icons && corepack pnpm build:renderer",
     "frontendDist": "../dist"
   },
   "app": {

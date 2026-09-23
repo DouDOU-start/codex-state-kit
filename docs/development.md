@@ -79,7 +79,7 @@ target/release/bundle/nsis/
 target/release/bundle/msi/
 ```
 
-构建前自动重新生成图标与前端资源。优先分发安装包；单独分发主程序时必须附带 `warp/` 与 `mihomo/` 资源目录。内核更新步骤见 [WARP 来源记录](../src-tauri/resources/warp/PROVENANCE.md) 与 [Mihomo 来源记录](../src-tauri/resources/mihomo/PROVENANCE.md)。
+构建前会下载并校验当前平台的 Mihomo 内核，再重新生成图标与前端资源。内核二进制不提交到仓库。优先分发安装包；单独分发主程序时必须附带 `warp/` 与 `mihomo/` 资源目录。内核更新步骤见 [WARP 来源记录](../src-tauri/resources/warp/PROVENANCE.md) 与 [Mihomo 来源记录](../src-tauri/resources/mihomo/PROVENANCE.md)。
 
 ## 代码结构
 

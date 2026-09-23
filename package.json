@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "tauri dev",
     "dev:renderer": "vite",
+    "prepare:mihomo": "node ./tools/prepare-mihomo.mjs",
     "build": "tauri build",
     "build:renderer": "tsc --noEmit && vite build",
     "icons": "tauri icon frontend/public/icon.svg --output src-tauri/icons && node -e \"require('node:fs').copyFileSync('src-tauri/icons/icon.png', 'src-tauri/icons/source.png')\"",

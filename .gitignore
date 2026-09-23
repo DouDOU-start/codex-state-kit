@@ -14,3 +14,7 @@
 .vscode/
 *.key
 *.password
+
+# Mihomo 内核在打包时下载，不提交二进制。
+src-tauri/resources/mihomo/mihomo.exe
+src-tauri/resources/mihomo/mihomo
