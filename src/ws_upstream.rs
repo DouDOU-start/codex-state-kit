@@ -101,19 +101,20 @@ impl WsUpstreamPool {
     pub async fn resolve_proxy(&self, template: &str, bound: Option<&str>) -> Result<String> {
         let template = template.trim();
         if !fetch::has_session_placeholder(template) {
-            return Ok(fetch::outbound_proxy_for_client(template));
+            return Ok(fetch::dial_proxy_for_client(template));
         }
         if let Some(session) = bound.map(str::trim).filter(|value| !value.is_empty()) {
-            return Ok(fetch::outbound_proxy_for_client(
-                &fetch::apply_bound_session(template, Some(session))?,
-            ));
+            return Ok(fetch::dial_proxy_for_client(&fetch::apply_bound_session(
+                template,
+                Some(session),
+            )?));
         }
         let mut guard = self.inner.lock().await;
         if guard.sticky_session.is_none() {
             guard.sticky_session = Some(fetch::generate_proxy_session());
         }
         let session = guard.sticky_session.clone().context("缺少代理 session")?;
-        Ok(fetch::outbound_proxy_for_client(
+        Ok(fetch::dial_proxy_for_client(
             &fetch::replace_session_placeholder(template, &session),
         ))
     }

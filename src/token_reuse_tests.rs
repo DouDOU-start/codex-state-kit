@@ -97,6 +97,7 @@ fn patch(settings: &Settings, policy: TokenReusePolicy) -> SettingsPatch {
         mihomo_subscription: String::new(),
         mihomo_node: String::new(),
         ws_upstream_enabled: settings.ws_upstream_enabled,
+        chain_system_proxy: settings.chain_system_proxy,
     }
 }
 

@@ -79,6 +79,10 @@ pub struct Settings {
     /// 业务请求优先走上游 WebSocket。握手失败时仍回退 HTTP SSE。
     #[serde(default = "default_ws_upstream_enabled")]
     pub ws_upstream_enabled: bool,
+    /// Reach the manual proxy through the OS system proxy when one is set
+    /// (Clash with only the system proxy on). See `system_proxy`.
+    #[serde(default = "default_chain_system_proxy")]
+    pub chain_system_proxy: bool,
 }
 
 impl Default for Settings {
@@ -100,6 +104,7 @@ impl Default for Settings {
             mihomo_subscription: String::new(),
             mihomo_node: String::new(),
             ws_upstream_enabled: default_ws_upstream_enabled(),
+            chain_system_proxy: default_chain_system_proxy(),
         }
     }
 }
@@ -144,6 +149,10 @@ fn default_token_prefetch_age_mins() -> u32 {
 }
 
 fn default_ws_upstream_enabled() -> bool {
+    true
+}
+
+fn default_chain_system_proxy() -> bool {
     true
 }
 
@@ -208,6 +217,10 @@ pub struct SettingsPatch {
     pub mihomo_node: String,
     #[serde(default = "default_ws_upstream_enabled")]
     pub ws_upstream_enabled: bool,
+    /// Reach the manual proxy through the OS system proxy when one is set
+    /// (Clash with only the system proxy on). See `system_proxy`.
+    #[serde(default = "default_chain_system_proxy")]
+    pub chain_system_proxy: bool,
 }
 
 impl SettingsPatch {
@@ -236,6 +249,7 @@ impl SettingsPatch {
             )?,
             mihomo_node: normalize_mihomo_text(&self.mihomo_node, 128, "节点名")?,
             ws_upstream_enabled: self.ws_upstream_enabled,
+            chain_system_proxy: self.chain_system_proxy,
         };
         if settings.proxy_listen.is_empty()
             || settings.upstream.is_empty()
@@ -480,6 +494,7 @@ mod tests {
             mihomo_subscription: String::new(),
             mihomo_node: String::new(),
             ws_upstream_enabled: true,
+            chain_system_proxy: true,
         }
         .into_settings()
         .unwrap();

@@ -45,6 +45,7 @@ function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): Sett
     forcedModel: status.forcedModel ?? "",
     models: status.configuredModels,
     wsUpstreamEnabled: status.wsUpstreamEnabled !== false,
+    chainSystemProxy: status.chainSystemProxy !== false,
     ...overrides,
   };
 }
@@ -508,6 +509,20 @@ export function useCodexStateKit() {
     }
   }, []);
 
+  const setChainSystemProxy = useCallback(async (enabled: boolean) => {
+    setBusy("save");
+    try {
+      const latest = await getStatus();
+      const next = await setConfig(patchFrom(latest, { chainSystemProxy: enabled }));
+      setStatus(next);
+      setBanner({ kind: "ok", text: enabled ? "手动代理将经系统代理连接（检测到时）" : "手动代理改为直连" });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
   const saveVmIdentity = useCallback(async (profile: VmProfile) => {
     setBusy("save");
     try {
@@ -614,6 +629,7 @@ export function useCodexStateKit() {
     probeMihomoGroup,
     probeAllMihomo,
     setWsUpstreamEnabled,
+    setChainSystemProxy,
     saveVmIdentity,
     regenerateVmInstallation,
     detectVmVersion,

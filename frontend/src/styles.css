@@ -503,3 +503,9 @@ input[type="checkbox"]:disabled { opacity: .5; cursor: not-allowed; }
 .binding-note { display: flex; align-items: center; gap: 6px; margin: -4px 0 12px; padding: 7px 10px; border: 1px solid #d4e2f2; border-radius: 8px; color: var(--text-soft); background: var(--accent-soft); font-size: 10px; }
 .binding-note svg { color: var(--accent); }
 .binding-note strong { color: var(--accent-strong); font-weight: 650; }
+.system-proxy { display: grid; gap: 6px; margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #f8fafc; }
+.system-proxy__toggle { display: inline-flex; align-items: center; gap: 8px; color: var(--text); font-size: 11px; font-weight: 600; cursor: pointer; }
+.system-proxy__state { color: var(--muted); font-size: 10px; }
+.system-proxy__state--on { color: var(--green); }
+.system-proxy p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.7; }
+.system-proxy .system-proxy__error { color: var(--red); }

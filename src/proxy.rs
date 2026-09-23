@@ -319,6 +319,9 @@ pub struct Status {
     pub diag_log_path: String,
     pub vm_identity: identity::VmIdentityView,
     pub ws_upstream_enabled: bool,
+    pub chain_system_proxy: bool,
+    /// Detected OS system proxy and the relay's last error.
+    pub system_proxy: crate::system_proxy::SystemProxyView,
     pub ws_upstream_connected: bool,
     pub ws_upstream_connected_at: Option<String>,
 }
@@ -386,6 +389,7 @@ impl App {
     }
 
     pub fn with_mihomo(settings: Settings, mihomo: MihomoRuntime) -> Result<Self> {
+        crate::system_proxy::set_enabled(settings.chain_system_proxy);
         let business_proxy = resolved_proxy(&settings, &mihomo);
         let http = pooled_upstream(business_proxy_key(&business_proxy, None)?)?;
         let billing_path = crate::home_dir().join(if cfg!(debug_assertions) {
@@ -648,6 +652,10 @@ impl App {
             diag_log_path: diag::path().display().to_string(),
             vm_identity: self.vm_identity.lock().await.view(),
             ws_upstream_enabled: settings.ws_upstream_enabled,
+            chain_system_proxy: settings.chain_system_proxy,
+            system_proxy: tokio::task::spawn_blocking(crate::system_proxy::view)
+                .await
+                .unwrap_or_else(|_| crate::system_proxy::view()),
             ws_upstream_connected: ws.connected,
             ws_upstream_connected_at: ws.connected_at,
         }
@@ -1926,6 +1934,7 @@ impl ProxyHandle {
                 self.app.mihomo.stop().await;
             }
         }
+        crate::system_proxy::set_enabled(next.chain_system_proxy);
         {
             let mut settings = self.app.settings.lock().await;
             *settings = next.clone();
@@ -2756,7 +2765,7 @@ fn upstream_http_client(proxy: &str) -> Result<reqwest::Client> {
         .no_gzip()
         .no_zstd();
     if !proxy.is_empty() {
-        let proxy = reqwest::Proxy::all(fetch::outbound_proxy_for_client(&proxy))
+        let proxy = reqwest::Proxy::all(fetch::dial_proxy_for_client(&proxy))
             .map_err(|_| anyhow::anyhow!("上游转发代理地址无效"))?;
         builder = builder.proxy(proxy);
     }
@@ -3302,7 +3311,7 @@ fn ws_dial(
     }
     Ok(WsDial {
         url,
-        proxy: fetch::outbound_proxy_for_client(proxy),
+        proxy: fetch::dial_proxy_for_client(proxy),
         authorization: header_string(headers, "authorization"),
         account_id: header_string(headers, "chatgpt-account-id"),
         extra_headers,

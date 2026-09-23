@@ -14,6 +14,7 @@ pub mod mihomo;
 pub mod pricing;
 pub mod proxy;
 pub mod settings;
+pub mod system_proxy;
 pub mod traffic;
 pub mod turn_state;
 pub mod update;

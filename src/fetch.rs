@@ -52,6 +52,13 @@ pub fn outbound_proxy_for_client(raw: &str) -> String {
     }
 }
 
+/// The proxy URL to actually connect with: [`outbound_proxy_for_client`],
+/// then routed through the system-proxy relay (see [`crate::system_proxy`]).
+/// Use [`outbound_proxy_for_client`] for display and logs.
+pub fn dial_proxy_for_client(raw: &str) -> String {
+    crate::system_proxy::route(&outbound_proxy_for_client(raw))
+}
+
 pub fn has_session_placeholder(raw: &str) -> bool {
     raw.contains(SESSION_PLACEHOLDER_LC) || raw.contains(SESSION_PLACEHOLDER_UC)
 }
@@ -174,7 +181,7 @@ pub fn http_client(outbound_proxy: &str) -> Result<reqwest::Client> {
         .redirect(reqwest::redirect::Policy::none())
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(4);
-    let proxy = outbound_proxy_for_client(outbound_proxy);
+    let proxy = dial_proxy_for_client(outbound_proxy);
     if !proxy.is_empty() {
         builder = builder.proxy(reqwest::Proxy::all(&proxy).context("出站代理")?);
     }

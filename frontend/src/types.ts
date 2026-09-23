@@ -136,6 +136,15 @@ export interface Status {
   wsUpstreamEnabled: boolean;
   wsUpstreamConnected: boolean;
   wsUpstreamConnectedAt?: string | null;
+  chainSystemProxy?: boolean;
+  systemProxy?: SystemProxyView;
+}
+
+export interface SystemProxyView {
+  enabled: boolean;
+  /** e.g. "HTTP 127.0.0.1:7897" */
+  detected?: string | null;
+  lastError?: string | null;
 }
 
 export interface SettingsPatch {
@@ -155,6 +164,7 @@ export interface SettingsPatch {
   mihomoSubscription: string;
   mihomoNode: string;
   wsUpstreamEnabled?: boolean;
+  chainSystemProxy?: boolean;
 }
 
 export type TokenReusePolicy = "shared_292" | "per_model";

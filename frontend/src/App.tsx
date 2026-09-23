@@ -401,6 +401,26 @@ export default function App() {
             />
           </label>
           <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。可把出口写成 {'{session}'}，打票时自动轮换；拿到稳定 292 后绑定该 session，业务也走同一条线路。</p>
+          <div className="system-proxy">
+            <label className="system-proxy__toggle">
+              <input
+                type="checkbox"
+                checked={fwd.status.chainSystemProxy !== false}
+                disabled={fwd.busy !== null}
+                onChange={(event) => void fwd.setChainSystemProxy(event.target.checked)}
+              />
+              经系统代理连接代理服务器
+            </label>
+            <span className={fwd.status.systemProxy?.detected ? "system-proxy__state system-proxy__state--on" : "system-proxy__state"}>
+              {fwd.status.chainSystemProxy === false
+                ? "已关闭，直连代理服务器"
+                : fwd.status.systemProxy?.detected
+                  ? `检测到系统代理 ${fwd.status.systemProxy.detected}`
+                  : "未检测到系统代理，直连代理服务器"}
+            </span>
+            <p>适用于 Clash Verge 等只开了系统代理、没开 TUN 的情况：代理服务器需要翻墙才能连上时，Kit 会先经系统代理再连到它。开关 Clash 的系统代理后自动跟随，无需重启。</p>
+            {fwd.status.systemProxy?.lastError ? <p className="system-proxy__error">{fwd.status.systemProxy.lastError}</p> : null}
+          </div>
           <div className="latency-row">
             <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null} onClick={() => void fwd.probeLatency("manual", outboundProxy)}>
               {fwd.probing === "manual" ? "测试中" : "测延迟"}

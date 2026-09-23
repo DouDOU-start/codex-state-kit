@@ -91,6 +91,8 @@ const defaultStatus = (): Status => ({
   wsUpstreamEnabled: true,
   wsUpstreamConnected: false,
   wsUpstreamConnectedAt: null,
+  chainSystemProxy: true,
+  systemProxy: { enabled: true, detected: "HTTP 127.0.0.1:7897", lastError: null },
   logs: [{
     id: 1,
     accountId: "mock-account-a",
@@ -286,6 +288,8 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
     forcedModel: settings.forcedModel,
     configuredModels: settings.models,
     wsUpstreamEnabled: settings.wsUpstreamEnabled !== false,
+    chainSystemProxy: settings.chainSystemProxy !== false,
+    systemProxy: { ...(mockStatus.systemProxy ?? { detected: null, lastError: null }), enabled: settings.chainSystemProxy !== false },
     proxyOk: true,
   };
   mockConfig.codexHome = settings.codexHome;

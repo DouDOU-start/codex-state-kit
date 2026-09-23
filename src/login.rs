@@ -161,6 +161,7 @@ enum ResolvedAuthMode {
 
 pub fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
+        .proxy(crate::system_proxy::reqwest_proxy())
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
@@ -170,6 +171,7 @@ pub fn http_client() -> Result<reqwest::Client> {
 /// RT 换票请求携带长期凭据，禁止跟随重定向，避免请求体被转发到其他来源。
 pub fn token_import_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
+        .proxy(crate::system_proxy::reqwest_proxy())
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()
