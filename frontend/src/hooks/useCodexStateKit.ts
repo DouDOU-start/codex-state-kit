@@ -6,10 +6,7 @@ import {
   importChatgptAccessToken,
   importChatgptRefreshToken,
   pollChatgptLogin,
-  refreshTurnState,
   setConfig,
-  setBoundTokenLen,
-  setModelBoundTokenLen,
   openUrl,
   startChatgptLogin,
   probeOutboundLatency,
@@ -25,7 +22,7 @@ import {
   renameAccount,
   switchAccount,
 } from "@/lib/api";
-import type { SavedAccount, Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy, SettingsPatch, ProbeKind, LatencyReport, VmProfile } from "@/types";
+import type { SavedAccount, Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, SettingsPatch, ProbeKind, LatencyReport, VmProfile } from "@/types";
 
 function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): SettingsPatch {
   return {
@@ -36,14 +33,7 @@ function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): Sett
     outboundMode: status.outboundMode,
     mihomoSubscription: status.mihomoSubscription ?? "",
     mihomoNode: status.mihomoNode ?? "",
-    stateMissPolicy: status.stateMissPolicy,
-    tokenReusePolicy: status.tokenReusePolicy,
-    stateFetchModel: status.stateFetchModel ?? "",
-    tokenFetchPaused: status.tokenFetchPaused ?? false,
-    tokenMaxAgeMins: status.tokenMaxAgeMins ?? 40,
-    tokenPrefetchAgeMins: status.tokenPrefetchAgeMins ?? 35,
     forcedModel: status.forcedModel ?? "",
-    models: status.configuredModels,
     wsUpstreamEnabled: status.wsUpstreamEnabled !== false,
     chainSystemProxy: status.chainSystemProxy !== false,
     ...overrides,
@@ -257,68 +247,6 @@ export function useCodexStateKit() {
     }
   }, []);
 
-  const setStateMissPolicy = useCallback(async (stateMissPolicy: StateMissPolicy) => {
-    setBusy("save");
-    try {
-      const latest = await getStatus();
-      const next = await setConfig(patchFrom(latest, { stateMissPolicy }));
-      setStatus(next);
-      setBanner({ kind: "ok", text: "State 处理策略已保存。" });
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-    } finally {
-      setBusy(null);
-    }
-  }, []);
-
-  const setTokenReusePolicy = useCallback(async (tokenReusePolicy: TokenReusePolicy) => {
-    setBusy("save");
-    try {
-      const latest = await getStatus();
-      const next = await setConfig(patchFrom(latest, { tokenReusePolicy }));
-      setStatus(next);
-      setBanner({ kind: "ok", text: tokenReusePolicy === "shared_292"
-        ? "已启用跨模型复用 292，同账号共享有效票据。"
-        : "已恢复按模型独立，各模型分别获取和复用 Token。" });
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-    } finally {
-      setBusy(null);
-    }
-  }, []);
-
-  const saveStateFetchModel = useCallback(async (stateFetchModel: string) => {
-    setBusy("save");
-    try {
-      const latest = await getStatus();
-      const next = await setConfig(patchFrom(latest, { stateFetchModel: stateFetchModel.trim() }));
-      setStatus(next);
-      setBanner({ kind: "ok", text: next.tokenReusePolicy === "shared_292" && next.stateFetchModel
-        ? `跨模型复用只使用 ${next.stateFetchModel} 获取 292。`
-        : "已取消指定取票模型，292 会从可用模型中获取。" });
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-    } finally {
-      setBusy(null);
-    }
-  }, []);
-
-  const setTokenFetchPaused = useCallback(async (tokenFetchPaused: boolean) => {
-    setBusy("save");
-    try {
-      const latest = await getStatus();
-      const next = await setConfig(patchFrom(latest, { tokenFetchPaused }));
-      setStatus(next);
-      setBanner({ kind: "ok", text: tokenFetchPaused
-        ? "已暂停获取 Token，后台不再打票。已缓存的 Token 仍可注入。"
-        : "已继续获取 Token。" });
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-    } finally {
-      setBusy(null);
-    }
-  }, []);
-
   const saveForcedModel = useCallback(async (forcedModel: string) => {
     setBusy("save");
     try {
@@ -371,24 +299,6 @@ export function useCodexStateKit() {
       setProbingGroup(null);
     }
   }, [status]);
-
-  const refetchTurnState = useCallback(async () => {
-    setBusy("refresh");
-    try {
-      const next = await refreshTurnState();
-      setStatus(next);
-      setBanner({ kind: "ok", text: "已重新获取 Token。" });
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-      try {
-        setStatus(await getStatus());
-      } catch {
-        // keep previous status
-      }
-    } finally {
-      setBusy(null);
-    }
-  }, []);
 
   const startLogin = useCallback(async (home: string, method: LoginMethod) => {
     setBusy("login");
@@ -581,26 +491,6 @@ export function useCodexStateKit() {
     }
   }, []);
 
-  const bindTokenLen = useCallback(async (len: number | null) => {
-    try {
-      const next = await setBoundTokenLen(len);
-      setStatus(next);
-      setBanner({ kind: "ok", text: len ? `已全局绑定 ${len} Token` : "已恢复账号默认绑定" });
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-    }
-  }, []);
-
-  const bindModelTokenLen = useCallback(async (model: string, len: number | null) => {
-    try {
-      const next = await setModelBoundTokenLen(model, len);
-      setStatus(next);
-      setBanner({ kind: "ok", text: len ? `${model} 已绑定 ${len} Token` : `${model} 已恢复跟随全局` });
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-    }
-  }, []);
-
   return {
     status,
     login,
@@ -615,12 +505,7 @@ export function useCodexStateKit() {
     refresh,
     saveSettings,
     saveMihomo,
-    setStateMissPolicy,
-    setTokenReusePolicy,
-    saveStateFetchModel,
-    setTokenFetchPaused,
     saveForcedModel,
-    refetchTurnState,
     probing,
     probingGroup,
     latency,
@@ -640,8 +525,6 @@ export function useCodexStateKit() {
     cancelLogin,
     openLoginPage,
     loadLogin,
-    bindTokenLen,
-    bindModelTokenLen,
     dismissBanner: () => setBanner(null),
   };
 }

@@ -13,9 +13,8 @@
 | `login::request_credentials` 能取得实际选用凭据的 `account_id`；`proxy::forward_http_tracked` 会将账号写入网络日志。 | 以**选用的凭据**作为账号归属依据，不以客户端可填的 `ChatGPT-Account-ID` 请求头或邮箱作主键。计费开启后，若请求头与凭据不一致，需在发送前纠正或拒绝，避免错账。 |
 | `logs::ResponseBodyMetrics` 已旁路解析 SSE/JSON，含 gzip、deflate、zstd 支持，但当前只提取 `output_tokens`。 | 扩充为完整用量快照：`input_tokens`、`output_tokens`、`input_tokens_details.cached_tokens` 等。解析仍只读取上游元数据，不收集响应正文。 |
 | `proxy::ResponseLogTracker` 能获知完成、错误、客户端取消；网络日志保存在容量有限的内存队列。 | 在独立的计费服务中落库；不要复用网络日志的自增 ID、内存队列或设置 JSON。 |
-| 后台 `fetch_turn_state_with_cookies` 及 `validate_carried_ticket` 也会向上游发送 `/responses` 请求。 | 作为 `token_fetch`、`reverify` 两类内部请求单独记录。若它们有用量，应归到相同上游账号；界面展示业务和内部请求的各自小计。 |
 
-当前内部取票与复验也会在发送前创建 `pending`，完成后因暂时没有可采信的 provider usage 而结算为 `missing_usage`；探针任务被取消或进程重启时会恢复为 `interrupted`。后续若探针协议能稳定返回 usage，再复用同一结算路径计算内部成本。
+旧版的后台取票请求曾以 `token_fetch`、`reverify` 来源记账；取票机制已移除，这些历史记录保留在数据库中，仍计入账号总计。
 
 ## 数据存储
 
@@ -83,7 +82,7 @@ CREATE INDEX usage_by_state_time ON usage_records(state, started_at);
 
 1. 建立 SQLite 存储层、迁移、账号归属与请求开始记录；验证切换 A→B 后旧请求结束仍归 A，重启后 A/B 历史仍可查。
 2. 扩充 SSE/JSON 用量解析和 `ResponseLogTracker` 结算；覆盖分块/压缩响应、重复终态、缺用量、断流、客户端取消和崩溃恢复。
-3. 接入内部取票及复验请求，分别统计；配置价格规则，验证改价不改历史、未知价不记 0。
+3. 配置价格规则，验证改价不改历史、未知价不记 0。
 4. 增加查询命令和界面，再用真实响应样本核对聚合值与逐笔记录。
 
 ## 参考

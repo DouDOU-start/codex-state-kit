@@ -26,28 +26,6 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum StateMissPolicy {
-    #[default]
-    Preserve,
-    Wait,
-    Strip,
-    Passthrough,
-    #[serde(rename = "strip_all")]
-    StripAll,
-}
-
-/// 仅同账号内共享精确 292 字节的 Turn-State，其他绑定长度保持模型隔离。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TokenReusePolicy {
-    #[default]
-    #[serde(rename = "shared_292")]
-    Shared292,
-    PerModel,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -57,19 +35,7 @@ pub struct Settings {
     pub outbound_proxy: String,
     #[serde(default, deserialize_with = "deserialize_outbound_mode")]
     pub outbound_mode: OutboundMode,
-    pub models: Vec<String>,
-    pub state_miss_policy: StateMissPolicy,
-    pub token_reuse_policy: TokenReusePolicy,
-    /// 跨模型复用 292 时，只向这个模型索取共享票据。空字符串表示不指定。
-    #[serde(default)]
-    pub state_fetch_model: String,
     pub forced_model: String,
-    #[serde(default)]
-    pub token_fetch_paused: bool,
-    #[serde(default = "default_token_max_age_mins")]
-    pub token_max_age_mins: u32,
-    #[serde(default = "default_token_prefetch_age_mins")]
-    pub token_prefetch_age_mins: u32,
     /// Clash / Mihomo 订阅 URL、本地文件，或分享链接正文。
     #[serde(default)]
     pub mihomo_subscription: String,
@@ -93,14 +59,7 @@ impl Default for Settings {
             codex_home: home_dir().join(".codex").display().to_string(),
             outbound_proxy: String::new(),
             outbound_mode: OutboundMode::Manual,
-            models: vec![],
-            state_miss_policy: StateMissPolicy::Preserve,
-            token_reuse_policy: TokenReusePolicy::default(),
-            state_fetch_model: String::new(),
             forced_model: String::new(),
-            token_fetch_paused: false,
-            token_max_age_mins: default_token_max_age_mins(),
-            token_prefetch_age_mins: default_token_prefetch_age_mins(),
             mihomo_subscription: String::new(),
             mihomo_node: String::new(),
             ws_upstream_enabled: default_ws_upstream_enabled(),
@@ -114,38 +73,6 @@ impl Settings {
         let model = self.forced_model.trim();
         (!model.is_empty()).then_some(model)
     }
-
-    pub fn state_fetch_model(&self) -> Option<&str> {
-        let model = self.state_fetch_model.trim();
-        (!model.is_empty()).then_some(model)
-    }
-
-    /// 跨模型复用时指定唯一的 292 取票模型。未指定，或当前不是共享策略时，不限制供体。
-    pub fn shared_state_donor(&self) -> Option<&str> {
-        if self.token_reuse_policy != TokenReusePolicy::Shared292 {
-            return None;
-        }
-        self.state_fetch_model()
-    }
-
-    pub fn token_max_age_secs(&self) -> i64 {
-        i64::from(self.token_max_age_mins) * 60
-    }
-
-    pub fn token_prefetch_age_secs(&self) -> i64 {
-        i64::from(self.token_prefetch_age_mins) * 60
-    }
-}
-
-pub const DEFAULT_TOKEN_MAX_AGE_MINS: u32 = 40;
-pub const DEFAULT_TOKEN_PREFETCH_AGE_MINS: u32 = 35;
-
-fn default_token_max_age_mins() -> u32 {
-    DEFAULT_TOKEN_MAX_AGE_MINS
-}
-
-fn default_token_prefetch_age_mins() -> u32 {
-    DEFAULT_TOKEN_PREFETCH_AGE_MINS
 }
 
 fn default_ws_upstream_enabled() -> bool {
@@ -162,13 +89,6 @@ fn normalize_mihomo_text(raw: &str, max_len: usize, label: &str) -> Result<Strin
         bail!("{label}过长");
     }
     Ok(value.to_string())
-}
-
-fn normalize_token_lifetime(max_age_mins: u32, prefetch_age_mins: u32) -> Result<(u32, u32)> {
-    if prefetch_age_mins >= max_age_mins {
-        bail!("预取时间必须早于过期时间");
-    }
-    Ok((max_age_mins, prefetch_age_mins))
 }
 
 /// 开发环境用 8788，打包版用 8787，互不冲突
@@ -196,21 +116,7 @@ pub struct SettingsPatch {
     #[serde(default, deserialize_with = "deserialize_outbound_mode")]
     pub outbound_mode: OutboundMode,
     #[serde(default)]
-    pub models: Vec<String>,
-    #[serde(default)]
-    pub state_miss_policy: StateMissPolicy,
-    #[serde(default)]
-    pub token_reuse_policy: TokenReusePolicy,
-    #[serde(default)]
-    pub state_fetch_model: String,
-    #[serde(default)]
     pub forced_model: String,
-    #[serde(default)]
-    pub token_fetch_paused: bool,
-    #[serde(default = "default_token_max_age_mins")]
-    pub token_max_age_mins: u32,
-    #[serde(default = "default_token_prefetch_age_mins")]
-    pub token_prefetch_age_mins: u32,
     #[serde(default)]
     pub mihomo_subscription: String,
     #[serde(default)]
@@ -225,23 +131,13 @@ pub struct SettingsPatch {
 
 impl SettingsPatch {
     pub fn into_settings(self) -> Result<Settings> {
-        let models = self.models;
-        let lifetime =
-            normalize_token_lifetime(self.token_max_age_mins, self.token_prefetch_age_mins)?;
         let settings = Settings {
             proxy_listen: self.proxy_listen.trim().to_string(),
             upstream: self.upstream.trim().to_string(),
             codex_home: self.codex_home.trim().to_string(),
             outbound_proxy: normalize_outbound_proxy(&self.outbound_proxy)?,
             outbound_mode: self.outbound_mode,
-            models,
-            state_miss_policy: self.state_miss_policy,
-            token_reuse_policy: self.token_reuse_policy,
-            state_fetch_model: normalize_model_id(&self.state_fetch_model, "取 State 的模型")?,
             forced_model: normalize_forced_model(&self.forced_model)?,
-            token_fetch_paused: self.token_fetch_paused,
-            token_max_age_mins: lifetime.0,
-            token_prefetch_age_mins: lifetime.1,
             mihomo_subscription: normalize_mihomo_text(
                 &self.mihomo_subscription,
                 8192,
@@ -355,61 +251,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_policy_defaults_and_round_trips_without_losing_other_settings() {
-        assert_eq!(
-            settings_from_json("{}").unwrap().state_miss_policy,
-            StateMissPolicy::Preserve
-        );
-        for (name, policy) in [
-            ("preserve", StateMissPolicy::Preserve),
-            ("wait", StateMissPolicy::Wait),
-            ("strip", StateMissPolicy::Strip),
-            ("passthrough", StateMissPolicy::Passthrough),
-            ("strip_all", StateMissPolicy::StripAll),
-        ] {
-            let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
-                "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
-                "stateMissPolicy":name, "models":["test-model"], "outboundProxy":"http://127.0.0.1:7890"
-            })).unwrap();
-            let settings = patch.into_settings().unwrap();
-            let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
-            assert_eq!(loaded.state_miss_policy, policy);
-            assert_eq!(loaded.models, ["test-model"]);
-            assert_eq!(loaded.outbound_proxy, "http://127.0.0.1:7890");
-        }
-        assert!(serde_json::from_value::<StateMissPolicy>(serde_json::json!("unknown")).is_err());
-    }
-
-    #[test]
-    fn token_reuse_policy_defaults_and_round_trips() {
-        assert_eq!(
-            Settings::default().token_reuse_policy,
-            TokenReusePolicy::Shared292
-        );
-        let legacy =
-            settings_from_json(r#"{"models":["a","b"],"outbound_mode":"manual"}"#).unwrap();
-        assert_eq!(legacy.token_reuse_policy, TokenReusePolicy::Shared292);
-        assert_eq!(legacy.models, ["a", "b"]);
-        for (name, policy) in [
-            ("shared_292", TokenReusePolicy::Shared292),
-            ("per_model", TokenReusePolicy::PerModel),
-        ] {
-            let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
-                "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
-                "tokenReusePolicy":name, "stateMissPolicy":"wait", "models":["a","b"]
-            })).unwrap();
-            let settings = patch.into_settings().unwrap();
-            let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
-            assert_eq!(loaded.token_reuse_policy, policy);
-            assert_eq!(loaded.state_miss_policy, StateMissPolicy::Wait);
-            assert_eq!(loaded.models, ["a", "b"]);
-        }
-        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
-            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test"
-        }))
+    fn settings_saved_with_turn_state_options_still_load() {
+        let legacy = settings_from_json(
+            r#"{"models":["a"],"state_miss_policy":"wait","token_reuse_policy":"shared_292","state_fetch_model":"a","token_fetch_paused":true,"token_max_age_mins":20,"token_prefetch_age_mins":10,"outbound_proxy":"http://127.0.0.1:7890","forced_model":"gpt-6-astra"}"#,
+        )
         .unwrap();
-        assert_eq!(patch.token_reuse_policy, TokenReusePolicy::Shared292);
-        assert!(serde_json::from_str::<TokenReusePolicy>("\"unknown\"").is_err());
+        assert_eq!(legacy.outbound_proxy, "http://127.0.0.1:7890");
+        assert_eq!(legacy.forced_model(), Some("gpt-6-astra"));
+        let saved = serde_json::to_string(&legacy).unwrap();
+        assert!(!saved.contains("state_miss_policy"));
+        assert!(!saved.contains("token_max_age_mins"));
     }
 
     #[test]
@@ -478,19 +329,12 @@ mod tests {
     #[test]
     fn patch_keeps_optional_proxy() {
         let settings = SettingsPatch {
-            token_reuse_policy: TokenReusePolicy::default(),
-            state_fetch_model: String::new(),
-            state_miss_policy: StateMissPolicy::Preserve,
             proxy_listen: "127.0.0.1:8787".into(),
             upstream: "https://chatgpt.com/backend-api/codex".into(),
             codex_home: "/tmp/codex".into(),
             outbound_proxy: "socks5://127.0.0.1:1080".into(),
             outbound_mode: OutboundMode::Manual,
-            models: vec![],
             forced_model: String::new(),
-            token_fetch_paused: false,
-            token_max_age_mins: DEFAULT_TOKEN_MAX_AGE_MINS,
-            token_prefetch_age_mins: DEFAULT_TOKEN_PREFETCH_AGE_MINS,
             mihomo_subscription: String::new(),
             mihomo_node: String::new(),
             ws_upstream_enabled: true,
@@ -532,30 +376,6 @@ mod tests {
         assert_eq!(loaded.forced_model(), Some("gpt-6-astra"));
         assert!(normalize_forced_model("gpt 6").is_err());
         assert!(normalize_forced_model(&"m".repeat(81)).is_err());
-    }
-
-    #[test]
-    fn state_fetch_model_defaults_and_only_pins_shared_292() {
-        assert!(Settings::default().shared_state_donor().is_none());
-        assert!(settings_from_json("{}")
-            .unwrap()
-            .state_fetch_model()
-            .is_none());
-        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
-            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
-            "stateFetchModel":" gpt-5.5 ", "tokenReusePolicy":"shared_292"
-        }))
-        .unwrap();
-        let settings = patch.into_settings().unwrap();
-        assert_eq!(settings.shared_state_donor(), Some("gpt-5.5"));
-        let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
-        assert_eq!(loaded.shared_state_donor(), Some("gpt-5.5"));
-        let mut per_model = loaded.clone();
-        per_model.token_reuse_policy = TokenReusePolicy::PerModel;
-        assert!(per_model.shared_state_donor().is_none());
-        assert_eq!(per_model.state_fetch_model(), Some("gpt-5.5"));
-        assert!(normalize_model_id("gpt 5.5", "取 State 的模型").is_err());
-        assert!(normalize_model_id(&"m".repeat(81), "取 State 的模型").is_err());
     }
 
     #[test]
@@ -606,74 +426,5 @@ mod tests {
         assert_eq!(saved.outbound_mode, OutboundMode::Manual);
         assert_eq!(saved.outbound_proxy, "socks5://localhost:1080");
         assert!(serde_json::from_str::<OutboundMode>("\"unknown\"").is_err());
-    }
-
-    #[test]
-    fn token_fetch_paused_defaults_and_round_trips() {
-        assert!(!Settings::default().token_fetch_paused);
-        assert!(!settings_from_json("{}").unwrap().token_fetch_paused);
-        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
-            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
-            "tokenFetchPaused":true
-        }))
-        .unwrap();
-        let settings = patch.into_settings().unwrap();
-        assert!(settings.token_fetch_paused);
-        let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
-        assert!(loaded.token_fetch_paused);
-        let omitted: SettingsPatch = serde_json::from_value(serde_json::json!({
-            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test"
-        }))
-        .unwrap();
-        assert!(!omitted.token_fetch_paused);
-    }
-
-    #[test]
-    fn token_lifetime_defaults_and_rejects_invalid_windows() {
-        let defaults = Settings::default();
-        assert_eq!(defaults.token_max_age_mins, 40);
-        assert_eq!(defaults.token_prefetch_age_mins, 35);
-        assert_eq!(defaults.token_max_age_secs(), 2400);
-        assert_eq!(defaults.token_prefetch_age_secs(), 2100);
-        let omitted = settings_from_json("{}").unwrap();
-        assert_eq!(omitted.token_max_age_mins, 40);
-        assert_eq!(omitted.token_prefetch_age_mins, 35);
-        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
-            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
-            "tokenMaxAgeMins":20, "tokenPrefetchAgeMins":10
-        }))
-        .unwrap();
-        let settings = patch.into_settings().unwrap();
-        assert_eq!(settings.token_max_age_mins, 20);
-        assert_eq!(settings.token_prefetch_age_mins, 10);
-        let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
-        assert_eq!(loaded.token_max_age_mins, 20);
-        assert_eq!(loaded.token_prefetch_age_mins, 10);
-        let equal: SettingsPatch = serde_json::from_value(serde_json::json!({
-            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
-            "tokenMaxAgeMins":20, "tokenPrefetchAgeMins":20
-        }))
-        .unwrap();
-        assert!(equal
-            .into_settings()
-            .unwrap_err()
-            .to_string()
-            .contains("预取时间必须早于过期时间"));
-        let short: SettingsPatch = serde_json::from_value(serde_json::json!({
-            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
-            "tokenMaxAgeMins":3, "tokenPrefetchAgeMins":1
-        }))
-        .unwrap();
-        let short_settings = short.into_settings().unwrap();
-        assert_eq!(short_settings.token_max_age_mins, 3);
-        assert_eq!(short_settings.token_prefetch_age_mins, 1);
-        let long: SettingsPatch = serde_json::from_value(serde_json::json!({
-            "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
-            "tokenMaxAgeMins":240, "tokenPrefetchAgeMins":200
-        }))
-        .unwrap();
-        let long_settings = long.into_settings().unwrap();
-        assert_eq!(long_settings.token_max_age_mins, 240);
-        assert_eq!(long_settings.token_prefetch_age_mins, 200);
     }
 }

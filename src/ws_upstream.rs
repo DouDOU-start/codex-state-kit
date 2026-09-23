@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tokio_tungstenite::WebSocketStream;
 use url::Url;
 
-use crate::fetch;
+use crate::outbound;
 use crate::ws_bridge;
 
 const MAX_AGE: Duration = Duration::from_secs(55 * 60);
@@ -102,22 +102,21 @@ impl WsUpstreamPool {
     /// `{session}` 在一条连接的存活期内保持不变。调用方已解析好的地址原样返回。
     pub async fn resolve_proxy(&self, template: &str, bound: Option<&str>) -> Result<String> {
         let template = template.trim();
-        if !fetch::has_session_placeholder(template) {
-            return Ok(fetch::dial_proxy_for_client(template));
+        if !outbound::has_session_placeholder(template) {
+            return Ok(outbound::dial_proxy_for_client(template));
         }
         if let Some(session) = bound.map(str::trim).filter(|value| !value.is_empty()) {
-            return Ok(fetch::dial_proxy_for_client(&fetch::apply_bound_session(
-                template,
-                Some(session),
-            )?));
+            return Ok(outbound::dial_proxy_for_client(
+                &outbound::apply_bound_session(template, Some(session))?,
+            ));
         }
         let mut guard = self.inner.lock().await;
         if guard.sticky_session.is_none() {
-            guard.sticky_session = Some(fetch::generate_proxy_session());
+            guard.sticky_session = Some(outbound::generate_proxy_session());
         }
         let session = guard.sticky_session.clone().context("缺少代理 session")?;
-        Ok(fetch::dial_proxy_for_client(
-            &fetch::replace_session_placeholder(template, &session),
+        Ok(outbound::dial_proxy_for_client(
+            &outbound::replace_session_placeholder(template, &session),
         ))
     }
 

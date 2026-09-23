@@ -259,11 +259,6 @@ pub async fn get_codex_config(
 }
 
 #[tauri::command(async)]
-pub async fn refresh_turn_state(state: State<'_, AppState>) -> CommandResult<Status> {
-    command(state.core().refresh_turn_state().await)
-}
-
-#[tauri::command(async)]
 pub async fn get_login_status(
     state: State<'_, AppState>,
     home: Option<String>,
@@ -492,27 +487,6 @@ pub async fn cancel_chatgpt_login(state: State<'_, AppState>) -> CommandResult<A
         ok: true,
         message: "已取消登录".into(),
     })
-}
-
-#[tauri::command(async)]
-pub async fn set_bound_token_len(
-    state: State<'_, AppState>,
-    len: Option<usize>,
-) -> CommandResult<Status> {
-    Ok(state.proxy.core().set_bound_token_len(len).await)
-}
-
-#[tauri::command(async)]
-pub async fn set_model_bound_token_len(
-    state: State<'_, AppState>,
-    model: String,
-    len: Option<usize>,
-) -> CommandResult<Status> {
-    Ok(state
-        .proxy
-        .core()
-        .set_model_bound_token_len(&model, len)
-        .await)
 }
 
 #[tauri::command(async)]

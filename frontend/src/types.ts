@@ -1,5 +1,4 @@
 export interface LogEntry {
-  statePolicy?: StateMissPolicy | null;
   accountId?: string | null;
   accountEmail?: string | null;
   id: number;
@@ -28,9 +27,6 @@ export interface LogEntry {
   upstreamResponseModel?: string | null;
   contentEncoding: string;
   bodyBytes: number;
-  turnStateAction: string;
-  turnStateLen?: number | null;
-  returnedTurnStateLen?: number | null;
   errorKind?: string | null;
   streamState: "not_tracked" | "awaiting_first_chunk" | "streaming" | "completed" | "error" | "cancelled" | string;
   firstChunkMs?: number | null;
@@ -40,43 +36,6 @@ export interface LogEntry {
   streamChunks: number;
   maxIdleMs?: number | null;
   currentIdleMs?: number | null;
-}
-
-export interface TokenLenCount {
-  len: number;
-  count: number;
-}
-
-export interface PoolTokenInfo {
-  len: number;
-  ageSecs: number;
-  isBound: boolean;
-  isValid: boolean;
-}
-
-export interface ModelTokenView {
-  model: string;
-  status: "active" | "refreshing" | "expired" | "empty" | string;
-  ageSecs?: number | null;
-  len?: number | null;
-  capturedAt?: string | null;
-  distribution?: TokenLenCount[];
-  poolTokens?: PoolTokenInfo[];
-  /** 模型级绑定覆盖（null/undefined 表示跟随全局） */
-  boundOverride?: number | null;
-  sharedFromModel?: string | null;
-}
-
-export interface TurnStateView {
-  status: "idle" | "active" | "partial" | "empty" | string;
-  ageSecs?: number | null;
-  len?: number | null;
-  source?: string | null;
-  capturedAt?: string | null;
-  models?: ModelTokenView[];
-  boundTokenLen?: number;
-  sharedSourceModel?: string | null;
-  boundProxySession?: string | null;
 }
 
 export interface VmIdentityView {
@@ -102,15 +61,8 @@ export interface VmProfile {
 }
 
 export interface Status {
-  tokenReusePolicy: TokenReusePolicy;
-  stateFetchModel: string;
-  tokenFetchPaused?: boolean;
-  tokenMaxAgeMins?: number;
-  tokenPrefetchAgeMins?: number;
   diagLogPath?: string;
   forcedModel: string;
-  stateMissPolicy: StateMissPolicy;
-  configuredModels: string[];
   currentAccountId?: string | null;
   currentAccountEmail?: string | null;
   accountTraffic: { concurrentRequests: number; rpm: number };
@@ -126,9 +78,6 @@ export interface Status {
   mihomoSubscription: string;
   mihomoNode: string;
   mihomo: MihomoStatus;
-  fetchError?: string | null;
-  fetchOkAt?: string | null;
-  turnState: TurnStateView;
   logs: LogEntry[];
   vmIdentity: VmIdentityView;
   wsUpstreamEnabled: boolean;
@@ -177,14 +126,7 @@ export interface SystemProxyView {
 }
 
 export interface SettingsPatch {
-  tokenReusePolicy: TokenReusePolicy;
-  stateFetchModel: string;
-  tokenFetchPaused?: boolean;
-  tokenMaxAgeMins?: number;
-  tokenPrefetchAgeMins?: number;
   forcedModel: string;
-  models: string[];
-  stateMissPolicy: StateMissPolicy;
   proxyListen: string;
   upstream: string;
   codexHome: string;
@@ -196,10 +138,8 @@ export interface SettingsPatch {
   chainSystemProxy?: boolean;
 }
 
-export type TokenReusePolicy = "shared_292" | "per_model";
 export type OutboundMode = "manual" | "mihomo";
 export type ProbeKind = "manual" | "mihomo";
-export type StateMissPolicy = "preserve" | "wait" | "strip" | "passthrough" | "strip_all";
 
 export interface LatencySample {
   name: string;

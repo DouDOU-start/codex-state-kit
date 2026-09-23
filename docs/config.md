@@ -40,10 +40,12 @@ openai_base_url = "http://127.0.0.1:8787"
 | --- | --- | --- |
 | 应用设置 | `~/.codex-state-kit.json` | `~/.codex-state-kit-dev.json` |
 | 路由恢复记录 | `~/.codex-state-kit.backup.json` | `~/.codex-state-kit-dev.backup.json` |
-| Turn-State 缓存 | `~/.codex-state-kit-token.json` | `~/.codex-state-kit-dev-token.json` |
+| 使用记录 | `~/.codex-state-kit-billing.sqlite3` | `~/.codex-state-kit-dev-billing.sqlite3` |
+| 模型价格缓存 | `~/.codex-state-kit-pricing.json` | `~/.codex-state-kit-dev-pricing.json` |
+| 虚拟设备 | `~/.codex-state-kit-vm.json` | `~/.codex-state-kit-dev-vm.json` |
 | 本机代理端口 | `8787` | `8788` |
 
-账号文件保存在所选工作目录的 `auth.json`。WARP 数据位置见[出站代理与 WARP](warp.md)。
+账号文件保存在所选工作目录的 `auth.json`。旧版的 Turn-State 缓存文件 `~/.codex-state-kit-token.json` 已不再使用，启动时会自动删除。
 
 开发版与正式版的应用数据分开保存，但默认 Codex 工作目录相同。不要让两个实例同时管理同一个工作目录。
 
@@ -56,12 +58,14 @@ openai_base_url = "http://127.0.0.1:8787"
 | `proxy_listen` | 本机监听地址，默认 `127.0.0.1:8787`；开发版为 `8788` |
 | `upstream` | 上游地址，默认 `https://chatgpt.com/backend-api/codex` |
 | `codex_home` | Codex 配置目录的完整路径 |
-| `outbound_mode` | `warp` 或 `manual`，新配置默认 `warp` |
-| `outbound_proxy` | 手动代理 URL；切换模式时保留。可把出口写成 `{session}`，打票时自动轮换，拿到稳定 292 后绑定该 session 发业务 |
-| `network_route_policy` | `same_network`（默认，Token 获取与业务发送共用出站代理）或 `separate`（旧策略，业务走 `upstream_proxy`）；旧配置未填写该字段且已设置 `upstream_proxy` 时保持分路 |
-| `upstream_proxy` | 分路模式下的上游业务转发代理，默认空；例如 `http://127.0.0.1:7897`，保存后对新请求生效 |
-| `warp_http2` | 是否优先使用 TCP，默认 `false`；应用支持自动回退 |
-| `token_reuse_policy` | `shared_292`（默认，同账号跨模型复用精确 292 字节票据）或 `per_model`（旧策略，按模型独立）；旧配置未填写该字段时也使用新默认 |
-| `forced_model` | 强制绑定的上游模型 ID，例如 `gpt-6-astra`；填写后下游无论请求什么模型都会改成该值再转发，Token 也按该模型获取。留空保持下游原模型 |
+| `outbound_mode` | `manual`（默认）或 `mihomo`；旧值 `warp` 按 `manual` 读取 |
+| `outbound_proxy` | 手动代理 URL；切换模式时保留。可把出口写成 `{session}`，见[出站代理](outbound.md) |
+| `mihomo_subscription` | 订阅 URL、本地文件路径或分享链接正文 |
+| `mihomo_node` | 固定使用的节点名；留空使用订阅中的第一个 |
+| `ws_upstream_enabled` | 业务请求是否优先走上游 WebSocket，默认 `true` |
+| `chain_system_proxy` | 是否经系统代理连接手动代理，默认 `true` |
+| `forced_model` | 强制绑定的上游模型 ID，例如 `gpt-6-astra`；填写后下游无论请求什么模型都会改成该值再转发。留空保持下游原模型 |
 
-应用设置可能含代理密码，账号和 Token 文件也包含凭据；提交问题报告时不要附上这些文件的原文。
+旧版的 `upstream_proxy` 会迁移到 `outbound_proxy`；Turn-State 相关的旧字段（`models`、`state_miss_policy`、`token_reuse_policy` 等）读取时忽略，下次保存时移除。
+
+应用设置可能含代理密码，账号文件也包含凭据；提交问题报告时不要附上这些文件的原文。

@@ -21,45 +21,11 @@ pub fn next_id() -> u64 {
     REQ_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-pub fn token_fp(token: &str) -> String {
-    let token = token.trim();
-    if token.is_empty() {
-        return "none".into();
-    }
-    let issued = crate::turn_state::issued_unix(token).unwrap_or(0);
-    format!(
-        "{}:{}:{:016x}",
-        token.len(),
-        issued,
-        fnv1a64(token.as_bytes())
-    )
-}
-
-pub fn token_age_secs(token: &str) -> Option<i64> {
-    crate::turn_state::issued_unix(token.trim())
-        .map(|issued| chrono::Utc::now().timestamp().saturating_sub(issued))
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct Request {
     pub id: u64,
     pub flow: String,
     pub model: Option<String>,
-    pub same_turn: bool,
-    pub client_had_state: bool,
-    pub token_fp: Option<String>,
-    pub token_age_secs: Option<i64>,
-    pub cookies: Vec<String>,
-    pub turn_state_action: String,
     pub route_kind: String,
     pub proxy_session: Option<String>,
 }
@@ -79,20 +45,6 @@ pub fn emit(stage: &str, req: Option<&Request>, extra: Value) {
         }
         if let Some(model) = &req.model {
             object.insert("model".into(), json!(model));
-        }
-        object.insert("sameTurn".into(), json!(req.same_turn));
-        object.insert("clientHadState".into(), json!(req.client_had_state));
-        if let Some(token_fp) = &req.token_fp {
-            object.insert("tokenFp".into(), json!(token_fp));
-        }
-        if let Some(age) = req.token_age_secs {
-            object.insert("tokenAgeSecs".into(), json!(age));
-        }
-        if !req.cookies.is_empty() {
-            object.insert("cookies".into(), json!(req.cookies));
-        }
-        if !req.turn_state_action.is_empty() {
-            object.insert("turnStateAction".into(), json!(req.turn_state_action));
         }
         if !req.route_kind.is_empty() {
             object.insert("routeKind".into(), json!(req.route_kind));
@@ -120,30 +72,5 @@ fn write_line(line: &str) {
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(file, "{line}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use base64::engine::general_purpose::URL_SAFE;
-    use base64::Engine as _;
-
-    fn token_for(issued: i64) -> String {
-        let mut raw = vec![0x80];
-        raw.extend_from_slice(&issued.to_be_bytes());
-        raw.extend_from_slice(&[0u8; 210]);
-        URL_SAFE.encode(raw)
-    }
-
-    #[test]
-    fn token_fingerprint_is_stable_and_does_not_embed_raw_token() {
-        let token = token_for(1_700_000_000);
-        let first = token_fp(&token);
-        let second = token_fp(&token);
-        assert_eq!(first, second);
-        assert!(first.starts_with(&format!("{}:1700000000:", token.len())));
-        assert!(!first.contains(&token));
-        assert_ne!(token_fp(&token_for(1_700_000_001)), first);
     }
 }

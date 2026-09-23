@@ -63,19 +63,12 @@ async fn fixed_response_proxy(
 
 fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
     SettingsPatch {
-        token_reuse_policy: settings.token_reuse_policy,
-        state_miss_policy: settings.state_miss_policy,
         proxy_listen: settings.proxy_listen.clone(),
         upstream: settings.upstream.clone(),
         codex_home: settings.codex_home.clone(),
         outbound_proxy: proxy.into(),
         outbound_mode: settings.outbound_mode,
-        models: settings.models.clone(),
-        state_fetch_model: settings.state_fetch_model.clone(),
         forced_model: settings.forced_model.clone(),
-        token_fetch_paused: settings.token_fetch_paused,
-        token_max_age_mins: settings.token_max_age_mins,
-        token_prefetch_age_mins: settings.token_prefetch_age_mins,
         mihomo_subscription: String::new(),
         mihomo_node: String::new(),
         ws_upstream_enabled: settings.ws_upstream_enabled,
@@ -126,17 +119,6 @@ async fn upstream_proxy_hot_update_and_failures() {
         };
         let app = Arc::new(App::new(settings.clone()).unwrap());
         let handle = ProxyHandle::new(app.clone());
-        app.turn_state.lock().await.register_model("test-model");
-        use base64::Engine;
-        let mut token_bytes = vec![0u8; 219];
-        token_bytes[0] = 0x80;
-        token_bytes[1..9].copy_from_slice(&chrono::Utc::now().timestamp().to_be_bytes());
-        let token = base64::engine::general_purpose::URL_SAFE.encode(token_bytes);
-        assert!(app
-            .turn_state
-            .lock()
-            .await
-            .capture("test-model", &token, "test"));
         let mut route_details = NetworkLogDetails::default();
         let response = forward_http_with_log(
             &app,
@@ -182,18 +164,7 @@ async fn upstream_proxy_hot_update_and_failures() {
             .await
             .unwrap();
         assert_eq!(crate::settings::load_settings().outbound_proxy, second);
-        assert!(app
-            .turn_state
-            .lock()
-            .await
-            .peek_for_model("test-model")
-            .is_none());
-        assert!(TurnStateStore::load()
-            .peek_for_model("test-model")
-            .is_none());
         assert!(handle.task.lock().await.is_none());
-        // 换线路会停掉旧的后台取票循环，且不再启动新的。
-        assert!(handle.fetch_task.lock().await.is_none());
         let response = forward_http(
             &app,
             Request::builder().uri("/new").body(Body::empty()).unwrap(),

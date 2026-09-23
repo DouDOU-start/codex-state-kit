@@ -284,7 +284,7 @@ export default function App() {
             <Activity size={19} aria-hidden="true" />
             <div>
               <h2>当前账号请求</h2>
-              <p>{isTauri ? (loggedIn ? "经本机转发的业务请求 · 不含 Token 探测" : "登录后显示账号请求统计") : "浏览器示例数据 · 非实际请求"}</p>
+              <p>{isTauri ? (loggedIn ? "经本机转发的业务请求" : "登录后显示账号请求统计") : "浏览器示例数据 · 非实际请求"}</p>
             </div>
           </div>
           <dl className="account-traffic__metrics">
@@ -316,7 +316,7 @@ export default function App() {
 
         <section className="panel tab-panel" role="tabpanel" id="tabpanel-network" aria-labelledby="tab-network" hidden={tab !== "network"}>
           <header>
-            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站网络</h2><p>获取 Token 与业务发送共用这一条出站线路</p></div></div>
+            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站网络</h2><p>业务请求、登录和价格同步都走这一条出站线路</p></div></div>
           </header>
           {bindingNote}
           <div className="proxy-mode" role="group" aria-label="出站代理模式">
@@ -353,7 +353,7 @@ export default function App() {
               }}
             />
           </label>
-          <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。可把出口写成 {'{session}'}，打票时自动轮换；拿到稳定 292 后绑定该 session，业务也走同一条线路。</p>
+          <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。可把出口写成 {'{session}'}，Kit 自动生成会话出口；同一条上游连接沿用同一个 session。</p>
           <div className="system-proxy">
             <label className="system-proxy__toggle">
               <input
@@ -444,7 +444,7 @@ export default function App() {
             <p className="panel__hint">
               {fwd.status.mihomo?.phase === "connected"
                 ? `已连接${fwd.status.mihomo.selected ? ` · ${fwd.status.mihomo.selected}` : ""}${fwd.status.mihomo.proxyUrl ? ` · ${fwd.status.mihomo.proxyUrl}` : ""}`
-                : "内核随应用内置。打票和业务都走这条订阅线路。"}
+                : "内核随应用内置。业务请求、登录和价格同步都走这条订阅线路。"}
             </p>
           </div>
           )}
@@ -484,7 +484,7 @@ export default function App() {
               }}
             />
           </label>
-          <p className="panel__hint">填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游，Token 也按该模型获取和复用。</p>
+          <p className="panel__hint">填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游。</p>
         </section>
         </div>
 
