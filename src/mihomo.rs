@@ -338,7 +338,7 @@ impl MihomoRuntime {
             &paths.data_dir.join("mihomo.log"),
         )
         .await?;
-        let chosen = if subscription.groups.is_empty() {
+        let chosen = {
             let name = (!wanted.is_empty() && names.iter().any(|item| item == &wanted))
                 .then(|| wanted.clone())
                 .or_else(|| names.first().cloned());
@@ -348,11 +348,6 @@ impl MihomoRuntime {
             } else {
                 None
             }
-        } else if let Some(group) = select_group_for_node(&subscription, &wanted) {
-            select_node(&controller, &secret, &group, &wanted).await?;
-            Some(wanted)
-        } else {
-            None
         };
         let groups = fetch_groups(&controller, &secret).await.unwrap_or_default();
         let mut inner = self.inner.lock().expect("mihomo state");
@@ -867,61 +862,24 @@ pub fn render_config(
                 .collect(),
         ),
     );
-    if config.groups.is_empty() {
-        let names: Vec<serde_yaml::Value> =
-            config.nodes.iter().map(|node| yaml_str(&node.name)).collect();
-        let mut group = serde_yaml::Mapping::new();
-        group.insert(yaml_str("name"), yaml_str(GROUP));
-        group.insert(yaml_str("type"), yaml_str("select"));
-        group.insert(yaml_str("proxies"), serde_yaml::Value::Sequence(names));
-        map.insert(
-            yaml_str("proxy-groups"),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(group)]),
-        );
-        map.insert(
-            yaml_str("rules"),
-            serde_yaml::Value::Sequence(vec![yaml_str(&format!("MATCH,{GROUP}"))]),
-        );
-    } else {
-        map.insert(
-            yaml_str("proxy-groups"),
-            serde_yaml::Value::Sequence(config.groups.clone()),
-        );
-        let rules = if config.rules.is_empty() {
-            let first = config
-                .groups
-                .first()
-                .and_then(|group| group.get("name"))
-                .and_then(|name| name.as_str())
-                .unwrap_or(GROUP);
-            vec![yaml_str(&format!("MATCH,{first}"))]
-        } else {
-            config.rules.clone()
-        };
-        map.insert(yaml_str("rules"), serde_yaml::Value::Sequence(rules));
-    }
+    let names: Vec<serde_yaml::Value> = config
+        .nodes
+        .iter()
+        .map(|node| yaml_str(&node.name))
+        .collect();
+    let mut group = serde_yaml::Mapping::new();
+    group.insert(yaml_str("name"), yaml_str(GROUP));
+    group.insert(yaml_str("type"), yaml_str("select"));
+    group.insert(yaml_str("proxies"), serde_yaml::Value::Sequence(names));
+    map.insert(
+        yaml_str("proxy-groups"),
+        serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(group)]),
+    );
+    map.insert(
+        yaml_str("rules"),
+        serde_yaml::Value::Sequence(vec![yaml_str(&format!("MATCH,{GROUP}"))]),
+    );
     serde_yaml::to_string(&serde_yaml::Value::Mapping(map)).unwrap_or_default()
-}
-
-fn select_group_for_node(config: &SubscriptionConfig, node: &str) -> Option<String> {
-    if node.is_empty() {
-        return None;
-    }
-    config.groups.iter().find_map(|group| {
-        let kind = group.get("type")?.as_str()?;
-        if kind != "select" {
-            return None;
-        }
-        let contains = group
-            .get("proxies")?
-            .as_sequence()?
-            .iter()
-            .any(|item| item.as_str() == Some(node));
-        if !contains {
-            return None;
-        }
-        group.get("name")?.as_str().map(str::to_string)
-    })
 }
 
 fn apply_groups(view: &mut MihomoStatus, groups: &[ProxyGroup]) {
@@ -1265,7 +1223,7 @@ proxies:
     }
 
     #[test]
-    fn keeps_subscription_groups_and_rules() {
+    fn subscription_groups_collapse_into_kit() {
         let raw = r#"
 proxies:
   - name: entry
@@ -1295,10 +1253,11 @@ rules:
         assert_eq!(parsed.groups.len(), 2);
         assert_eq!(parsed.rules.len(), 2);
         let config = render_config(&parsed, 17891, "127.0.0.1:17892", "secret");
-        assert!(config.contains("name: 前置"));
+        assert!(config.contains("name: Kit"));
+        assert!(config.contains("MATCH,Kit"));
         assert!(config.contains("dialer-proxy: entry"));
-        assert!(config.contains("DOMAIN-SUFFIX,openai.com,代理"));
-        assert!(!config.contains("name: Kit"));
+        assert!(!config.contains("name: 前置"));
+        assert!(!config.contains("DOMAIN-SUFFIX,openai.com,代理"));
     }
 
     #[test]

@@ -5,21 +5,19 @@ import LogIn from "lucide-react/dist/esm/icons/log-in.js";
 import Shield from "lucide-react/dist/esm/icons/shield.js";
 import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import Activity from "lucide-react/dist/esm/icons/activity.js";
+import Monitor from "lucide-react/dist/esm/icons/monitor.js";
 import Network from "lucide-react/dist/esm/icons/network.js";
 import Terminal from "lucide-react/dist/esm/icons/terminal.js";
 import CircleCheck from "lucide-react/dist/esm/icons/circle-check.js";
 import Radio from "lucide-react/dist/esm/icons/radio.js";
 import Waypoints from "lucide-react/dist/esm/icons/waypoints.js";
-import Pause from "lucide-react/dist/esm/icons/pause.js";
-import Play from "lucide-react/dist/esm/icons/play.js";
-import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import { AppShell } from "@/components/AppShell";
 import { BillingPanel } from "@/components/BillingPanel";
 import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
 import { NetworkLogDialog } from "@/components/NetworkLogDialog";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { LoginMode, Status, TurnStateView, StateMissPolicy, TokenReusePolicy, LatencySample, VmIdentityView } from "@/types";
+import type { LoginMode, Status, LatencySample, VmIdentityView } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -37,136 +35,9 @@ function delayText(sample?: LatencySample | null): string | null {
   return sample.error || "超时";
 }
 
-function tokenChip(view?: TurnStateView | null, paused = false) {
-  if (paused && view?.status !== "active") return { label: "已暂停获取", className: "runtime-chip runtime-chip--idle" };
-  if (!view || view.status === "empty") return { label: "等待 Token", className: "runtime-chip runtime-chip--idle" };
-  if (view.status === "idle") return { label: "等待请求", className: "runtime-chip runtime-chip--idle" };
-  if (view.status === "active") return { label: "Token 可用", className: "runtime-chip" };
-  if (view.status === "partial") return { label: "部分可用", className: "runtime-chip runtime-chip--warm" };
-  return { label: "Token 已过期", className: "runtime-chip runtime-chip--warm" };
-}
-
 function degradeChip(status: Status) {
   if (!status.degraded) return null;
   return { label: "312 降智", className: "runtime-chip runtime-chip--down" };
-}
-
-function formatAge(secs?: number | null) {
-  if (secs == null) return null;
-  if (secs < 0) return "刚刚";
-  if (secs < 60) return `${secs} 秒前`;
-  if (secs < 3600) return `${Math.floor(secs / 60)} 分钟前`;
-  return `${Math.floor(secs / 3600)} 小时前`;
-}
-
-function modelSummary(view?: TurnStateView | null): string {
-  const models = view?.models;
-  if (!models || models.length === 0) return "";
-  const active = models.filter((m) => m.status === "active").length;
-  const bound = view?.boundTokenLen ?? 292;
-  return `${active}/${models.length} 个模型 Token 就绪 · 绑定 ${bound}`;
-}
-
-const STATE_POLICY_OPTIONS: Array<{
-  value: StateMissPolicy;
-  label: string;
-  summary: string;
-  tooltip: string;
-}> = [
-  {
-    value: "preserve",
-    label: "无票保留",
-    summary: "无票时沿用原值",
-    tooltip: "已带 State 则替换为当前账号的有效凭证。新一轮首包未带时补上规范票据并包装成探针同轮第二包。同轮续跑只改请求头，保留 previous_response_id。没有匹配凭证时保留客户端原值。",
-  },
-  {
-    value: "wait",
-    label: "无票等待",
-    summary: "等有效票再发送",
-    tooltip: "缺少规范票据时持续等待再写入。新一轮首包包装成同轮第二包；同轮续跑只改请求头。请求账号与当前登录不同时立即报错，不转发。同一账号的旧 Access Token 仍会覆盖后继续。客户端取消，或账号、线路、策略变化时终止。",
-  },
-  {
-    value: "strip",
-    label: "无票剥离",
-    summary: "无票时删除",
-    tooltip: "已带则替换。新一轮首包未带则补上规范票据并包装成探针同轮第二包；同轮续跑只改请求头。没有匹配凭证时删除客户端 State，让上游自行处理。",
-  },
-  {
-    value: "passthrough",
-    label: "不替换",
-    summary: "始终沿用原值",
-    tooltip: "始终原样转发客户端 State，即使本地有有效凭证也不替换。用于和自动替换策略做对照。",
-  },
-  {
-    value: "strip_all",
-    label: "全部剥离",
-    summary: "始终删除 State",
-    tooltip: "所有业务请求发出前都删除 State，包括本地已有有效凭证的情况。这是实验性策略，效果待验证。",
-  },
-];
-
-function tokenCopy(view?: TurnStateView | null, fetchError?: string | null, reusePolicy: TokenReusePolicy = "shared_292", paused = false) {
-  const bound = view?.boundTokenLen ?? 292;
-  if (paused) {
-    if (view?.status === "active") {
-      const summary = modelSummary(view);
-      return {
-        title: reusePolicy === "shared_292" && bound === 292 ? "292 Token 正在跨模型复用" : `${bound} Token 正在复用`,
-        body: summary ? `已暂停后台获取 · ${summary}` : "已暂停后台获取，已缓存的 Token 仍可注入。",
-        loading: false,
-      };
-    }
-    return {
-      title: `已暂停获取 ${bound} Token`,
-      body: "后台不再打票。已缓存的 Token 仍可注入，需要时再点继续获取。",
-      loading: false,
-    };
-  }
-  if (fetchError && (!view || (view.status !== "active" && view.status !== "idle"))) {
-    return {
-      title: `正在获取 ${bound} Token…`,
-      body: fetchError,
-      loading: true,
-    };
-  }
-  if (!view || view.status === "empty") {
-    return {
-      title: "等待 Token 就绪",
-      body: "登录后自动获取 Token，并在需要时刷新。",
-      loading: false,
-    };
-  }
-  if (view.status === "idle") {
-    return {
-      title: "等待发现模型",
-      body: "Codex 发起第一个请求后，自动识别模型并预取 Token。",
-      loading: false,
-    };
-  }
-  if (view.status === "active") {
-    const summary = modelSummary(view);
-    const bound = view.boundTokenLen ?? 292;
-    return {
-      title: reusePolicy === "shared_292" && bound === 292 ? "292 Token 正在跨模型复用" : `${bound} Token 正在复用`,
-      body: reusePolicy === "shared_292" && bound === 292 && view.sharedSourceModel
-        ? `同账号共享 · 来源 ${view.sharedSourceModel} · ${summary}`
-        : summary,
-      loading: false,
-    };
-  }
-  if (view.status === "partial") {
-    const summary = modelSummary(view);
-    return {
-      title: "部分模型 Token 已就绪",
-      body: summary || "其余模型正在获取中…",
-      loading: true,
-    };
-  }
-  return {
-    title: "等待刷新 Token",
-    body: "凭据包已超过 240 秒，正在后台再采一张。",
-    loading: true,
-  };
 }
 
 export default function App() {
@@ -176,7 +47,6 @@ export default function App() {
   const [mihomoSubscription, setMihomoSubscription] = useState("");
   const [mihomoNode, setMihomoNode] = useState("");
   const [forcedModel, setForcedModel] = useState("");
-  const [stateFetchModel, setStateFetchModel] = useState("");
   const [cliVersion, setCliVersion] = useState("0.155.0");
   const [vmOriginator, setVmOriginator] = useState("codex_cli_rs");
   const [osType, setOsType] = useState("Mac OS");
@@ -198,7 +68,6 @@ export default function App() {
     setMihomoSubscription(fwd.status.mihomoSubscription ?? "");
     setMihomoNode(fwd.status.mihomoNode ?? "");
     setForcedModel(fwd.status.forcedModel ?? "");
-    setStateFetchModel(fwd.status.stateFetchModel ?? "");
     const identity = fwd.status.vmIdentity;
     if (identity) {
       setCliVersion(identity.cliVersion);
@@ -252,23 +121,14 @@ export default function App() {
         ? "Access Token · 不可自动刷新"
         : null,
   ].filter(Boolean).join(" · ");
-  const turn = fwd.status.turnState;
-  const stateDonor = fwd.status.tokenReusePolicy === "shared_292" ? fwd.status.stateFetchModel : "";
-  const fetchPaused = Boolean(fwd.status.tokenFetchPaused);
-  const token = tokenChip(turn, fetchPaused);
   const degrade = degradeChip(fwd.status);
-  const copy = tokenCopy(
-    turn,
-    fwd.status.fetchError ?? (fwd.status.outboundMode === "mihomo" ? fwd.status.mihomo?.error : null),
-    fwd.status.tokenReusePolicy,
-    fetchPaused,
-  );
-  const age = formatAge(turn?.ageSecs);
-  const sourceLabel =
-    turn?.source === "fetch" ? "StateKit 获取" : turn?.source === "ws" ? "WebSocket" : turn?.source === "http" ? "HTTP" : null;
-  const meta = [age, turn?.len ? `${turn.len} 字节` : null, sourceLabel, turn?.boundProxySession ? `session ${turn.boundProxySession}` : null].filter(Boolean).join(" · ");
   const selectedNode = mihomoNode || fwd.status.mihomo?.selected || "";
   const selectedNodeDelay = fwd.latency.mihomo?.samples.find((item) => item.name === selectedNode);
+  const mihomoGroups = fwd.status?.mihomo.groups ?? [];
+  const kitGroups = mihomoGroups.filter((group) => group.name === "Kit");
+  const shownMihomoGroups = kitGroups.length > 0
+    ? kitGroups
+    : mihomoGroups.filter((group) => group.groupType === "select");
 
   const copyCode = async () => {
     if (!fwd.device?.userCode) return;
@@ -308,10 +168,6 @@ export default function App() {
               <i />
               {chipLabel(fwd.status)}
             </span>
-            <span className={token.className}>
-              <i />
-              {token.label}
-            </span>
             {degrade ? (
               <span className={degrade.className}>
                 <i />
@@ -348,157 +204,6 @@ export default function App() {
           </div>
         ) : null}
 
-        <section className={`token-card token-card--${turn?.status || "empty"}`}>
-          <div className="token-card__head">
-            <span className="token-card__icon" aria-hidden="true">
-              {copy.loading ? <span className="spinner spinner--blue" /> : <Shield size={25} strokeWidth={1.7} />}
-            </span>
-            <div>
-              <span className="token-card__eyebrow">TOKEN 状态</span>
-              <strong>{copy.title}</strong>
-              {copy.body ? <small>{copy.body}</small> : null}
-              {meta ? <p className="token-card__meta">{meta}</p> : null}
-            </div>
-          </div>
-          <div className="token-card__actions">
-            <button
-              type="button"
-              className="token-fetch-toggle"
-              disabled={fwd.busy !== null}
-              title="立即重新获取 Token，绕过后台冷却；暂停自动获取时也可点一次"
-              onClick={() => void fwd.refetchTurnState()}
-            >
-              <RefreshCw size={13} className={fwd.busy === "refresh" ? "is-spinning" : undefined} />
-              {fwd.busy === "refresh" ? "正在获取" : "重新获取"}
-            </button>
-            <button
-              type="button"
-              className={`token-fetch-toggle${fetchPaused ? " token-fetch-toggle--paused" : ""}`}
-              aria-pressed={fetchPaused}
-              disabled={fwd.busy !== null}
-              title={fetchPaused ? "继续后台获取 Token" : "暂停后台打票，已缓存的 Token 仍可注入"}
-              onClick={() => void fwd.setTokenFetchPaused(!fetchPaused)}
-            >
-              {fetchPaused ? <Play size={13} /> : <Pause size={13} />}
-              {fetchPaused ? "继续获取" : "暂停获取"}
-            </button>
-            <span className="token-card__badge"><Radio size={14} /> {fetchPaused ? `已暂停 · 绑定 ${turn?.boundTokenLen ?? 292}` : fwd.status.proxyOk ? `自动管理 · 绑定 ${turn?.boundTokenLen ?? 292}` : "等待代理启动"}</span>
-          </div>
-          <div className="token-reuse-policy" role="group" aria-labelledby="token-reuse-policy-label">
-            <div className="token-reuse-policy__heading">
-              <strong id="token-reuse-policy-label">Token 复用策略</strong>
-              <span>自动保存 · 即时生效</span>
-            </div>
-            <div className="token-reuse-policy__options">
-              <label className="token-reuse-option">
-                <input type="radio" name="token-reuse-policy" value="shared_292"
-                  checked={fwd.status.tokenReusePolicy === "shared_292"} disabled={fwd.busy !== null}
-                  onChange={() => void fwd.setTokenReusePolicy("shared_292")} />
-                <span><strong>跨模型复用 292 <small>默认</small></strong><span>一张有效票据同账号共用，不再逐模型打票</span></span>
-              </label>
-              <label className="token-reuse-option">
-                <input type="radio" name="token-reuse-policy" value="per_model"
-                  checked={fwd.status.tokenReusePolicy === "per_model"} disabled={fwd.busy !== null}
-                  onChange={() => void fwd.setTokenReusePolicy("per_model")} />
-                <span><strong>按模型独立 <small>旧策略</small></strong><span>各模型分别获取，只复用各自的 Token</span></span>
-              </label>
-            </div>
-            {fwd.status.tokenReusePolicy === "shared_292" ? (
-              <label className="field token-reuse-donor">
-                <span>取 State 的模型</span>
-                <input
-                  spellCheck={false}
-                  autoComplete="off"
-                  disabled={fwd.busy !== null}
-                  value={stateFetchModel}
-                  placeholder="例如 gpt-5.5，留空则从已有模型里选一个"
-                  onChange={(event) => setStateFetchModel(event.target.value)}
-                  onBlur={(event) => {
-                    const value = event.currentTarget.value;
-                    if (value.trim() === (fwd.status?.stateFetchModel ?? "")) return;
-                    setStateFetchModel(value);
-                    void fwd.saveStateFetchModel(value);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") event.currentTarget.blur();
-                  }}
-                />
-              </label>
-            ) : null}
-            <p>292 与线路 Cookie 成套保存、成套注入。填写取票模型后，跨模型复用只向这个模型索取 292，其他模型不再打这张共享票。332 及其他绑定长度仍按模型独立。留空则从已有模型里选一个供体。</p>
-          </div>
-          {turn?.models && turn.models.length > 0 ? (
-            <div className="token-models">
-              {turn.models.map((m) => {
-                const effectiveBound = m.boundOverride ?? turn.boundTokenLen ?? 292;
-                const hasOverride = m.boundOverride != null;
-                return (
-                <div key={m.model} className="token-model-row">
-                  <span className={`token-model token-model--${m.status}`}>
-                    <i />{m.model}{m.ageSecs != null ? ` · ${formatAge(m.ageSecs)}` : ""}{m.len ? ` · ${m.len}字节` : ""}
-                    {m.sharedFromModel ? <span className="token-model__shared" title={`票据来源：${m.sharedFromModel}`}>共享 · {m.sharedFromModel}</span> : null}
-                    {stateDonor && stateDonor === m.model ? <span className="token-model__donor">取票</span> : null}
-                    {hasOverride ? <span className="token-model__override">独立绑定 {effectiveBound}</span> : null}
-                  </span>
-                  {/* 池中缓存的 token（所有长度），点击设置模型级绑定 */}
-                  {m.poolTokens && m.poolTokens.length > 0 ? (
-                    <span className="token-pool">
-                      {m.poolTokens.map((p) => (
-                        <button
-                          key={p.len}
-                          type="button"
-                          className={`token-pool__chip${p.isBound ? " token-pool__chip--bound" : ""}${!p.isValid ? " token-pool__chip--expired" : ""}`}
-                          title={
-                            p.isBound
-                              ? `当前${hasOverride ? "独立" : "全局"}绑定 · ${p.len}字节 · ${formatAge(p.ageSecs)}`
-                              : `点击为 ${m.model} 独立绑定 ${p.len}`
-                          }
-                          onClick={() => {
-                            if (p.isBound && hasOverride) {
-                              void fwd.bindModelTokenLen(m.model, null);
-                            } else {
-                              void fwd.bindModelTokenLen(m.model, p.len);
-                            }
-                          }}
-                        >
-                          <span className="token-pool__len">{p.len}</span>
-                          <span className="token-pool__age">{formatAge(p.ageSecs)}</span>
-                          {p.isBound ? <span className="token-pool__bound-tag">{hasOverride ? "独立" : "全局"}</span> : null}
-                        </button>
-                      ))}
-                      {hasOverride ? (
-                        <button
-                          type="button"
-                          className="token-pool__chip token-pool__chip--reset"
-                          title="清除模型级绑定，恢复跟随全局"
-                          onClick={() => void fwd.bindModelTokenLen(m.model, null)}
-                        >
-                          ↩ 跟随全局
-                        </button>
-                      ) : null}
-                    </span>
-                  ) : null}
-                  {/* 最近一轮 fetch 的分布统计 */}
-                  {m.distribution && m.distribution.length > 0 ? (
-                    <span className="token-dist">
-                      <span className="token-dist__label">分布:</span>
-                      {m.distribution.map((d) => (
-                        <span key={d.len} className="token-dist__item">
-                          {d.len}×{d.count}
-                        </span>
-                      ))}
-                    </span>
-                  ) : null}
-                </div>
-                );
-              })}
-            </div>
-          ) : null}
-          {fwd.status.fetchError && turn?.status === "active" ? (
-            <p className="token-card__meta token-card__meta--warn">刷新失败：{fwd.status.fetchError}</p>
-          ) : null}
-        </section>
-
         <section className="account-traffic" aria-label="当前账号请求统计">
           <div className="account-traffic__heading">
             <Activity size={19} aria-hidden="true" />
@@ -528,7 +233,7 @@ export default function App() {
           <div className="banner banner--error" role="alert">
             <span>
               <TriangleAlert size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
-              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}，{fetchPaused ? "已暂停获取，继续获取后才会重新打票。" : `正在通过出站代理重新采集 ${turn?.boundTokenLen ?? 292} token…`}
+              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}。
             </span>
           </div>
         ) : null}
@@ -555,76 +260,6 @@ export default function App() {
             </label>
             <span>{fwd.status.wsUpstreamConnected ? `已连接${fwd.status.wsUpstreamConnectedAt ? ` · ${fwd.status.wsUpstreamConnectedAt}` : ""}` : "未连接"}</span>
             <button type="button" className="text-button" disabled={fwd.busy !== null} onClick={() => void fwd.reconnectUpstream()}>重连</button>
-          </div>
-          <div className="vm-identity">
-            <p className="vm-identity__summary">虚拟设备 {fwd.status.vmIdentity?.userAgent ?? "—"}</p>
-            <p className="vm-identity__id">Installation {fwd.status.vmIdentity?.installationId ?? "—"}</p>
-            <div className="vm-identity__grid">
-              <label className="field">
-                <span>CLI 版本</span>
-                <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={cliVersion} onChange={(event) => setCliVersion(event.target.value)} />
-              </label>
-              <label className="field">
-                <span>Originator</span>
-                <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmOriginator} onChange={(event) => setVmOriginator(event.target.value)} />
-              </label>
-              <label className="field">
-                <span>系统</span>
-                <select disabled={fwd.busy !== null} value={osType} onChange={(event) => setOsType(event.target.value)}>
-                  <option value="Mac OS">Mac OS</option>
-                  <option value="Linux">Linux</option>
-                  <option value="Windows">Windows</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>系统版本</span>
-                <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={osVersion} onChange={(event) => setOsVersion(event.target.value)} />
-              </label>
-              <label className="field">
-                <span>架构</span>
-                <select disabled={fwd.busy !== null} value={vmArch} onChange={(event) => setVmArch(event.target.value)}>
-                  <option value="arm64">arm64</option>
-                  <option value="x86_64">x86_64</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>终端</span>
-                <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmTerminal} onChange={(event) => setVmTerminal(event.target.value)} />
-              </label>
-            </div>
-            <div className="vm-identity__actions">
-              <button
-                type="button"
-                className="text-button"
-                disabled={fwd.busy !== null}
-                onClick={() => {
-                  void fwd.saveVmIdentity({
-                    cliVersion,
-                    originator: vmOriginator,
-                    osType,
-                    osVersion,
-                    arch: vmArch,
-                    terminal: vmTerminal,
-                  }).then((next) => {
-                    if (next) applyVmDraft(next.vmIdentity);
-                  });
-                }}
-              >
-                保存身份
-              </button>
-              <button type="button" className="text-button" disabled={fwd.busy !== null} onClick={() => void fwd.detectVmVersion().then((next) => { if (next) applyVmDraft(next.vmIdentity); })}>检测本机 CLI</button>
-              <button
-                type="button"
-                className="text-button"
-                disabled={fwd.busy !== null}
-                onClick={() => {
-                  if (!window.confirm("重新生成 Installation ID 后，上游会把 Kit 看成一台新设备。确定继续？")) return;
-                  void fwd.regenerateVmInstallation();
-                }}
-              >
-                换一台新机器
-              </button>
-            </div>
           </div>
           {fwd.status.outboundMode === "manual" ? <>
           <label className="field">
@@ -668,24 +303,16 @@ export default function App() {
                 }}
               />
             </label>
-            {(fwd.status.mihomo?.groups.length ?? 0) > 0 ? (
-              <>
-                {fwd.status.mihomo.groups.map((group) => (
-                  <MihomoGroupPanel
-                    key={group.name}
-                    group={group}
-                    probing={fwd.probingGroup === group.name || fwd.probingGroup === "*"}
-                    onSelect={(node) => void fwd.selectMihomoNode(group.name, node)}
-                    onProbe={() => void fwd.probeMihomoGroup(group.name)}
-                  />
-                ))}
-                <div className="latency-row">
-                  <button type="button" className="token-fetch-toggle" disabled={fwd.probingGroup !== null || (isTauri && fwd.status.mihomo?.phase !== "connected")} onClick={() => void fwd.probeAllMihomo()}>
-                    {fwd.probingGroup === "*" ? "测试中" : "测全部延迟"}
-                  </button>
-                </div>
-              </>
-            ) : (
+            {shownMihomoGroups.map((group) => (
+              <MihomoGroupPanel
+                key={group.name}
+                group={group}
+                probing={fwd.probingGroup === group.name || fwd.probingGroup === "*"}
+                onSelect={(node) => void fwd.selectMihomoNode(group.name, node)}
+                onProbe={() => void fwd.probeMihomoGroup(group.name)}
+              />
+            ))}
+            {shownMihomoGroups.length > 0 ? null : (
               <>
                 <label className="field">
                   <span>当前节点</span>
@@ -875,37 +502,86 @@ export default function App() {
             />
           </label>
           <p className="panel__hint">填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游，Token 也按该模型获取和复用。</p>
-          <div className="connection-policy">
-            <div className="field connection-directory state-policy-field">
-              <span>State 处理策略</span>
-              <div className="state-policy-options" role="radiogroup" aria-label="State 处理策略">
-                {STATE_POLICY_OPTIONS.map((option) => (
-                  <label
-                    key={option.value}
-                    className={`state-policy-option${(fwd.status?.stateMissPolicy ?? "preserve") === option.value ? " state-policy-option--selected" : ""}`}
-                    data-tooltip={option.tooltip}
-                  >
-                    <input
-                      type="radio"
-                      name="state-miss-policy"
-                      value={option.value}
-                      checked={(fwd.status?.stateMissPolicy ?? "preserve") === option.value}
-                      aria-label={option.label}
-                      aria-description={option.tooltip}
-                      disabled={fwd.busy !== null}
-                      onChange={() => void fwd.setStateMissPolicy(option.value)}
-                    />
-                    <span className="state-policy-option__radio" aria-hidden="true" />
-                    <span className="state-policy-option__copy">
-                      <strong>{option.label}</strong>
-                      <small>{option.summary}</small>
-                    </span>
-                  </label>
-                ))}
+        </div>
+
+        <section className="panel vm-panel">
+          <header>
+            <div className="section-heading">
+              <span className="section-icon"><Monitor size={19} /></span>
+              <div>
+                <h2>虚拟设备</h2>
+                <p>{fwd.status.vmIdentity?.userAgent ?? "上游看到的 Codex CLI 身份"}</p>
               </div>
             </div>
+            <span className="vm-identity__id">Installation {fwd.status.vmIdentity?.installationId ?? "—"}</span>
+          </header>
+          <div className="vm-identity__grid">
+            <label className="field">
+              <span>CLI 版本</span>
+              <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={cliVersion} onChange={(event) => setCliVersion(event.target.value)} />
+            </label>
+            <label className="field">
+              <span>Originator</span>
+              <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmOriginator} onChange={(event) => setVmOriginator(event.target.value)} />
+            </label>
+            <label className="field">
+              <span>系统</span>
+              <select disabled={fwd.busy !== null} value={osType} onChange={(event) => setOsType(event.target.value)}>
+                <option value="Mac OS">Mac OS</option>
+                <option value="Linux">Linux</option>
+                <option value="Windows">Windows</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>系统版本</span>
+              <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={osVersion} onChange={(event) => setOsVersion(event.target.value)} />
+            </label>
+            <label className="field">
+              <span>架构</span>
+              <select disabled={fwd.busy !== null} value={vmArch} onChange={(event) => setVmArch(event.target.value)}>
+                <option value="arm64">arm64</option>
+                <option value="x86_64">x86_64</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>终端</span>
+              <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmTerminal} onChange={(event) => setVmTerminal(event.target.value)} />
+            </label>
           </div>
-        </div>
+          <div className="vm-identity__actions">
+            <button
+              type="button"
+              className="button button--secondary"
+              disabled={fwd.busy !== null}
+              onClick={() => {
+                void fwd.saveVmIdentity({
+                  cliVersion,
+                  originator: vmOriginator,
+                  osType,
+                  osVersion,
+                  arch: vmArch,
+                  terminal: vmTerminal,
+                }).then((next) => {
+                  if (next) applyVmDraft(next.vmIdentity);
+                });
+              }}
+            >
+              保存身份
+            </button>
+            <button type="button" className="button button--ghost" disabled={fwd.busy !== null} onClick={() => void fwd.detectVmVersion().then((next) => { if (next) applyVmDraft(next.vmIdentity); })}>检测本机 CLI</button>
+            <button
+              type="button"
+              className="button button--ghost"
+              disabled={fwd.busy !== null}
+              onClick={() => {
+                if (!window.confirm("重新生成 Installation ID 后，上游会把 Kit 看成一台新设备。确定继续？")) return;
+                void fwd.regenerateVmInstallation();
+              }}
+            >
+              换一台新机器
+            </button>
+          </div>
+        </section>
 
         <footer className="page-footer">
           <span><Shield size={13} /> 本地运行 · 配置尽在掌握</span>
