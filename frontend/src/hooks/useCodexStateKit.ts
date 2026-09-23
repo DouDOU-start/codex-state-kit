@@ -19,8 +19,12 @@ import {
   updateVmIdentity,
   regenerateVmInstallationId,
   detectVmCliVersion,
+  listAccounts,
+  removeAccount,
+  renameAccount,
+  switchAccount,
 } from "@/lib/api";
-import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy, SettingsPatch, ProbeKind, LatencyReport, VmProfile } from "@/types";
+import type { SavedAccount, Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy, SettingsPatch, ProbeKind, LatencyReport, VmProfile } from "@/types";
 
 function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): SettingsPatch {
   return {
@@ -56,6 +60,7 @@ function errorMessage(cause: unknown): string {
 export function useCodexStateKit() {
   const [status, setStatus] = useState<Status | null>(null);
   const [login, setLogin] = useState<LoginStatus | null>(null);
+  const [accounts, setAccounts] = useState<SavedAccount[]>([]);
   const [device, setDevice] = useState<LoginStart | null>(null);
   const [banner, setBanner] = useState<Banner | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -113,6 +118,56 @@ export function useCodexStateKit() {
     if (!status) return;
     void loadLogin(status.codexHome);
   }, [loadLogin, status?.codexHome]);
+
+  const codexHome = status?.codexHome;
+
+  const loadAccounts = useCallback(async () => {
+    try {
+      setAccounts(await listAccounts(codexHome));
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    }
+  }, [codexHome]);
+
+  // A new login is saved into the account list by the backend; reload it
+  // whenever the logged-in account changes.
+  useEffect(() => {
+    if (!codexHome) return;
+    void loadAccounts();
+  }, [loadAccounts, codexHome, login?.accountId]);
+
+  const switchToAccount = useCallback(async (accountId: string) => {
+    setBusy("login");
+    try {
+      const next = await switchAccount(accountId, codexHome);
+      setLogin(next);
+      setBanner({ kind: "ok", text: `已切换到 ${next.email ?? accountId}，后续请求立即使用该账号` });
+      await loadAccounts();
+      void loadStatus(true);
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, [codexHome, loadAccounts, loadStatus]);
+
+  const removeSavedAccount = useCallback(async (accountId: string) => {
+    try {
+      await removeAccount(accountId, codexHome);
+      await loadAccounts();
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    }
+  }, [codexHome, loadAccounts]);
+
+  const renameSavedAccount = useCallback(async (accountId: string, label: string) => {
+    try {
+      await renameAccount(accountId, label, codexHome);
+      await loadAccounts();
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    }
+  }, [codexHome, loadAccounts]);
 
   const stopPolling = useCallback(() => {
     loginGeneration.current += 1;
@@ -514,6 +569,10 @@ export function useCodexStateKit() {
   return {
     status,
     login,
+    accounts,
+    switchToAccount,
+    removeSavedAccount,
+    renameSavedAccount,
     device,
     banner,
     error,

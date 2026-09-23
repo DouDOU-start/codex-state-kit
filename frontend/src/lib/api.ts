@@ -19,6 +19,7 @@ import type {
   BillingUsageTotals,
   ModelPriceRow,
   PricingView,
+  SavedAccount,
 } from "@/types";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
@@ -790,4 +791,78 @@ export async function syncPricing(): Promise<PricingView> {
   const view = mockPricing();
   view.info.lastCheckedAt = new Date().toISOString();
   return view;
+}
+
+const mockAccounts: SavedAccount[] = [
+  {
+    accountId: "mock-account-b",
+    email: "mock@example.com",
+    label: null,
+    authMode: "chatgpt",
+    refreshable: true,
+    usable: true,
+    active: true,
+    addedAt: new Date(Date.now() - 86_400_000 * 3).toISOString(),
+    lastUsedAt: new Date(Date.now() - 3_600_000).toISOString(),
+  },
+  {
+    accountId: "mock-account-a",
+    email: "previous@example.com",
+    label: "备用号",
+    authMode: "chatgpt",
+    refreshable: true,
+    usable: true,
+    active: false,
+    addedAt: new Date(Date.now() - 86_400_000 * 9).toISOString(),
+    lastUsedAt: new Date(Date.now() - 86_400_000).toISOString(),
+  },
+  {
+    accountId: "mock-account-c",
+    email: "team@example.com",
+    label: null,
+    authMode: "chatgptAuthTokens",
+    refreshable: false,
+    usable: true,
+    active: false,
+    addedAt: new Date(Date.now() - 86_400_000 * 12).toISOString(),
+    lastUsedAt: null,
+  },
+];
+
+export async function listAccounts(home?: string): Promise<SavedAccount[]> {
+  if (isTauri) return invoke<SavedAccount[]>("list_accounts", { home: home ?? null });
+  return mockAccounts.map((account) => ({ ...account }));
+}
+
+export async function switchAccount(accountId: string, home?: string): Promise<LoginStatus> {
+  if (isTauri) return invoke<LoginStatus>("switch_account", { home: home ?? null, accountId });
+  const target = mockAccounts.find((account) => account.accountId === accountId);
+  if (!target) throw new Error("账号不存在");
+  for (const account of mockAccounts) account.active = account === target;
+  target.lastUsedAt = new Date().toISOString();
+  mockLogin = {
+    loggedIn: true,
+    authMode: target.authMode ?? "chatgpt",
+    email: target.email ?? null,
+    accountId: target.accountId,
+    refreshable: target.refreshable,
+  };
+  mockStatus.currentAccountId = target.accountId;
+  mockStatus.currentAccountEmail = target.email ?? null;
+  return { ...mockLogin };
+}
+
+export async function removeAccount(accountId: string, home?: string): Promise<void> {
+  if (isTauri) return invoke<void>("remove_account", { home: home ?? null, accountId });
+  const index = mockAccounts.findIndex((account) => account.accountId === accountId);
+  if (index < 0) throw new Error("账号不存在");
+  if (mockAccounts[index].active) throw new Error("不能删除正在使用的账号，请先切换到其他账号");
+  mockAccounts.splice(index, 1);
+}
+
+export async function renameAccount(accountId: string, label: string, home?: string): Promise<void> {
+  if (isTauri) return invoke<void>("rename_account", { home: home ?? null, accountId, label });
+  const account = mockAccounts.find((item) => item.accountId === accountId);
+  if (!account) throw new Error("账号不存在");
+  account.label = label.trim() || null;
 }

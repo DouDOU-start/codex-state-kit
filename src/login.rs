@@ -36,6 +36,14 @@ const DEFAULT_EXPIRES_IN: u64 = 900;
 const DEFAULT_INTERVAL: u64 = 5;
 static AUTH_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// Serialises writes of the Kit login file (token adoption, account switches).
+pub(crate) fn auth_sync_lock() -> std::sync::MutexGuard<'static, ()> {
+    AUTH_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 #[derive(Clone, Debug)]
 pub struct LoginEndpoints {
     pub usercode_url: String,
@@ -892,15 +900,17 @@ fn write_session_auth(
     refresh_token: &str,
     account_id: &str,
 ) -> Result<()> {
-    write_auth_json(
-        &kit_auth_path(home),
-        id_token,
-        access_token,
-        refresh_token,
-        account_id,
-        StoredAuthMode::Managed,
-        false,
-    )
+    remember_accounts_around(home, || {
+        write_auth_json(
+            &kit_auth_path(home),
+            id_token,
+            access_token,
+            refresh_token,
+            account_id,
+            StoredAuthMode::Managed,
+            false,
+        )
+    })
 }
 
 fn write_imported_refresh_auth(
@@ -910,29 +920,42 @@ fn write_imported_refresh_auth(
     refresh_token: &str,
     account_id: &str,
 ) -> Result<()> {
-    write_auth_json(
-        &kit_auth_path(home),
-        id_token,
-        access_token,
-        refresh_token,
-        account_id,
-        StoredAuthMode::Managed,
-        true,
-    )
+    remember_accounts_around(home, || {
+        write_auth_json(
+            &kit_auth_path(home),
+            id_token,
+            access_token,
+            refresh_token,
+            account_id,
+            StoredAuthMode::Managed,
+            true,
+        )
+    })
 }
 
 fn write_access_token_auth(home: &Path, access_token: &str, account_id: &str) -> Result<()> {
     // 与 Codex 的 external access token 结构一致：AT 同时提供 JWT 身份声明，
     // refresh_token 保留为空字符串，auth_mode 标记为 chatgptAuthTokens。
-    write_auth_json(
-        &kit_auth_path(home),
-        access_token,
-        access_token,
-        "",
-        account_id,
-        StoredAuthMode::ExternalAccessToken,
-        true,
-    )
+    remember_accounts_around(home, || {
+        write_auth_json(
+            &kit_auth_path(home),
+            access_token,
+            access_token,
+            "",
+            account_id,
+            StoredAuthMode::ExternalAccessToken,
+            true,
+        )
+    })
+}
+
+/// Saves the outgoing Kit login into the account vault before a new login
+/// replaces it, and the new login afterwards, so no account is lost.
+fn remember_accounts_around(home: &Path, write: impl FnOnce() -> Result<()>) -> Result<()> {
+    crate::accounts::capture_quietly(home);
+    write()?;
+    crate::accounts::capture_quietly(home);
+    Ok(())
 }
 
 fn write_auth_json(
@@ -997,7 +1020,7 @@ fn write_auth_json(
     atomic_write(path, &serde_json::to_vec_pretty(&auth)?)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_file_name(format!(
         "{}.tmp",
         path.file_name()
@@ -1009,7 +1032,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_auth_file(path: &Path) -> Result<Option<Value>> {
+pub(crate) fn read_auth_file(path: &Path) -> Result<Option<Value>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -1018,7 +1041,7 @@ fn read_auth_file(path: &Path) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
-fn status_from_auth(auth: &Value) -> LoginStatus {
+pub(crate) fn status_from_auth(auth: &Value) -> LoginStatus {
     let tokens = auth.get("tokens").and_then(Value::as_object);
     let access = tokens
         .and_then(|map| map.get("access_token"))

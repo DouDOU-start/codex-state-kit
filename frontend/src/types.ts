@@ -371,3 +371,17 @@ export interface PricingView {
   info: PricingCatalogInfo;
   models: ModelPriceRow[];
 }
+
+export interface SavedAccount {
+  accountId: string;
+  email?: string | null;
+  label?: string | null;
+  authMode?: string | null;
+  /** Access-token imports cannot refresh and must be re-imported on expiry. */
+  refreshable: boolean;
+  /** The saved credentials still look usable. */
+  usable: boolean;
+  active: boolean;
+  addedAt: string;
+  lastUsedAt?: string | null;
+}

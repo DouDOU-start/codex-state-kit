@@ -426,3 +426,33 @@ svg { flex-shrink: 0; }
 @media (max-width: 560px) { .token-reuse-policy__options { grid-template-columns: 1fr; } }
 @media (max-width: 740px) { .billing-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .billing-metrics > div:first-child { grid-column: 1 / -1; } .billing-record { grid-template-columns: 66px minmax(110px, 1fr) 74px; } .billing-record__tokens { display: none; } }
 @media (max-width: 440px) { .billing-panel__toolbar { align-items: stretch; flex-direction: column; } .billing-account-select { justify-content: space-between; } .billing-account-select select { flex: 1; max-width: none; } .billing-record { grid-template-columns: 1fr auto; gap: 4px 8px; } .billing-record__time { grid-column: 1 / 2; } .billing-record__cost { grid-column: 2; grid-row: 1 / 3; } .billing-record__main { grid-column: 1; } }
+
+.tab-panel--split > .accounts-panel { grid-column: 1 / -1; }
+.accounts-panel > header { margin-bottom: 12px; }
+.accounts-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.accounts-item { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fbfcfd; }
+.accounts-item--active { border-color: #b8cde4; background: var(--accent-soft); }
+.accounts-item__avatar { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 50%; color: var(--accent-strong); background: #e2ecf7; font-size: 13px; font-weight: 700; }
+.accounts-item--active .accounts-item__avatar { color: #fff; background: var(--accent); }
+.accounts-item__main { display: grid; min-width: 0; gap: 4px; }
+.accounts-item__main strong { display: flex; align-items: baseline; gap: 8px; min-width: 0; overflow: hidden; color: var(--text); font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.accounts-item__main strong small { color: var(--muted); font-size: 10px; font-weight: 400; }
+.accounts-item__meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; color: var(--muted); font-size: 10px; }
+.accounts-item__meta code { font: 10px "Cascadia Code", Consolas, monospace; color: var(--text-soft); }
+.accounts-tag { padding: 1px 6px; border-radius: 999px; font-size: 9px; font-weight: 600; }
+.accounts-tag--warm { color: var(--warm); background: var(--warm-soft); }
+.accounts-tag--bad { color: var(--red); background: var(--red-soft); }
+.accounts-item__actions { display: flex; align-items: center; gap: 6px; }
+.accounts-item__current { display: inline-flex; align-items: center; gap: 4px; padding: 0 9px; min-height: 28px; color: var(--green); font-size: 10px; font-weight: 650; }
+.accounts-icon-button { display: grid; width: 28px; height: 28px; place-items: center; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--surface); cursor: pointer; }
+.accounts-icon-button:hover:not(:disabled) { color: var(--accent-strong); border-color: #b8cbe0; background: var(--accent-soft); }
+.accounts-icon-button--danger:hover:not(:disabled) { color: var(--red); border-color: #efd6d3; background: var(--red-soft); }
+.accounts-item__edit { display: flex; align-items: center; gap: 4px; }
+.accounts-item__edit input { width: 220px; height: 28px; padding: 0 8px; border: 1px solid #83a8d0; border-radius: 6px; color: var(--text); background: #fff; font-size: 12px; }
+.accounts-item__edit input:focus { outline: none; box-shadow: 0 0 0 3px #477bb413; }
+.accounts-item__edit button { display: grid; width: 26px; height: 26px; place-items: center; border: 1px solid var(--line); border-radius: 6px; color: var(--text-soft); background: var(--surface); cursor: pointer; }
+.accounts-empty { margin: 0; padding: 14px; border: 1px dashed var(--line-strong); border-radius: 8px; color: var(--muted); font-size: 11px; text-align: center; }
+.account-switcher { display: inline-flex; align-items: center; gap: 6px; min-height: 26px; padding: 0 4px 0 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--text-soft); background: var(--surface); }
+.account-switcher select { max-width: 180px; height: 24px; border: 0; color: var(--text); background: transparent; font-size: 11px; cursor: pointer; }
+.account-switcher select:focus { outline: none; }
+@media (max-width: 640px) { .accounts-item { grid-template-columns: 34px minmax(0, 1fr); } .accounts-item__actions { grid-column: 1 / -1; justify-content: flex-end; } }

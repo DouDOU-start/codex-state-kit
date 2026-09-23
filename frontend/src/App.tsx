@@ -13,6 +13,7 @@ import Radio from "lucide-react/dist/esm/icons/radio.js";
 import Waypoints from "lucide-react/dist/esm/icons/waypoints.js";
 import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.js";
 import Settings2 from "lucide-react/dist/esm/icons/settings-2.js";
+import Users from "lucide-react/dist/esm/icons/users.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
 import BadgeDollarSign from "lucide-react/dist/esm/icons/badge-dollar-sign.js";
 import { AppShell } from "@/components/AppShell";
@@ -20,6 +21,7 @@ import { BillingPanel } from "@/components/BillingPanel";
 import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
 import { UsageRecordsPanel } from "@/components/UsageRecordsPanel";
 import { PricingPanel } from "@/components/PricingPanel";
+import { AccountsPanel, accountName } from "@/components/AccountsPanel";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
 import type { LoginMode, Status, LatencySample, VmIdentityView } from "@/types";
@@ -86,6 +88,7 @@ export default function App() {
   const [accessTokenInput, setAccessTokenInput] = useState("");
   const [tab, setTab] = useState<TabId>(initialTab);
   const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
+  const loginPanelRef = useRef<HTMLElement>(null);
   const hydrated = useRef(false);
 
   useEffect(() => {
@@ -236,6 +239,24 @@ export default function App() {
             ))}
           </div>
           <div className="page-actions">
+            {fwd.accounts.length > 1 ? (
+              <label className="account-switcher" title="切换账号">
+                <Users size={13} aria-hidden="true" />
+                <select
+                  aria-label="切换账号"
+                  disabled={fwd.busy !== null || Boolean(fwd.device)}
+                  value={fwd.accounts.find((account) => account.active)?.accountId ?? ""}
+                  onChange={(event) => void fwd.switchToAccount(event.target.value)}
+                >
+                  {fwd.accounts.some((account) => account.active) ? null : <option value="">未使用已保存账号</option>}
+                  {fwd.accounts.map((account) => (
+                    <option key={account.accountId} value={account.accountId} disabled={!account.usable}>
+                      {accountName(account)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
             <span className={chipClass(fwd.status)}>
               <i />
               {chipLabel(fwd.status)}
@@ -427,7 +448,18 @@ export default function App() {
         </section>
 
         <div className="tab-panel tab-panel--split" role="tabpanel" id="tabpanel-account" aria-labelledby="tab-account" hidden={tab !== "account"}>
-        <section className="panel">
+        <AccountsPanel
+          accounts={fwd.accounts}
+          busy={fwd.busy !== null || Boolean(fwd.device)}
+          onSwitch={(accountId) => void fwd.switchToAccount(accountId)}
+          onRemove={(accountId) => void fwd.removeSavedAccount(accountId)}
+          onRename={(accountId, label) => void fwd.renameSavedAccount(accountId, label)}
+          onAdd={() => {
+            loginPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+            loginPanelRef.current?.querySelector<HTMLButtonElement>(".login-methods button[aria-pressed=\"true\"]")?.focus();
+          }}
+        />
+        <section className="panel" ref={loginPanelRef}>
           <header>
             <div className="section-heading"><span className="section-icon section-icon--warm"><Terminal size={19} /></span><div><h2>Codex 接入</h2><p>登录账号，连接你的客户端</p></div></div>
           </header>
@@ -530,7 +562,7 @@ export default function App() {
                   onClick={() => void fwd.startLogin(codexHome, loginMode)}
                 >
                   {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
-                  重新登录
+                  登录新账号
                 </button>
               </div>
             ) : (

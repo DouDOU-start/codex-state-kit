@@ -1,3 +1,4 @@
+use codex_state_kit::accounts::{self, AccountView};
 use codex_state_kit::billing::{BillingSummary, PricingRuleSpec, UsageFilter, UsageRecordsPage};
 use codex_state_kit::pricing::{CatalogInfo, ModelPriceRow};
 use codex_state_kit::{
@@ -263,6 +264,52 @@ pub async fn get_login_status(
     let settings = state.core().settings.lock().await.clone();
     let home = home.unwrap_or(settings.codex_home);
     Ok(login_status(std::path::Path::new(&home)))
+}
+
+async fn codex_home(state: &AppState, home: Option<String>) -> PathBuf {
+    PathBuf::from(home.unwrap_or(state.core().settings.lock().await.codex_home.clone()))
+}
+
+/// Saved ChatGPT accounts; the live Kit login is imported on first call.
+#[tauri::command(async)]
+pub async fn list_accounts(
+    state: State<'_, AppState>,
+    home: Option<String>,
+) -> CommandResult<Vec<AccountView>> {
+    let home = codex_home(&state, home).await;
+    command(accounts::list(&home))
+}
+
+/// Switches Kit to a saved account. Forwarded requests use it right away.
+#[tauri::command(async)]
+pub async fn switch_account(
+    state: State<'_, AppState>,
+    home: Option<String>,
+    account_id: String,
+) -> CommandResult<LoginStatus> {
+    let home = codex_home(&state, home).await;
+    command(accounts::switch(&home, &account_id))
+}
+
+#[tauri::command(async)]
+pub async fn remove_account(
+    state: State<'_, AppState>,
+    home: Option<String>,
+    account_id: String,
+) -> CommandResult<()> {
+    let home = codex_home(&state, home).await;
+    command(accounts::remove(&home, &account_id))
+}
+
+#[tauri::command(async)]
+pub async fn rename_account(
+    state: State<'_, AppState>,
+    home: Option<String>,
+    account_id: String,
+    label: String,
+) -> CommandResult<()> {
+    let home = codex_home(&state, home).await;
+    command(accounts::rename(&home, &account_id, &label))
 }
 
 #[tauri::command(async)]
