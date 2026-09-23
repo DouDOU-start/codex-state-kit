@@ -237,6 +237,10 @@ pub struct UsageTotals {
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub cost_nanos: Option<i64>,
+    /// Sum over the requests that have a price, whatever the others are.
+    pub priced_cost_nanos: i64,
+    /// Requests without a price: no matching price, or no usage reported.
+    pub unpriced_count: u64,
     // Kept out of the wire format.  A summary must remain NULL when any row
     // in that bucket has unknown usage or no matching price rule.
     #[serde(skip)]
@@ -255,6 +259,8 @@ impl Default for UsageTotals {
             output_tokens: 0,
             reasoning_tokens: 0,
             cost_nanos: None,
+            priced_cost_nanos: 0,
+            unpriced_count: 0,
             cost_complete: true,
         }
     }
@@ -861,7 +867,7 @@ impl BillingStore {
         }
         let where_sql = clauses.join(" AND ");
         let refs: Vec<&dyn ToSql> = args.iter().map(|v| v.as_ref() as &dyn ToSql).collect();
-        let mut stmt = conn.prepare(&format!("SELECT a.provider,a.upstream_account_id,a.display_email,MIN(u.started_at),MAX(u.started_at),u.source,u.state,COUNT(*),COALESCE(SUM(u.input_tokens),0),COALESCE(SUM(u.cached_input_tokens),0),COALESCE(SUM(u.output_tokens),0),CASE WHEN COUNT(u.cost_nanos)=COUNT(*) THEN SUM(u.cost_nanos) ELSE NULL END,COALESCE(SUM(u.cache_write_tokens),0),COALESCE(SUM(u.reasoning_tokens),0) FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE {where_sql} GROUP BY a.id,u.source,u.state ORDER BY a.provider,a.upstream_account_id"))?;
+        let mut stmt = conn.prepare(&format!("SELECT a.provider,a.upstream_account_id,a.display_email,MIN(u.started_at),MAX(u.started_at),u.source,u.state,COUNT(*),COALESCE(SUM(u.input_tokens),0),COALESCE(SUM(u.cached_input_tokens),0),COALESCE(SUM(u.output_tokens),0),CASE WHEN COUNT(u.cost_nanos)=COUNT(*) THEN SUM(u.cost_nanos) ELSE NULL END,COALESCE(SUM(u.cache_write_tokens),0),COALESCE(SUM(u.reasoning_tokens),0),COALESCE(SUM(u.cost_nanos),0),COUNT(u.cost_nanos) FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE {where_sql} GROUP BY a.id,u.source,u.state ORDER BY a.provider,a.upstream_account_id"))?;
         let mut grouped: std::collections::BTreeMap<(String, String), AccountSummary> =
             std::collections::BTreeMap::new();
         let rows = stmt.query_map(refs.as_slice(), |row| {
@@ -880,6 +886,8 @@ impl BillingStore {
                 row.get::<_, Option<i64>>(11)?,
                 row.get::<_, i64>(12)?,
                 row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, i64>(15)?,
             ))
         })?;
         for row in rows {
@@ -898,6 +906,8 @@ impl BillingStore {
                 cost,
                 cache_write,
                 reasoning,
+                priced_sum,
+                priced_count,
             ) = row?;
             let item = grouped
                 .entry((provider.clone(), account_id.clone()))
@@ -923,8 +933,9 @@ impl BillingStore {
                 &mut item.internal
             };
             let tokens = [input, cached, cache_write, output, reasoning];
-            add_totals(destination, count, &state, tokens, cost);
-            add_totals(&mut item.total, count, &state, tokens, cost);
+            let priced = (priced_sum, priced_count);
+            add_totals(destination, count, &state, tokens, cost, priced);
+            add_totals(&mut item.total, count, &state, tokens, cost, priced);
         }
         Ok(BillingSummary {
             generated_at: chrono::Utc::now().to_rfc3339(),
@@ -935,13 +946,15 @@ impl BillingStore {
     }
 }
 
-/// `tokens` = [input, cached input, cache write, output, reasoning].
+/// `tokens` = [input, cached input, cache write, output, reasoning];
+/// `priced` = (cost sum, count) over the rows that have a price.
 fn add_totals(
     target: &mut UsageTotals,
     count: i64,
     state: &str,
     tokens: [i64; 5],
     cost: Option<i64>,
+    priced: (i64, i64),
 ) {
     let [input, cached, cache_write, output, reasoning] = tokens.map(|v| v.max(0) as u64);
     target.request_count = target.request_count.saturating_add(count.max(0) as u64);
@@ -959,6 +972,10 @@ fn add_totals(
     target.cache_write_tokens = target.cache_write_tokens.saturating_add(cache_write);
     target.output_tokens = target.output_tokens.saturating_add(output);
     target.reasoning_tokens = target.reasoning_tokens.saturating_add(reasoning);
+    target.priced_cost_nanos = target.priced_cost_nanos.saturating_add(priced.0);
+    target.unpriced_count = target
+        .unpriced_count
+        .saturating_add((count - priced.1).max(0) as u64);
     if target.cost_complete {
         if let Some(cost) = cost {
             target.cost_nanos = Some(target.cost_nanos.unwrap_or(0).saturating_add(cost));
@@ -1237,6 +1254,10 @@ mod tests {
         assert_eq!(account.total.request_count, 2);
         assert_eq!(account.total.cost_nanos, None);
         assert_eq!(account.business.cost_nanos, None);
+        // The priced part is still reported, with the rest counted.
+        assert_eq!(account.total.priced_cost_nanos, 3);
+        assert_eq!(account.total.unpriced_count, 1);
+        assert_eq!(account.business.unpriced_count, 1);
     }
 
     #[test]
