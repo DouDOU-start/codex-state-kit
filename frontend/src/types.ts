@@ -315,6 +315,8 @@ export interface BillingRecord {
   cacheReadCostNanos?: number | null;
   cacheWriteCostNanos?: number | null;
   outputCostNanos?: number | null;
+  /** Persisted time to first visible output. */
+  firstTokenMs?: number | null;
   costNanos?: number | null;
   currency?: string | null;
   errorKind?: string | null;

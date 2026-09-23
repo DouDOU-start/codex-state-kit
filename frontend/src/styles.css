@@ -320,7 +320,6 @@ svg { flex-shrink: 0; }
 .usage-latency--slow { color: #c2410c; }
 .usage-table__cost { font-variant-numeric: tabular-nums; }
 .usage-table__cost strong { font-weight: 650; }
-.usage-table__client { color: var(--muted); font-size: 10px; }
 .usage-dash { display: grid; gap: 14px; }
 .usage-dash__header, .usage-dash__tools { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .usage-dash__header h2 { margin: 0; font-size: 16px; }

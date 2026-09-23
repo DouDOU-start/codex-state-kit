@@ -177,7 +177,7 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
         clock.date,
         record.sentModel || record.requestedModel || "未知模型",
         typeLabel(record),
-        `首字 ${formatDuration(log?.firstTokenMs)}`,
+        `首字 ${formatDuration(record.firstTokenMs ?? log?.firstTokenMs)}`,
         `总耗时 ${formatDuration(log?.ms ?? durationMs(record))}`,
         `in ${record.inputTokens ?? "—"}`,
         `cache_read ${record.cachedInputTokens ?? 0}`,
@@ -245,14 +245,13 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
                 <th>延迟</th>
                 <th>计量</th>
                 <th>费用</th>
-                <th>客户端</th>
               </tr>
             </thead>
             <tbody>
               {visible.map((record) => {
                 const clock = recordClock(record);
                 const log = matchLog(record, status.logs);
-                const first = log?.firstTokenMs ?? null;
+                const first = record.firstTokenMs ?? log?.firstTokenMs ?? null;
                 const total = log?.ms ?? durationMs(record);
                 const model = record.sentModel || record.requestedModel || "未知模型";
                 const tier = record.serviceTier ? TIER_LABEL[record.serviceTier] : undefined;
@@ -286,7 +285,6 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
                       <strong>{formatMoney(record.costNanos)}</strong>
                       {parts.map((part) => <small key={part}>{part}</small>)}
                     </td>
-                    <td className="usage-table__client">本机代理</td>
                   </tr>
                 );
               })}

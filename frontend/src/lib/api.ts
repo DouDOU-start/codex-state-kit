@@ -598,6 +598,7 @@ const mockBillingRecords: BillingRecord[] = [
     cacheWriteCostNanos: 0,
     outputCostNanos: 10_240_000,
     costNanos: 17_612_800,
+    firstTokenMs: 1_840,
     currency: "USD",
   },
   {

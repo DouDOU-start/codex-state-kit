@@ -10,6 +10,16 @@ use state::AppState;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must be registered first: a second launch exits here before it can
+        // re-attach Codex, back up auth.json or bind the proxy port again,
+        // and the running Kit's window is brought to the front instead.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let resource_dir = app.path().resource_dir()?;
