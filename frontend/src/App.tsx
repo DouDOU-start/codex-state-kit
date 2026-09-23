@@ -181,8 +181,7 @@ export default function App() {
               onClick={() => setNetworkLogsOpen(true)}
             >
               <Activity size={13} />
-              网络日志
-              <span className="network-log-trigger__count">{fwd.status.logs.length}</span>
+              使用记录
             </button>
           </div>
         </div>

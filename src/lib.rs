@@ -1,5 +1,6 @@
 pub mod attach;
 pub mod billing;
+pub mod body_model;
 pub mod browser_login;
 pub mod chatgpt_cookies;
 pub mod diag;

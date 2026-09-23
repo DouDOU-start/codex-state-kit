@@ -103,7 +103,7 @@ async fn account_switch_preserves_request_identity_and_rejects_old_tickets() {
         ));
         let (headers, reply) = requests.recv().await.unwrap();
         assert_eq!(headers["authorization"], "Bearer access-account-a");
-        assert_eq!(headers[turn_state::HEADER_NAME], token_a);
+        assert!(!headers.contains_key(turn_state::HEADER_NAME));
         let (finish_a, wait_a) = oneshot::channel();
         reply
             .send(Response::new(Body::from_stream(
@@ -122,11 +122,7 @@ async fn account_switch_preserves_request_identity_and_rejects_old_tickets() {
             let (headers, reply) = requests.recv().await.unwrap();
             assert_eq!(headers["authorization"], "Bearer access-account-b");
             assert_eq!(headers["chatgpt-account-id"], "account-b");
-            if client != Some("account-b") {
-                assert!(!headers.contains_key(turn_state::HEADER_NAME));
-            } else {
-                assert_eq!(headers[turn_state::HEADER_NAME], token_a);
-            } // Caller-supplied same-account state is opaque.
+            assert!(!headers.contains_key(turn_state::HEADER_NAME));
             reply.send(Response::new(Body::from("done-b"))).unwrap();
             axum::body::to_bytes(pending.await.unwrap().into_body(), 1024)
                 .await
@@ -137,9 +133,7 @@ async fn account_switch_preserves_request_identity_and_rejects_old_tickets() {
                 entry.account_email.as_deref(),
                 Some("account-b@example.com")
             );
-            if client != Some("account-b") {
-                assert_eq!(entry.turn_state_action, "removed_account_mismatch");
-            }
+            assert_eq!(entry.turn_state_action, "not_applicable");
         }
         app.sync_logged_in_account().await;
         assert!(app
@@ -158,7 +152,7 @@ async fn account_switch_preserves_request_identity_and_rejects_old_tickets() {
             request(Some("account-a"), &token_a),
         ));
         let (headers, reply) = requests.recv().await.unwrap();
-        assert_eq!(headers[turn_state::HEADER_NAME], token_b);
+        assert!(!headers.contains_key(turn_state::HEADER_NAME));
         assert_eq!(headers["chatgpt-account-id"], "account-b");
         reply.send(Response::new(Body::from("done-b"))).unwrap();
         axum::body::to_bytes(pending.await.unwrap().into_body(), 1024)

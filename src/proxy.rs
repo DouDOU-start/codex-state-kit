@@ -1716,25 +1716,6 @@ impl ProxyHandle {
 
     async fn start_fetch_loop(&self) {
         self.stop_fetch_loop().await;
-        let (tx, mut rx) = oneshot::channel();
-        *self.fetch_stop.lock().await = Some(tx);
-        let app = self.app.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let wait = app.refresh_if_needed().await;
-                tokio::select! {
-                    _ = &mut rx => break,
-                    _ = tokio::time::sleep(wait) => {}
-                    _ = app.degrade_notify.notified() => {
-                        eprintln!("312 信号唤醒 fetch 循环，立即续期");
-                    }
-                    _ = app.model_notify.notified() => {
-                        eprintln!("新模型发现，唤醒 fetch 循环");
-                    }
-                }
-            }
-        });
-        *self.fetch_task.lock().await = Some(handle);
     }
 
     async fn stop_fetch_loop(&self) {
@@ -2768,19 +2749,21 @@ async fn forward_http_tracked(
         .context("read body")?;
     details.body_bytes = bytes.len();
 
-    let compacting = turn_state::is_context_compaction(path, &bytes);
-    let should_stamp = turn_state::should_stamp_http(parts.method.as_str(), path) && !compacting;
     let content_encoding = parts
         .headers
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .map(|value| value.to_string());
     details.content_encoding = logs::safe_content_encoding(content_encoding.as_deref());
-    if should_stamp {
+    if path.contains("/responses") {
         if let Some(forced) = request_settings.forced_model() {
-            bytes = turn_state::rewrite_model_in_body(&bytes, content_encoding.as_deref(), forced)
-                .map_err(|err| anyhow::anyhow!("{err}"))?
-                .into();
+            bytes = crate::body_model::rewrite_model_in_body(
+                &bytes,
+                content_encoding.as_deref(),
+                forced,
+            )
+            .map_err(|err| anyhow::anyhow!("{err}"))?
+            .into();
             details.body_bytes = bytes.len();
         }
     }
@@ -2795,25 +2778,14 @@ async fn forward_http_tracked(
         "http".into()
     };
     debug_log(&format!(
-        "[proxy] {} {} body={}bytes encoding={} should_stamp={}",
+        "[proxy] {} {} body={}bytes encoding={}",
         parts.method,
         path,
         bytes.len(),
         details.content_encoding,
-        should_stamp
     ));
 
-    let client_account = request_account(&parts.headers);
     let request_identity = app.sync_request_identity(Path::new(&home)).await;
-    let client_credentials_conflict = request_identity
-        .as_ref()
-        .is_some_and(|(creds, _)| login::credentials_conflict_headers(&parts.headers, creds));
-    let request_account_matches =
-        request_identity
-            .as_ref()
-            .is_some_and(|(creds, override_headers)| {
-                *override_headers || login::credentials_match_headers(&parts.headers, creds)
-            });
     let billing_identity_matches =
         request_identity
             .as_ref()
@@ -2826,11 +2798,6 @@ async fn forward_http_tracked(
         }
     }
     let effective_account = request_account(&parts.headers);
-    let account_changed = request_identity
-        .as_ref()
-        .is_some_and(|(creds, override_headers)| {
-            *override_headers && client_account.as_deref() != Some(creds.account_id.as_str())
-        });
     if let Some((creds, _)) = request_identity
         .as_ref()
         .filter(|_| billing_identity_matches)
@@ -2848,206 +2815,17 @@ async fn forward_http_tracked(
             .as_deref()
             .map(|id| logs::safe_text(id, 128));
     }
-    let request_model = should_stamp
-        .then(|| turn_state::extract_model_from_body(&bytes))
-        .flatten();
-    let same_turn = should_stamp && turn_state::is_same_turn_follow_up(&bytes);
-    let mut client_had_state = false;
-    let mut injected_token: Option<String> = None;
-    if should_stamp {
-        details.model = request_model
-            .as_deref()
-            .map(|model| logs::safe_text(model, 80))
-            .filter(|model| !model.is_empty());
-        if state_miss_policy == StateMissPolicy::Wait && client_credentials_conflict {
-            return Err(state_wait_error(
-                details,
-                StatusCode::CONFLICT,
-                "state_account_mismatch",
-                "账号凭据不匹配，请同步 Codex 登录账号后重试；请求未转发",
-            ));
-        }
-        if request_model.is_none() {
-            debug_log(&format!(
-                "[proxy] 未能解析 model，body={}bytes encoding={}",
-                bytes.len(),
-                details.content_encoding
-            ));
-        }
-
-        // 被动发现：从请求中提取模型，自动注册到 token 池
-        if let Some(ref model) = request_model {
-            let is_new = app.turn_state.lock().await.register_model(model);
-            if is_new {
-                debug_log(&format!(
-                    "[discover] 发现新模型: {}，通知 fetch 循环预取 token",
-                    model
-                ));
-                app.model_notify.notify_one();
-            }
-        }
-
-        let client_already_has = turn_state::has_http_turn_state(&parts.headers)
-            || turn_state::has_body_turn_state(&bytes);
-        client_had_state = client_already_has;
-        if state_miss_policy == StateMissPolicy::StripAll {
-            parts.headers.remove(turn_state::HEADER_NAME);
-            details.turn_state_action = "removed_all_policy".into();
-        } else if state_miss_policy == StateMissPolicy::Passthrough {
-            details.turn_state_action = if client_already_has {
-                "preserved_by_policy"
-            } else {
-                "initial_request"
-            }
-            .into();
-            details.turn_state_len = parts
-                .headers
-                .get(turn_state::HEADER_NAME)
-                .and_then(|value| value.to_str().ok())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::len);
-        } else {
-            // 探针当作每轮第一包。新一轮首包补上规范票据并包装成同轮第二包；
-            // 同轮续跑只改请求头，保留客户端 body（含 previous_response_id）。
-            let mut token = {
-                let store = app.turn_state.lock().await;
-                if request_account_matches
-                    && effective_account
-                        .as_deref()
-                        .is_some_and(|id| store.is_bound_to_account(id))
-                {
-                    request_model
-                        .as_deref()
-                        .and_then(|model| store.peek_for_model(model))
-                        .and_then(|value| turn_state::injectable_http_token(&value))
-                } else {
-                    None
-                }
-            };
-            let waited = token.is_none() && state_miss_policy == StateMissPolicy::Wait;
-            if waited {
-                token = turn_state::injectable_http_token(
-                    &wait_for_request_state(
-                        app,
-                        &request_settings,
-                        effective_account.as_deref(),
-                        request_model.as_deref(),
-                        details,
-                    )
-                    .await?,
-                );
-            }
-            if let Some(token) = token {
-                turn_state::apply_http_header(&mut parts.headers, &token);
-                // 同轮续跑（带 previous_response_id 或 tool output）只换请求头。
-                // 客户端往往不回带 State；若仍包装第二包会丢掉 previous_response_id，
-                // 子代理多步后续跑会空转推理。
-                let header_only = same_turn;
-                if !header_only {
-                    match turn_state::wrap_as_second_packet(
-                        &bytes,
-                        content_encoding.as_deref(),
-                        &token,
-                    ) {
-                        Ok(wrapped) => {
-                            bytes = wrapped.into();
-                            details.body_bytes = bytes.len();
-                        }
-                        Err(err) => {
-                            eprintln!("[stamp] 包装同轮第二包失败，仅写入请求头: {err}");
-                        }
-                    }
-                }
-                details.turn_state_action = if header_only {
-                    if waited {
-                        "header_only_after_wait".into()
-                    } else {
-                        "header_only".into()
-                    }
-                } else {
-                    match (client_already_has, waited) {
-                        (true, true) => "replaced_after_wait".into(),
-                        (true, false) => "replaced".into(),
-                        (false, true) => "injected_after_wait".into(),
-                        (false, false) => "injected".into(),
-                    }
-                };
-                details.turn_state_len = Some(token.len());
-                eprintln!(
-                    "[stamp] {} turn_state → token len={} model={:?} body={} 到 {} {}",
-                    if header_only {
-                        "只改请求头"
-                    } else if client_already_has {
-                        "替换"
-                    } else {
-                        "补上"
-                    },
-                    token.len(),
-                    request_model,
-                    if header_only {
-                        "原样"
-                    } else {
-                        "包装第二包"
-                    },
-                    parts.method,
-                    path
-                );
-                injected_token = Some(token);
-            } else if client_already_has {
-                if state_miss_policy == StateMissPolicy::Strip {
-                    parts.headers.remove(turn_state::HEADER_NAME);
-                    details.turn_state_action = "removed_by_policy".into();
-                } else if account_changed {
-                    parts.headers.remove(turn_state::HEADER_NAME);
-                    details.turn_state_action = "removed_account_mismatch".into();
-                } else {
-                    details.turn_state_action = match (&request_model, request_account_matches) {
-                        (None, _) => "preserved_unknown_model".into(),
-                        (Some(_), false) => "preserved_account_mismatch".into(),
-                        (Some(_), true) => "preserved_no_ticket".into(),
-                    };
-                    details.turn_state_len = parts
-                        .headers
-                        .get(turn_state::HEADER_NAME)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::len);
-                    eprintln!(
-                        "[stamp] 无可用 token（model={:?}），保留客户端原值 {} {}",
-                        request_model, parts.method, path
-                    );
-                }
-            } else {
-                details.turn_state_action = "initial_request".into();
-                eprintln!(
-                    "[stamp] 客户端未携带 State，且没有可注入的规范票据 {} {} model={:?}",
-                    parts.method, path, request_model
-                );
-            }
-        }
-    } else {
-        details.turn_state_action = if compacting {
-            "compaction_passthrough".into()
-        } else {
-            "not_applicable".into()
-        };
-        if state_miss_policy == StateMissPolicy::StripAll {
-            parts.headers.remove(turn_state::HEADER_NAME);
-            details.turn_state_action = "removed_all_policy".into();
-        }
-    }
-    let (bound_session, routing_cookies) = {
-        let store = app.turn_state.lock().await;
-        (
-            store.proxy_session_for_token(injected_token.as_deref()),
-            injected_token
-                .as_deref()
-                .map(|token| store.routing_cookies_for_token(Some(token)))
-                .unwrap_or_default(),
-        )
-    };
+    let request_model = crate::body_model::extract_model_from_body(&bytes);
+    let same_turn = false;
+    let client_had_state = false;
+    let injected_token: Option<String> = None;
+    details.model = request_model
+        .as_deref()
+        .map(|model| logs::safe_text(model, 80))
+        .filter(|model| !model.is_empty());
+    details.turn_state_action = "not_applicable".into();
+    let bound_session: Option<String> = None;
+    let routing_cookies: Vec<crate::chatgpt_cookies::RoutingCookie> = Vec::new();
     details.proxy_session = bound_session.clone();
     details.diag = Some(diag::Request {
         id: diag::next_id(),
@@ -3074,18 +2852,8 @@ async fn forward_http_tracked(
             }),
         );
     }
-    details.injected_token = injected_token.clone();
+    details.injected_token = None;
     parts.headers.remove(header::COOKIE);
-    if injected_token.is_some() {
-        let chatgpt_host = chatgpt_cookies::is_chatgpt_https_url(&target);
-        if !routing_cookies.is_empty() || chatgpt_host {
-            chatgpt_cookies::apply_to_headers(&mut parts.headers, &routing_cookies, chatgpt_host);
-            let names = chatgpt_cookies::cookie_names(&routing_cookies);
-            if !names.is_empty() {
-                debug_log(&format!("[stamp] 回放线路 cookie {}", names.join(",")));
-            }
-        }
-    }
     // Persist the account/request association before sending upstream. The
     // account comes from the credentials actually applied to this request, so
     // a late login switch cannot reassign an in-flight response.
@@ -3096,9 +2864,7 @@ async fn forward_http_tracked(
             .map(|(creds, _)| (creds.account_id.clone(), creds.email.clone()))
             .expect("billing_identity_matches implies an identity");
         let request_id = uuid::Uuid::new_v4().to_string();
-        let sent_model = request_model
-            .clone()
-            .or_else(|| turn_state::extract_model_from_body(&bytes));
+        let sent_model = request_model.clone();
         app.billing
             .begin_request(RequestStart {
                 request_id: request_id.clone(),
@@ -3114,7 +2880,8 @@ async fn forward_http_tracked(
         *billing_request = Some(BillingRequest::new(app.billing.clone(), request_id));
     }
     let resolved_proxy = if fetch::has_session_placeholder(&upstream_proxy) {
-        let resolved = fetch::apply_bound_session(&upstream_proxy, bound_session.as_deref())?;
+        let (resolved, session) = fetch::resolve_probe_proxy(&upstream_proxy);
+        details.proxy_session = session.clone();
         details.proxy_endpoint = Some(logs::endpoint_origin(&resolved));
         resolved
     } else {
@@ -3170,7 +2937,10 @@ async fn forward_http_tracked(
         )
         .body(bytes);
     for (name, value) in &parts.headers {
-        if is_hop(name) || identity::is_vm_identity_header(name.as_str()) {
+        if is_hop(name)
+            || identity::is_vm_identity_header(name.as_str())
+            || name.as_str().eq_ignore_ascii_case("x-codex-turn-state")
+        {
             continue;
         }
         builder = builder.header(name, value);
@@ -3227,33 +2997,9 @@ async fn forward_http_tracked(
         .into(),
     );
 
-    // 记录上游响应详情，方便排查 token 失效
-    let upstream_turn_state = turn_state::header_token(upstream_resp.headers());
-    details.returned_turn_state_len = upstream_turn_state.as_ref().map(|token| token.len());
-    if let Some(model) =
-        degraded_response_model(request_model.as_deref(), upstream_turn_state.as_deref())
-    {
-        app.observe_business_response(model, injected_token.as_deref(), true, None, false)
-            .await;
-    }
-    let injected_len = injected_token.as_ref().map(|t| t.len());
-    let upstream_ts_len = upstream_turn_state.as_ref().map(|t| t.len());
-    let same_token = match (&injected_token, &upstream_turn_state) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    };
     eprintln!(
-        "[resp] {} {} → {} | 注入={}字节 上游返回={}字节 same={}",
-        parts.method,
-        path,
-        resp_status_u16,
-        injected_len
-            .map(|l| l.to_string())
-            .unwrap_or_else(|| "无".into()),
-        upstream_ts_len
-            .map(|l| l.to_string())
-            .unwrap_or_else(|| "无".into()),
-        same_token
+        "[resp] {} {} → {}",
+        parts.method, path, resp_status_u16
     );
 
     let status = StatusCode::from_u16(resp_status_u16)?;
@@ -3291,12 +3037,6 @@ async fn forward_responses_over_ws(
 ) -> Result<Response> {
     let mut frame =
         ws_bridge::http_body_to_ws_request(bytes).map_err(|err| anyhow::anyhow!(err))?;
-    if let Some(token) = headers
-        .get(turn_state::HEADER_NAME)
-        .and_then(|value| value.to_str().ok())
-    {
-        ws_bridge::ensure_turn_state(&mut frame, token);
-    }
     let identity = app.vm_identity.lock().await.clone();
     identity::rewrite_client_metadata_value(&mut frame, &identity);
     let model = frame
@@ -3516,40 +3256,6 @@ async fn prepare_client_ws_frame(app: &App, text: &str) -> Result<serde_json::Va
     if frame.get("type").is_none() {
         frame["type"] = serde_json::json!("response.create");
     }
-    let encoded = serde_json::to_vec(&frame).context("无法序列化客户端 WebSocket 帧")?;
-    let passthrough = matches!(
-        settings.state_miss_policy,
-        StateMissPolicy::Passthrough | StateMissPolicy::StripAll
-    );
-    if !passthrough
-        && !turn_state::is_same_turn_follow_up(&encoded)
-        && !turn_state::ws_has_turn_state(text)
-    {
-        let model = frame
-            .get("model")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        if let Some(model) = model.as_deref() {
-            app.turn_state.lock().await.register_model(model);
-        }
-        let token = {
-            let store = app.turn_state.lock().await;
-            model
-                .as_deref()
-                .and_then(|model| store.peek_for_model(model))
-                .and_then(|value| turn_state::injectable_http_token(&value))
-        };
-        if let Some(token) = token {
-            if let Some(stamped) = turn_state::stamp_ws_json(
-                &serde_json::to_string(&frame).unwrap_or_default(),
-                &token,
-            ) {
-                if let Ok(value) = serde_json::from_str(&stamped) {
-                    frame = value;
-                }
-            }
-        }
-    }
     let identity = app.vm_identity.lock().await.clone();
     identity::rewrite_client_metadata_value(&mut frame, &identity);
     Ok(frame)
@@ -3679,10 +3385,6 @@ mod upstream_proxy_tests;
 #[cfg(test)]
 #[path = "account_switch_tests.rs"]
 mod account_switch_tests;
-
-#[cfg(test)]
-#[path = "state_policy_tests.rs"]
-mod state_policy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4398,10 +4100,8 @@ mod tests {
             .await
             .unwrap();
         let headers = received.recv().await.unwrap();
-        let cookie = headers[header::COOKIE].to_str().unwrap();
-        assert!(cookie.contains("__oailb=route1"));
-        assert!(!cookie.contains("session"));
-        assert_eq!(headers[turn_state::HEADER_NAME], fresh);
+        assert!(headers.get(header::COOKIE).is_none());
+        assert!(headers.get(turn_state::HEADER_NAME).is_none());
         server.abort();
     }
 
