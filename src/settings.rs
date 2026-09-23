@@ -8,8 +8,22 @@ use url::Url;
 pub enum OutboundMode {
     #[default]
     Manual,
-    Warp,
     Mihomo,
+}
+
+fn deserialize_outbound_mode<'de, D>(deserializer: D) -> Result<OutboundMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref() {
+        Some("mihomo") => Ok(OutboundMode::Mihomo),
+        Some("manual") | Some("warp") | None | Some("") => Ok(OutboundMode::Manual),
+        Some(other) => Err(serde::de::Error::unknown_variant(
+            other,
+            &["manual", "mihomo"],
+        )),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,15 +48,6 @@ pub enum TokenReusePolicy {
     PerModel,
 }
 
-/// 业务转发与 Token 获取是否共用同一条出站线路。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkRoutePolicy {
-    #[default]
-    SameNetwork,
-    Separate,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -50,17 +55,14 @@ pub struct Settings {
     pub upstream: String,
     pub codex_home: String,
     pub outbound_proxy: String,
-    pub upstream_proxy: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_outbound_mode")]
     pub outbound_mode: OutboundMode,
-    pub warp_http2: bool,
     pub models: Vec<String>,
     pub state_miss_policy: StateMissPolicy,
     pub token_reuse_policy: TokenReusePolicy,
     /// 跨模型复用 292 时，只向这个模型索取共享票据。空字符串表示不指定。
     #[serde(default)]
     pub state_fetch_model: String,
-    pub network_route_policy: NetworkRoutePolicy,
     pub forced_model: String,
     #[serde(default)]
     pub token_fetch_paused: bool,
@@ -74,6 +76,9 @@ pub struct Settings {
     /// 固定使用的节点名。空字符串表示连上后用订阅里的第一个。
     #[serde(default)]
     pub mihomo_node: String,
+    /// 业务请求优先走上游 WebSocket。握手失败时仍回退 HTTP SSE。
+    #[serde(default = "default_ws_upstream_enabled")]
+    pub ws_upstream_enabled: bool,
 }
 
 impl Default for Settings {
@@ -83,29 +88,23 @@ impl Default for Settings {
             upstream: "https://chatgpt.com/backend-api/codex".into(),
             codex_home: home_dir().join(".codex").display().to_string(),
             outbound_proxy: String::new(),
-            upstream_proxy: String::new(),
-            outbound_mode: OutboundMode::Warp,
-            warp_http2: false,
+            outbound_mode: OutboundMode::Manual,
             models: vec![],
             state_miss_policy: StateMissPolicy::Preserve,
             token_reuse_policy: TokenReusePolicy::default(),
             state_fetch_model: String::new(),
-            network_route_policy: NetworkRoutePolicy::default(),
             forced_model: String::new(),
             token_fetch_paused: false,
             token_max_age_mins: default_token_max_age_mins(),
             token_prefetch_age_mins: default_token_prefetch_age_mins(),
             mihomo_subscription: String::new(),
             mihomo_node: String::new(),
+            ws_upstream_enabled: default_ws_upstream_enabled(),
         }
     }
 }
 
 impl Settings {
-    pub fn same_network(&self) -> bool {
-        self.network_route_policy == NetworkRoutePolicy::SameNetwork
-    }
-
     pub fn forced_model(&self) -> Option<&str> {
         let model = self.forced_model.trim();
         (!model.is_empty()).then_some(model)
@@ -142,6 +141,10 @@ fn default_token_max_age_mins() -> u32 {
 
 fn default_token_prefetch_age_mins() -> u32 {
     DEFAULT_TOKEN_PREFETCH_AGE_MINS
+}
+
+fn default_ws_upstream_enabled() -> bool {
+    true
 }
 
 fn normalize_mihomo_text(raw: &str, max_len: usize, label: &str) -> Result<String> {
@@ -181,12 +184,8 @@ pub struct SettingsPatch {
     pub codex_home: String,
     #[serde(default)]
     pub outbound_proxy: String,
-    #[serde(default)]
-    pub upstream_proxy: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_outbound_mode")]
     pub outbound_mode: OutboundMode,
-    #[serde(default)]
-    pub warp_http2: bool,
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
@@ -195,8 +194,6 @@ pub struct SettingsPatch {
     pub token_reuse_policy: TokenReusePolicy,
     #[serde(default)]
     pub state_fetch_model: String,
-    #[serde(default)]
-    pub network_route_policy: NetworkRoutePolicy,
     #[serde(default)]
     pub forced_model: String,
     #[serde(default)]
@@ -209,6 +206,8 @@ pub struct SettingsPatch {
     pub mihomo_subscription: String,
     #[serde(default)]
     pub mihomo_node: String,
+    #[serde(default = "default_ws_upstream_enabled")]
+    pub ws_upstream_enabled: bool,
 }
 
 impl SettingsPatch {
@@ -221,14 +220,11 @@ impl SettingsPatch {
             upstream: self.upstream.trim().to_string(),
             codex_home: self.codex_home.trim().to_string(),
             outbound_proxy: normalize_outbound_proxy(&self.outbound_proxy)?,
-            upstream_proxy: normalize_proxy(&self.upstream_proxy, "上游转发代理")?,
             outbound_mode: self.outbound_mode,
-            warp_http2: self.warp_http2,
             models,
             state_miss_policy: self.state_miss_policy,
             token_reuse_policy: self.token_reuse_policy,
             state_fetch_model: normalize_model_id(&self.state_fetch_model, "取 State 的模型")?,
-            network_route_policy: self.network_route_policy,
             forced_model: normalize_forced_model(&self.forced_model)?,
             token_fetch_paused: self.token_fetch_paused,
             token_max_age_mins: lifetime.0,
@@ -239,6 +235,7 @@ impl SettingsPatch {
                 "订阅地址",
             )?,
             mihomo_node: normalize_mihomo_text(&self.mihomo_node, 128, "节点名")?,
+            ws_upstream_enabled: self.ws_upstream_enabled,
         };
         if settings.proxy_listen.is_empty()
             || settings.upstream.is_empty()
@@ -277,13 +274,16 @@ pub fn load_settings() -> Settings {
 fn settings_from_json(raw: &str) -> Result<Settings> {
     let value: serde_json::Value = serde_json::from_str(raw)?;
     let mut settings: Settings = serde_json::from_value(value.clone())?;
-    // Preserve configured legacy proxies; use embedded WARP for unconfigured installs.
-    if value.get("outbound_mode").is_none() && settings.outbound_proxy.trim().is_empty() {
-        settings.outbound_mode = OutboundMode::Warp;
-    }
-    // 旧配置若已单独填写上游转发代理，保持分路，避免业务突然改走 Token 线路。
-    if value.get("network_route_policy").is_none() && !settings.upstream_proxy.trim().is_empty() {
-        settings.network_route_policy = NetworkRoutePolicy::Separate;
+    // 旧的分路配置只剩一条线路：出站地址为空时，把原来的业务代理搬过来。
+    if settings.outbound_proxy.trim().is_empty() {
+        if let Some(upstream) = value
+            .get("upstream_proxy")
+            .and_then(serde_json::Value::as_str)
+        {
+            if let Ok(proxy) = normalize_outbound_proxy(upstream) {
+                settings.outbound_proxy = proxy;
+            }
+        }
     }
     Ok(settings)
 }
@@ -355,13 +355,13 @@ mod tests {
         ] {
             let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
                 "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
-                "stateMissPolicy":name, "models":["test-model"], "upstreamProxy":"http://127.0.0.1:7890"
+                "stateMissPolicy":name, "models":["test-model"], "outboundProxy":"http://127.0.0.1:7890"
             })).unwrap();
             let settings = patch.into_settings().unwrap();
             let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
             assert_eq!(loaded.state_miss_policy, policy);
             assert_eq!(loaded.models, ["test-model"]);
-            assert_eq!(loaded.upstream_proxy, "http://127.0.0.1:7890");
+            assert_eq!(loaded.outbound_proxy, "http://127.0.0.1:7890");
         }
         assert!(serde_json::from_value::<StateMissPolicy>(serde_json::json!("unknown")).is_err());
     }
@@ -399,8 +399,8 @@ mod tests {
     }
 
     #[test]
-    fn upstream_proxy_defaults_and_round_trips() {
-        assert!(settings_from_json("{}").unwrap().upstream_proxy.is_empty());
+    fn outbound_proxy_defaults_and_round_trips() {
+        assert!(settings_from_json("{}").unwrap().outbound_proxy.is_empty());
         for proxy in [
             "",
             "http://127.0.0.1:7897",
@@ -412,12 +412,12 @@ mod tests {
         ] {
             let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
                 "proxyListen": "127.0.0.1:8787", "upstream": "https://example.com",
-                "codexHome": "test", "upstreamProxy": format!(" {proxy} ")
+                "codexHome": "test", "outboundProxy": format!(" {proxy} ")
             }))
             .unwrap();
             let settings = patch.into_settings().unwrap();
             let saved = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
-            assert_eq!(saved.upstream_proxy, proxy);
+            assert_eq!(saved.outbound_proxy, proxy);
         }
         for proxy in [
             "not a url",
@@ -471,61 +471,35 @@ mod tests {
             upstream: "https://chatgpt.com/backend-api/codex".into(),
             codex_home: "/tmp/codex".into(),
             outbound_proxy: "socks5://127.0.0.1:1080".into(),
-            upstream_proxy: String::new(),
             outbound_mode: OutboundMode::Manual,
-            warp_http2: false,
             models: vec![],
-            network_route_policy: NetworkRoutePolicy::SameNetwork,
             forced_model: String::new(),
             token_fetch_paused: false,
             token_max_age_mins: DEFAULT_TOKEN_MAX_AGE_MINS,
             token_prefetch_age_mins: DEFAULT_TOKEN_PREFETCH_AGE_MINS,
             mihomo_subscription: String::new(),
             mihomo_node: String::new(),
+            ws_upstream_enabled: true,
         }
         .into_settings()
         .unwrap();
         assert_eq!(settings.outbound_proxy, "socks5://127.0.0.1:1080");
-        assert_eq!(
-            settings.network_route_policy,
-            NetworkRoutePolicy::SameNetwork
-        );
+        assert_eq!(settings.outbound_mode, OutboundMode::Manual);
     }
 
     #[test]
-    fn network_route_policy_defaults_and_legacy_upstream_stays_separate() {
-        assert_eq!(
-            Settings::default().network_route_policy,
-            NetworkRoutePolicy::SameNetwork
-        );
-        assert!(settings_from_json("{}").unwrap().same_network());
-        let legacy_split = settings_from_json(
+    fn legacy_upstream_proxy_moves_into_the_single_outbound() {
+        let kept = settings_from_json(
             r#"{"outbound_proxy":"socks5://localhost:1080","upstream_proxy":"http://127.0.0.1:7897"}"#,
         )
         .unwrap();
-        assert_eq!(
-            legacy_split.network_route_policy,
-            NetworkRoutePolicy::Separate
-        );
-        let explicit = settings_from_json(
-            r#"{"upstream_proxy":"http://127.0.0.1:7897","network_route_policy":"same_network"}"#,
+        assert_eq!(kept.outbound_proxy, "socks5://localhost:1080");
+        let moved = settings_from_json(
+            r#"{"upstream_proxy":"http://127.0.0.1:7897","network_route_policy":"separate"}"#,
         )
         .unwrap();
-        assert!(explicit.same_network());
-        for (name, policy) in [
-            ("same_network", NetworkRoutePolicy::SameNetwork),
-            ("separate", NetworkRoutePolicy::Separate),
-        ] {
-            let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
-                "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
-                "networkRoutePolicy":name
-            }))
-            .unwrap();
-            let settings = patch.into_settings().unwrap();
-            let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
-            assert_eq!(loaded.network_route_policy, policy);
-        }
-        assert!(serde_json::from_str::<NetworkRoutePolicy>("\"unknown\"").is_err());
+        assert_eq!(moved.outbound_proxy, "http://127.0.0.1:7897");
+        assert_eq!(moved.outbound_mode, OutboundMode::Manual);
     }
 
     #[test]
@@ -578,11 +552,17 @@ mod tests {
     }
 
     #[test]
-    fn embedded_warp_is_default_without_overriding_saved_choices() {
-        assert_eq!(Settings::default().outbound_mode, OutboundMode::Warp);
+    fn manual_is_default_without_overriding_saved_choices() {
+        assert_eq!(Settings::default().outbound_mode, OutboundMode::Manual);
         assert_eq!(
             settings_from_json("{}").unwrap().outbound_mode,
-            OutboundMode::Warp
+            OutboundMode::Manual
+        );
+        assert_eq!(
+            settings_from_json(r#"{"outbound_mode":"warp"}"#)
+                .unwrap()
+                .outbound_mode,
+            OutboundMode::Manual
         );
         assert_eq!(
             settings_from_json(r#"{"outbound_proxy":"http://localhost:7890"}"#)
@@ -608,7 +588,7 @@ mod tests {
         let settings = patch.into_settings().unwrap();
         let saved: Settings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
-        assert_eq!(saved.outbound_mode, OutboundMode::Warp);
+        assert_eq!(saved.outbound_mode, OutboundMode::Manual);
         assert_eq!(saved.outbound_proxy, "socks5://localhost:1080");
         assert!(serde_json::from_str::<OutboundMode>("\"unknown\"").is_err());
     }

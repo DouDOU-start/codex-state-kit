@@ -39,18 +39,48 @@ pub async fn probe_outbound_latency(
 }
 
 #[tauri::command(async)]
-pub async fn connect_warp(state: State<'_, AppState>, accept_terms: bool) -> CommandResult<Status> {
-    command(state.proxy.connect_warp(accept_terms).await)
+pub async fn mihomo_groups(
+    state: State<'_, AppState>,
+) -> CommandResult<Vec<codex_state_kit::mihomo::ProxyGroup>> {
+    command(state.proxy.app().mihomo.list_groups().await)
 }
 
 #[tauri::command(async)]
-pub async fn stop_warp(state: State<'_, AppState>) -> CommandResult<Status> {
-    Ok(state.proxy.stop_warp().await)
+pub async fn mihomo_select(
+    state: State<'_, AppState>,
+    group: String,
+    node: String,
+) -> CommandResult<()> {
+    command(
+        state
+            .proxy
+            .app()
+            .mihomo
+            .select_in_group(&group, &node)
+            .await,
+    )
 }
 
 #[tauri::command(async)]
-pub async fn open_warp_terms() -> CommandResult<()> {
-    open::that("https://www.cloudflare.com/application/terms/").map_err(|err| err.to_string())
+pub async fn ws_upstream_reconnect(state: State<'_, AppState>) -> CommandResult<Status> {
+    command(state.proxy.reconnect_ws_upstream().await)
+}
+
+#[tauri::command(async)]
+pub async fn mihomo_group_delay(
+    state: State<'_, AppState>,
+    group: String,
+) -> CommandResult<Vec<codex_state_kit::latency::LatencySample>> {
+    let settings = state.proxy.app().settings.lock().await.clone();
+    let target = command(codex_state_kit::latency::probe_target(&settings.upstream))?;
+    command(
+        state
+            .proxy
+            .app()
+            .mihomo
+            .probe_group_delays(&group, &target)
+            .await,
+    )
 }
 
 #[tauri::command(async)]

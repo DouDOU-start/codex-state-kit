@@ -5,7 +5,6 @@ mod state;
 use tauri::{Manager, RunEvent};
 
 use codex_state_kit::mihomo::MihomoPaths;
-use codex_state_kit::warp::WarpPaths;
 use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -14,21 +13,6 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let resource_dir = app.path().resource_dir()?;
-            let binary_name = if cfg!(windows) { "usque.exe" } else { "usque" };
-            let development_binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("resources/warp")
-                .join(binary_name);
-            let packaged_binary = resource_dir.join("warp").join(binary_name);
-            let binary = if cfg!(debug_assertions) && development_binary.is_file() {
-                development_binary
-            } else {
-                packaged_binary
-            };
-            let mut data_dir = app.path().app_local_data_dir()?;
-            if cfg!(debug_assertions) {
-                data_dir.push("dev");
-            }
-            data_dir.push("warp");
             let mihomo_name = if cfg!(windows) {
                 "mihomo.exe"
             } else {
@@ -48,9 +32,7 @@ pub fn run() {
                 mihomo_data.push("dev");
             }
             mihomo_data.push("mihomo");
-            let state = AppState::initialize(
-                WarpPaths { binary, data_dir },
-                MihomoPaths {
+            let state = AppState::initialize(MihomoPaths {
                     bundled_binary: mihomo_binary,
                     data_dir: mihomo_data,
                 },
@@ -78,9 +60,10 @@ pub fn run() {
             commands::set_bound_token_len,
             commands::set_model_bound_token_len,
             commands::probe_outbound_latency,
-            commands::connect_warp,
-            commands::stop_warp,
-            commands::open_warp_terms,
+            commands::mihomo_groups,
+            commands::mihomo_select,
+            commands::mihomo_group_delay,
+            commands::ws_upstream_reconnect,
             commands::open_github_repo,
             commands::check_update,
             commands::open_release_page,

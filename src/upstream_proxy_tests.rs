@@ -68,19 +68,17 @@ fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
         proxy_listen: settings.proxy_listen.clone(),
         upstream: settings.upstream.clone(),
         codex_home: settings.codex_home.clone(),
-        outbound_proxy: settings.outbound_proxy.clone(),
-        upstream_proxy: proxy.into(),
+        outbound_proxy: proxy.into(),
         outbound_mode: settings.outbound_mode,
-        warp_http2: settings.warp_http2,
         models: settings.models.clone(),
         state_fetch_model: settings.state_fetch_model.clone(),
-        network_route_policy: settings.network_route_policy,
         forced_model: settings.forced_model.clone(),
         token_fetch_paused: settings.token_fetch_paused,
         token_max_age_mins: settings.token_max_age_mins,
         token_prefetch_age_mins: settings.token_prefetch_age_mins,
         mihomo_subscription: String::new(),
         mihomo_node: String::new(),
+        ws_upstream_enabled: settings.ws_upstream_enabled,
     }
 }
 
@@ -120,9 +118,8 @@ async fn upstream_proxy_hot_update_and_failures() {
         let (first, first_headers, finish_first, first_task) = streaming_proxy().await;
         let settings = Settings {
             upstream: "http://upstream.invalid".into(),
-            upstream_proxy: first.clone(),
-            outbound_proxy: "http://127.0.0.1:9".into(),
-            network_route_policy: NetworkRoutePolicy::Separate,
+            outbound_proxy: first.clone(),
+            outbound_mode: OutboundMode::Manual,
             codex_home: crate::settings::home_dir().display().to_string(),
             ..Settings::default()
         };
@@ -139,8 +136,6 @@ async fn upstream_proxy_hot_update_and_failures() {
             .lock()
             .await
             .capture("test-model", &token, "test"));
-        let token_before = TurnStateStore::load().peek_for_model("test-model");
-        let warp_before = app.warp.status().phase;
         let mut route_details = NetworkLogDetails::default();
         let response = forward_http_with_log(
             &app,
@@ -154,7 +149,7 @@ async fn upstream_proxy_hot_update_and_failures() {
         )
         .await
         .unwrap();
-        assert_eq!(route_details.route_kind, logs::ROUTE_EXPLICIT_PROXY);
+        assert_eq!(route_details.route_kind, logs::ROUTE_MANUAL_PROXY);
         assert_eq!(
             route_details.proxy_endpoint.as_deref(),
             Some(first.as_str())
@@ -185,22 +180,18 @@ async fn upstream_proxy_hot_update_and_failures() {
             .apply_settings(patch(&settings, &second))
             .await
             .unwrap();
-        assert_eq!(crate::settings::load_settings().upstream_proxy, second);
-        assert_eq!(
-            app.settings.lock().await.outbound_proxy,
-            settings.outbound_proxy
-        );
-        assert_eq!(
-            app.turn_state.lock().await.peek_for_model("test-model"),
-            Some(token)
-        );
-        assert_eq!(
-            TurnStateStore::load().peek_for_model("test-model"),
-            token_before
-        );
-        assert_eq!(app.warp.status().phase, warp_before);
+        assert_eq!(crate::settings::load_settings().outbound_proxy, second);
+        assert!(app
+            .turn_state
+            .lock()
+            .await
+            .peek_for_model("test-model")
+            .is_none());
+        assert!(TurnStateStore::load()
+            .peek_for_model("test-model")
+            .is_none());
         assert!(handle.task.lock().await.is_none());
-        assert!(handle.fetch_task.lock().await.is_none());
+        assert!(handle.fetch_task.lock().await.is_some());
         let response = forward_http(
             &app,
             Request::builder().uri("/new").body(Body::empty()).unwrap(),
@@ -232,8 +223,8 @@ async fn upstream_proxy_hot_update_and_failures() {
             .apply_settings(patch(&settings, "ftp://user:secret@localhost"))
             .await
             .is_err());
-        assert_eq!(app.settings.lock().await.upstream_proxy, second);
-        assert_eq!(crate::settings::load_settings().upstream_proxy, second);
+        assert_eq!(app.settings.lock().await.outbound_proxy, second);
+        assert_eq!(crate::settings::load_settings().outbound_proxy, second);
         // A persistence failure must also keep the old runtime client/configuration.
         let path = crate::settings::settings_path();
         let saved = std::fs::read(&path).unwrap();
@@ -243,7 +234,7 @@ async fn upstream_proxy_hot_update_and_failures() {
             .apply_settings(patch(&settings, "http://127.0.0.1:9"))
             .await
             .is_err());
-        assert_eq!(app.settings.lock().await.upstream_proxy, second);
+        assert_eq!(app.settings.lock().await.outbound_proxy, second);
         std::fs::remove_dir(&path).unwrap();
         std::fs::write(&path, saved).unwrap();
 
@@ -275,7 +266,7 @@ async fn upstream_proxy_hot_update_and_failures() {
             }
         );
         let failed_log = app.logs.lock().await.back().cloned().unwrap();
-        assert_eq!(failed_log.route_kind, logs::ROUTE_EXPLICIT_PROXY);
+        assert_eq!(failed_log.route_kind, logs::ROUTE_MANUAL_PROXY);
         assert_eq!(failed_log.path, "/check");
         assert_eq!(failed_log.error_kind.as_deref(), Some("connect"));
         let serialized = serde_json::to_string(&failed_log).unwrap();
@@ -292,13 +283,13 @@ async fn upstream_proxy_hot_update_and_failures() {
                 .is_err()
         );
         handle.apply_settings(patch(&settings, "")).await.unwrap();
-        assert!(crate::settings::load_settings().upstream_proxy.is_empty());
+        assert!(crate::settings::load_settings().outbound_proxy.is_empty());
         assert!(App::new(crate::settings::load_settings())
             .unwrap()
             .settings
             .lock()
             .await
-            .upstream_proxy
+            .outbound_proxy
             .is_empty());
         verify_response_metrics().await;
     })
@@ -348,8 +339,6 @@ async fn verify_response_metrics() {
         let app = Arc::new(
             App::new(Settings {
                 upstream: format!("http://{}", listener.local_addr().unwrap()),
-                upstream_proxy: String::new(),
-                network_route_policy: NetworkRoutePolicy::Separate,
                 codex_home: crate::settings::home_dir().display().to_string(),
                 ..Settings::default()
             })
@@ -601,8 +590,8 @@ async fn json_error_response_is_not_reported_as_sse() {
             fixed_response_proxy("400 Bad Request", "application/json", b"{}").await;
         let app = App::new(Settings {
             upstream: "http://upstream.invalid".into(),
-            upstream_proxy: proxy,
-            network_route_policy: NetworkRoutePolicy::Separate,
+            outbound_proxy: proxy,
+            outbound_mode: OutboundMode::Manual,
             codex_home: home.path().display().to_string(),
             ..Settings::default()
         })
@@ -649,8 +638,6 @@ async fn same_network_sends_business_through_outbound_proxy() {
             upstream: "http://upstream.invalid".into(),
             outbound_proxy: proxy.clone(),
             outbound_mode: OutboundMode::Manual,
-            upstream_proxy: "http://127.0.0.1:9".into(),
-            network_route_policy: NetworkRoutePolicy::SameNetwork,
             codex_home: home.path().display().to_string(),
             ..Settings::default()
         })
@@ -707,7 +694,6 @@ async fn forced_model_rewrites_downstream_request() {
         let app = App::new(Settings {
             upstream: format!("http://{addr}"),
             outbound_mode: OutboundMode::Manual,
-            network_route_policy: NetworkRoutePolicy::Separate,
             forced_model: "gpt-6-astra".into(),
             codex_home: home.path().display().to_string(),
             ..Settings::default()

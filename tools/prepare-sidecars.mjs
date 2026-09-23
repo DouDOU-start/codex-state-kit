@@ -30,14 +30,12 @@ function targetArch() {
 try {
   if (process.platform === "win32") {
     const powershellArgs = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"];
-    run("powershell.exe", [...powershellArgs, path.join(root, "tools/prepare-warp.ps1")]);
     run("powershell.exe", [...powershellArgs, path.join(root, "tools/prepare-mihomo.ps1")]);
   } else if (process.platform === "darwin") {
     const arch = targetArch();
-    run("bash", [path.join(root, "tools/prepare-warp.sh"), arch]);
     run("bash", [path.join(root, "tools/prepare-mihomo.sh"), arch]);
   } else {
-    throw new Error("当前只为 Windows 和 macOS 下载内置网络内核");
+    throw new Error("当前只为 Windows 和 macOS 下载 Mihomo 内核");
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);

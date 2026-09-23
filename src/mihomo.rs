@@ -30,13 +30,38 @@ pub struct MihomoStatus {
     pub proxy_url: Option<String>,
     pub selected: Option<String>,
     pub nodes: Vec<String>,
+    pub groups: Vec<ProxyGroup>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyGroup {
+    pub name: String,
+    pub group_type: String,
+    pub now: Option<String>,
+    pub all: Vec<ProxyGroupNode>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyGroupNode {
+    pub name: String,
+    pub node_type: String,
+    pub delay: Option<u64>,
+    pub udp: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct ProxyNode {
     pub name: String,
     pub spec: serde_yaml::Value,
+}
+
+pub struct SubscriptionConfig {
+    pub nodes: Vec<ProxyNode>,
+    pub groups: Vec<serde_yaml::Value>,
+    pub rules: Vec<serde_yaml::Value>,
 }
 
 struct Inner {
@@ -73,6 +98,7 @@ impl MihomoRuntime {
                     proxy_url: None,
                     selected: None,
                     nodes: Vec::new(),
+                    groups: Vec::new(),
                     error: None,
                 },
                 child: None,
@@ -103,21 +129,57 @@ impl MihomoRuntime {
     }
 
     pub async fn probe_delays(&self, target: &str) -> Result<Vec<crate::latency::LatencySample>> {
-        let (controller, secret, nodes) = {
+        let group = {
+            let inner = self.inner.lock().expect("mihomo state");
+            inner
+                .view
+                .groups
+                .iter()
+                .find(|group| group.group_type == "select" || group.group_type == "url-test")
+                .map(|group| group.name.clone())
+                .unwrap_or_else(|| GROUP.to_string())
+        };
+        self.probe_group_delays(&group, target).await
+    }
+
+    pub async fn list_groups(&self) -> Result<Vec<ProxyGroup>> {
+        self.refresh_groups().await
+    }
+
+    pub async fn select_in_group(&self, group: &str, node: &str) -> Result<()> {
+        let (controller, secret) = self.controller_auth()?;
+        select_node(&controller, &secret, group, node).await?;
+        let _ = self.refresh_groups().await;
+        Ok(())
+    }
+
+    pub async fn probe_group_delays(
+        &self,
+        group: &str,
+        target: &str,
+    ) -> Result<Vec<crate::latency::LatencySample>> {
+        let (controller, secret, names) = {
             let inner = self.inner.lock().expect("mihomo state");
             if inner.view.phase != "connected" {
                 bail!("订阅节点尚未就绪");
             }
+            let names = inner
+                .view
+                .groups
+                .iter()
+                .find(|item| item.name == group)
+                .map(|item| item.all.iter().map(|node| node.name.clone()).collect())
+                .unwrap_or_else(|| inner.view.nodes.clone());
             (
                 inner.controller.clone().context("订阅节点尚未就绪")?,
                 inner.secret.clone().context("订阅节点尚未就绪")?,
-                inner.view.nodes.clone(),
+                names,
             )
         };
-        if nodes.is_empty() {
+        if names.is_empty() {
             bail!("订阅里没有可用节点");
         }
-        let url = crate::latency::group_delay_url(&controller, GROUP, target)?;
+        let url = crate::latency::group_delay_url(&controller, group, target)?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(12))
@@ -133,7 +195,40 @@ impl MihomoRuntime {
             bail!("节点延迟检测失败");
         }
         let body = response.json().await.context("无法读取延迟结果")?;
-        Ok(crate::latency::samples_from_group_delays(&nodes, &body))
+        let samples = crate::latency::samples_from_group_delays(&names, &body);
+        self.apply_delay_samples(group, &samples);
+        Ok(samples)
+    }
+
+    fn controller_auth(&self) -> Result<(String, String)> {
+        let inner = self.inner.lock().expect("mihomo state");
+        if inner.view.phase != "connected" {
+            bail!("订阅节点尚未就绪");
+        }
+        Ok((
+            inner.controller.clone().context("订阅节点尚未就绪")?,
+            inner.secret.clone().context("订阅节点尚未就绪")?,
+        ))
+    }
+
+    async fn refresh_groups(&self) -> Result<Vec<ProxyGroup>> {
+        let (controller, secret) = self.controller_auth()?;
+        let groups = fetch_groups(&controller, &secret).await?;
+        let mut inner = self.inner.lock().expect("mihomo state");
+        apply_groups(&mut inner.view, &groups);
+        Ok(groups)
+    }
+
+    fn apply_delay_samples(&self, group: &str, samples: &[crate::latency::LatencySample]) {
+        let mut inner = self.inner.lock().expect("mihomo state");
+        let Some(target) = inner.view.groups.iter_mut().find(|item| item.name == group) else {
+            return;
+        };
+        for sample in samples {
+            if let Some(node) = target.all.iter_mut().find(|node| node.name == sample.name) {
+                node.delay = sample.delay_ms;
+            }
+        }
     }
 
     pub fn proxy_url(&self) -> Result<String> {
@@ -186,6 +281,7 @@ impl MihomoRuntime {
         inner.view.proxy_url = None;
         inner.view.selected = None;
         inner.view.nodes.clear();
+        inner.view.groups.clear();
         inner.view.error = None;
     }
 
@@ -197,21 +293,21 @@ impl MihomoRuntime {
         fs::create_dir_all(&paths.data_dir).context("无法创建 Mihomo 数据目录")?;
         let binary = bundled_binary(paths)?;
         let body = load_subscription(&settings.mihomo_subscription).await?;
-        let nodes = parse_subscription(&body)?;
-        if nodes.is_empty() {
+        let subscription = parse_subscription(&body)?;
+        if subscription.nodes.is_empty() {
             bail!("订阅里没有可用节点");
         }
-        let names: Vec<String> = nodes.iter().map(|node| node.name.clone()).collect();
-        let wanted = settings.mihomo_node.trim();
-        let selected = names
+        let names: Vec<String> = subscription
+            .nodes
             .iter()
-            .any(|item| item == wanted)
-            .then(|| wanted.to_string());
+            .map(|node| node.name.clone())
+            .collect();
+        let wanted = settings.mihomo_node.trim().to_string();
         let mixed = free_port()?;
         let controller_port = free_port()?;
         let secret = format!("{:032x}", rand::random::<u128>());
         let controller = format!("127.0.0.1:{controller_port}");
-        let config = render_config(&nodes, mixed, &controller, &secret);
+        let config = render_config(&subscription, mixed, &controller, &secret);
         let config_path = paths.data_dir.join("config.yaml");
         fs::write(&config_path, config).context("无法写入 Mihomo 配置")?;
         let log =
@@ -242,20 +338,36 @@ impl MihomoRuntime {
             &paths.data_dir.join("mihomo.log"),
         )
         .await?;
-        let chosen = if let Some(name) = selected.or_else(|| names.first().cloned()) {
-            select_node(&controller, &secret, &name).await?;
-            Some(name)
+        let chosen = if subscription.groups.is_empty() {
+            let name = (!wanted.is_empty() && names.iter().any(|item| item == &wanted))
+                .then(|| wanted.clone())
+                .or_else(|| names.first().cloned());
+            if let Some(name) = name {
+                select_node(&controller, &secret, GROUP, &name).await?;
+                Some(name)
+            } else {
+                None
+            }
+        } else if let Some(group) = select_group_for_node(&subscription, &wanted) {
+            select_node(&controller, &secret, &group, &wanted).await?;
+            Some(wanted)
         } else {
             None
         };
+        let groups = fetch_groups(&controller, &secret).await.unwrap_or_default();
         let mut inner = self.inner.lock().expect("mihomo state");
         inner.child = Some(child);
         inner.view.phase = "connected".into();
         inner.view.proxy_url = Some(proxy_url);
-        inner.view.selected = chosen;
         inner.view.nodes = names;
         inner.view.error = None;
         inner.view.available = true;
+        if groups.is_empty() {
+            inner.view.selected = chosen;
+            inner.view.groups.clear();
+        } else {
+            apply_groups(&mut inner.view, &groups);
+        }
         Ok(())
     }
 }
@@ -325,41 +437,61 @@ async fn load_subscription(raw: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-pub fn parse_subscription(raw: &str) -> Result<Vec<ProxyNode>> {
+pub fn parse_subscription(raw: &str) -> Result<SubscriptionConfig> {
     let text = raw.trim();
     if text.is_empty() {
         bail!("订阅为空");
     }
-    if let Some(nodes) = yaml_proxies(text) {
-        if !nodes.is_empty() {
-            return Ok(nodes);
+    if let Some(config) = yaml_subscription(text) {
+        if !config.nodes.is_empty() {
+            return Ok(config);
         }
     }
     if let Some(decoded) = decode_text(text) {
-        if let Some(nodes) = yaml_proxies(&decoded) {
-            if !nodes.is_empty() {
-                return Ok(nodes);
+        if let Some(config) = yaml_subscription(&decoded) {
+            if !config.nodes.is_empty() {
+                return Ok(config);
             }
         }
         let nodes = uri_lines(&decoded)?;
         if !nodes.is_empty() {
-            return Ok(nodes);
+            return Ok(nodes_only(nodes));
         }
     }
     let nodes = uri_lines(text)?;
     if nodes.is_empty() {
         bail!("订阅里没有识别到节点");
     }
-    Ok(nodes)
+    Ok(nodes_only(nodes))
 }
 
-fn yaml_proxies(text: &str) -> Option<Vec<ProxyNode>> {
+fn nodes_only(nodes: Vec<ProxyNode>) -> SubscriptionConfig {
+    SubscriptionConfig {
+        nodes,
+        groups: Vec::new(),
+        rules: Vec::new(),
+    }
+}
+
+fn yaml_subscription(text: &str) -> Option<SubscriptionConfig> {
     let value: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
     let list = value
         .get("proxies")
         .and_then(serde_yaml::Value::as_sequence)
         .or_else(|| value.as_sequence())?;
-    Some(unique_nodes(list.iter().filter_map(node_from_yaml)))
+    Some(SubscriptionConfig {
+        nodes: unique_nodes(list.iter().filter_map(node_from_yaml)),
+        groups: sequence_values(&value, "proxy-groups"),
+        rules: sequence_values(&value, "rules"),
+    })
+}
+
+fn sequence_values(value: &serde_yaml::Value, key: &str) -> Vec<serde_yaml::Value> {
+    value
+        .get(key)
+        .and_then(serde_yaml::Value::as_sequence)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn node_from_yaml(value: &serde_yaml::Value) -> Option<ProxyNode> {
@@ -710,31 +842,38 @@ fn decode_text(raw: &str) -> Option<String> {
 }
 
 pub fn render_config(
-    nodes: &[ProxyNode],
+    config: &SubscriptionConfig,
     mixed_port: u16,
     controller: &str,
     secret: &str,
 ) -> String {
-    let names: Vec<serde_yaml::Value> = nodes.iter().map(|node| yaml_str(&node.name)).collect();
-    let mut group = serde_yaml::Mapping::new();
-    group.insert(yaml_str("name"), yaml_str(GROUP));
-    group.insert(yaml_str("type"), yaml_str("select"));
-    group.insert(yaml_str("proxies"), serde_yaml::Value::Sequence(names));
-    let config = serde_yaml::Value::Mapping({
-        let mut map = serde_yaml::Mapping::new();
-        map.insert(yaml_str("mixed-port"), yaml_int(mixed_port));
-        map.insert(yaml_str("allow-lan"), serde_yaml::Value::Bool(false));
-        map.insert(yaml_str("bind-address"), yaml_str("127.0.0.1"));
-        map.insert(yaml_str("mode"), yaml_str("rule"));
-        map.insert(yaml_str("log-level"), yaml_str("warning"));
-        map.insert(yaml_str("ipv6"), serde_yaml::Value::Bool(false));
-        map.insert(yaml_str("find-process-mode"), yaml_str("off"));
-        map.insert(yaml_str("external-controller"), yaml_str(controller));
-        map.insert(yaml_str("secret"), yaml_str(secret));
-        map.insert(
-            yaml_str("proxies"),
-            serde_yaml::Value::Sequence(nodes.iter().map(|node| node.spec.clone()).collect()),
-        );
+    let mut map = serde_yaml::Mapping::new();
+    map.insert(yaml_str("mixed-port"), yaml_int(mixed_port));
+    map.insert(yaml_str("allow-lan"), serde_yaml::Value::Bool(false));
+    map.insert(yaml_str("bind-address"), yaml_str("127.0.0.1"));
+    map.insert(yaml_str("mode"), yaml_str("rule"));
+    map.insert(yaml_str("log-level"), yaml_str("warning"));
+    map.insert(yaml_str("ipv6"), serde_yaml::Value::Bool(false));
+    map.insert(yaml_str("find-process-mode"), yaml_str("off"));
+    map.insert(yaml_str("external-controller"), yaml_str(controller));
+    map.insert(yaml_str("secret"), yaml_str(secret));
+    map.insert(
+        yaml_str("proxies"),
+        serde_yaml::Value::Sequence(
+            config
+                .nodes
+                .iter()
+                .map(|node| node.spec.clone())
+                .collect(),
+        ),
+    );
+    if config.groups.is_empty() {
+        let names: Vec<serde_yaml::Value> =
+            config.nodes.iter().map(|node| yaml_str(&node.name)).collect();
+        let mut group = serde_yaml::Mapping::new();
+        group.insert(yaml_str("name"), yaml_str(GROUP));
+        group.insert(yaml_str("type"), yaml_str("select"));
+        group.insert(yaml_str("proxies"), serde_yaml::Value::Sequence(names));
         map.insert(
             yaml_str("proxy-groups"),
             serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(group)]),
@@ -743,9 +882,152 @@ pub fn render_config(
             yaml_str("rules"),
             serde_yaml::Value::Sequence(vec![yaml_str(&format!("MATCH,{GROUP}"))]),
         );
-        map
-    });
-    serde_yaml::to_string(&config).unwrap_or_default()
+    } else {
+        map.insert(
+            yaml_str("proxy-groups"),
+            serde_yaml::Value::Sequence(config.groups.clone()),
+        );
+        let rules = if config.rules.is_empty() {
+            let first = config
+                .groups
+                .first()
+                .and_then(|group| group.get("name"))
+                .and_then(|name| name.as_str())
+                .unwrap_or(GROUP);
+            vec![yaml_str(&format!("MATCH,{first}"))]
+        } else {
+            config.rules.clone()
+        };
+        map.insert(yaml_str("rules"), serde_yaml::Value::Sequence(rules));
+    }
+    serde_yaml::to_string(&serde_yaml::Value::Mapping(map)).unwrap_or_default()
+}
+
+fn select_group_for_node(config: &SubscriptionConfig, node: &str) -> Option<String> {
+    if node.is_empty() {
+        return None;
+    }
+    config.groups.iter().find_map(|group| {
+        let kind = group.get("type")?.as_str()?;
+        if kind != "select" {
+            return None;
+        }
+        let contains = group
+            .get("proxies")?
+            .as_sequence()?
+            .iter()
+            .any(|item| item.as_str() == Some(node));
+        if !contains {
+            return None;
+        }
+        group.get("name")?.as_str().map(str::to_string)
+    })
+}
+
+fn apply_groups(view: &mut MihomoStatus, groups: &[ProxyGroup]) {
+    view.groups = groups.to_vec();
+    if let Some(primary) = groups.iter().find(|group| group.group_type == "select") {
+        view.selected = primary.now.clone();
+        view.nodes = primary
+            .all
+            .iter()
+            .map(|node| node.name.clone())
+            .collect();
+    }
+}
+
+async fn fetch_groups(controller: &str, secret: &str) -> Result<Vec<ProxyGroup>> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("无法创建节点检测客户端")?;
+    let response = client
+        .get(format!("http://{controller}/proxies"))
+        .header("Authorization", format!("Bearer {secret}"))
+        .send()
+        .await
+        .context("无法读取 Mihomo 代理组")?;
+    if !response.status().is_success() {
+        bail!("Mihomo 拒绝读取代理组");
+    }
+    let body = response.json().await.context("无法解析 Mihomo 代理组")?;
+    Ok(parse_groups_from_api(&body))
+}
+
+fn parse_groups_from_api(body: &JsonValue) -> Vec<ProxyGroup> {
+    let Some(proxies) = body.get("proxies").and_then(JsonValue::as_object) else {
+        return Vec::new();
+    };
+    let mut groups = Vec::new();
+    for (name, value) in proxies {
+        if name == "GLOBAL" || name == "COMPATIBLE" {
+            continue;
+        }
+        let Some(group_type) = value
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .and_then(normalize_group_type)
+        else {
+            continue;
+        };
+        let all = value
+            .get("all")
+            .and_then(JsonValue::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(|node_name| {
+                        let node = proxies.get(node_name);
+                        ProxyGroupNode {
+                            name: node_name.to_string(),
+                            node_type: node
+                                .and_then(|node| node.get("type"))
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            delay: node.and_then(node_delay),
+                            udp: node
+                                .and_then(|node| node.get("udp"))
+                                .and_then(JsonValue::as_bool)
+                                .unwrap_or(false),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        groups.push(ProxyGroup {
+            name: name.clone(),
+            group_type: group_type.to_string(),
+            now: value
+                .get("now")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            all,
+        });
+    }
+    groups
+}
+
+fn normalize_group_type(kind: &str) -> Option<&'static str> {
+    match kind {
+        "Selector" => Some("select"),
+        "URLTest" => Some("url-test"),
+        "Fallback" => Some("fallback"),
+        "LoadBalance" => Some("load-balance"),
+        "Relay" => Some("relay"),
+        _ => None,
+    }
+}
+
+fn node_delay(node: &JsonValue) -> Option<u64> {
+    node.get("history")
+        .and_then(JsonValue::as_array)
+        .and_then(|history| history.last())
+        .and_then(|item| item.get("delay"))
+        .and_then(JsonValue::as_u64)
+        .filter(|delay| *delay > 0)
 }
 
 fn free_port() -> Result<u16> {
@@ -785,13 +1067,14 @@ async fn wait_until_ready(
     }
 }
 
-async fn select_node(controller: &str, secret: &str, name: &str) -> Result<()> {
+async fn select_node(controller: &str, secret: &str, group: &str, name: &str) -> Result<()> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()?;
+    let group = crate::latency::encode_path_segment(group);
     let response = client
-        .put(format!("http://{controller}/proxies/{GROUP}"))
+        .put(format!("http://{controller}/proxies/{group}"))
         .header("Authorization", format!("Bearer {secret}"))
         .json(&serde_json::json!({ "name": name }))
         .send()
@@ -941,10 +1224,11 @@ proxies:
     port: 443
     password: other
 "#;
-        let nodes = parse_subscription(raw).unwrap();
-        assert_eq!(nodes[0].name, "alpha");
-        assert_eq!(nodes[1].name, "alpha-2");
-        let config = render_config(&nodes, 17891, "127.0.0.1:17892", "secret");
+        let parsed = parse_subscription(raw).unwrap();
+        assert_eq!(parsed.nodes[0].name, "alpha");
+        assert_eq!(parsed.nodes[1].name, "alpha-2");
+        assert!(parsed.groups.is_empty());
+        let config = render_config(&parsed, 17891, "127.0.0.1:17892", "secret");
         assert!(config.contains("mixed-port"));
         assert!(config.contains("name: Kit"));
         assert!(config.contains("MATCH,Kit"));
@@ -956,7 +1240,7 @@ proxies:
     fn parses_base64_share_links() {
         let line = "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#home";
         let encoded = base64::engine::general_purpose::STANDARD.encode(line);
-        let nodes = parse_subscription(&encoded).unwrap();
+        let nodes = parse_subscription(&encoded).unwrap().nodes;
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].name, "home");
         let text = serde_yaml::to_string(&nodes[0].spec).unwrap();
@@ -969,12 +1253,80 @@ proxies:
         let payload = base64::engine::general_purpose::STANDARD.encode(
             br#"{"add":"vmess.example","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"ws","tls":"tls","ps":"edge"}"#,
         );
-        let nodes = parse_subscription(&format!("vmess://{payload}")).unwrap();
+        let nodes = parse_subscription(&format!("vmess://{payload}"))
+            .unwrap()
+            .nodes;
         assert_eq!(nodes[0].name, "edge");
         let text = serde_yaml::to_string(&nodes[0].spec).unwrap();
         assert!(text.contains("type: vmess"));
         assert!(text.contains("network: ws"));
         assert!(parse_subscription("   ").is_err());
         assert!(parse_subscription("not a subscription").is_err());
+    }
+
+    #[test]
+    fn keeps_subscription_groups_and_rules() {
+        let raw = r#"
+proxies:
+  - name: entry
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: secret
+  - name: exit
+    type: vless
+    server: 5.6.7.8
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    dialer-proxy: entry
+proxy-groups:
+  - name: 前置
+    type: select
+    proxies: [entry]
+  - name: 代理
+    type: select
+    proxies: [exit, DIRECT]
+rules:
+  - DOMAIN-SUFFIX,openai.com,代理
+  - MATCH,代理
+"#;
+        let parsed = parse_subscription(raw).unwrap();
+        assert_eq!(parsed.groups.len(), 2);
+        assert_eq!(parsed.rules.len(), 2);
+        let config = render_config(&parsed, 17891, "127.0.0.1:17892", "secret");
+        assert!(config.contains("name: 前置"));
+        assert!(config.contains("dialer-proxy: entry"));
+        assert!(config.contains("DOMAIN-SUFFIX,openai.com,代理"));
+        assert!(!config.contains("name: Kit"));
+    }
+
+    #[test]
+    fn parses_mihomo_proxy_groups() {
+        let body = serde_json::json!({
+            "proxies": {
+                "GLOBAL": { "type": "Selector", "now": "代理", "all": ["代理"] },
+                "前置": {
+                    "type": "Selector",
+                    "now": "entry",
+                    "all": ["entry"]
+                },
+                "自动选择": {
+                    "type": "URLTest",
+                    "now": "exit",
+                    "all": ["exit"]
+                },
+                "entry": { "type": "Shadowsocks", "udp": true, "history": [{ "delay": 166 }] },
+                "exit": { "type": "Vless", "udp": true, "history": [{ "delay": 0 }] }
+            }
+        });
+        let groups = parse_groups_from_api(&body);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "前置");
+        assert_eq!(groups[0].group_type, "select");
+        assert_eq!(groups[0].now.as_deref(), Some("entry"));
+        assert_eq!(groups[0].all[0].delay, Some(166));
+        assert_eq!(groups[1].group_type, "url-test");
+        assert_eq!(groups[1].all[0].delay, None);
     }
 }

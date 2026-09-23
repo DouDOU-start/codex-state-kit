@@ -80,10 +80,8 @@ async fn account_switch_preserves_request_identity_and_rejects_old_tickets() {
         let app = Arc::new(
             App::new(Settings {
                 upstream: endpoint.clone(),
-                upstream_proxy: String::new(),
                 outbound_proxy: endpoint,
                 outbound_mode: OutboundMode::Manual,
-                network_route_policy: NetworkRoutePolicy::Separate,
                 codex_home: home.path().display().to_string(),
                 ..Settings::default()
             })

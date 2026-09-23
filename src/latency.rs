@@ -57,7 +57,21 @@ pub fn proxy_for_probe(raw: &str) -> Result<String> {
     Ok(fetch::outbound_proxy_for_client(&normalized))
 }
 
+pub(crate) fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 pub fn group_delay_url(controller: &str, group: &str, target: &str) -> Result<reqwest::Url> {
+    let group = encode_path_segment(group);
     let mut url = reqwest::Url::parse(&format!("http://{controller}/group/{group}/delay"))
         .context("无法构造节点延迟检测地址")?;
     url.query_pairs_mut()

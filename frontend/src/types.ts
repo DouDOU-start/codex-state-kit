@@ -86,7 +86,6 @@ export interface Status {
   tokenMaxAgeMins?: number;
   tokenPrefetchAgeMins?: number;
   diagLogPath?: string;
-  networkRoutePolicy: NetworkRoutePolicy;
   forcedModel: string;
   stateMissPolicy: StateMissPolicy;
   configuredModels: string[];
@@ -101,10 +100,7 @@ export interface Status {
   proxyError?: string | null;
   attachError?: string | null;
   outboundProxy: string;
-  upstreamProxy: string;
   outboundMode: OutboundMode;
-  warpHttp2: boolean;
-  warp: WarpStatus;
   mihomoSubscription: string;
   mihomoNode: string;
   mihomo: MihomoStatus;
@@ -114,6 +110,9 @@ export interface Status {
   degraded: boolean;
   degradedAt?: string | null;
   logs: LogEntry[];
+  wsUpstreamEnabled: boolean;
+  wsUpstreamConnected: boolean;
+  wsUpstreamConnectedAt?: string | null;
 }
 
 export interface SettingsPatch {
@@ -122,7 +121,6 @@ export interface SettingsPatch {
   tokenFetchPaused?: boolean;
   tokenMaxAgeMins?: number;
   tokenPrefetchAgeMins?: number;
-  networkRoutePolicy: NetworkRoutePolicy;
   forcedModel: string;
   models: string[];
   stateMissPolicy: StateMissPolicy;
@@ -130,17 +128,15 @@ export interface SettingsPatch {
   upstream: string;
   codexHome: string;
   outboundProxy: string;
-  upstreamProxy: string;
   outboundMode: OutboundMode;
-  warpHttp2: boolean;
   mihomoSubscription: string;
   mihomoNode: string;
+  wsUpstreamEnabled?: boolean;
 }
 
 export type TokenReusePolicy = "shared_292" | "per_model";
-export type NetworkRoutePolicy = "same_network" | "separate";
-export type OutboundMode = "manual" | "warp" | "mihomo";
-export type ProbeKind = "manual" | "warp" | "mihomo";
+export type OutboundMode = "manual" | "mihomo";
+export type ProbeKind = "manual" | "mihomo";
 export type StateMissPolicy = "preserve" | "wait" | "strip" | "passthrough" | "strip_all";
 
 export interface LatencySample {
@@ -154,22 +150,27 @@ export interface LatencyReport {
   samples: LatencySample[];
 }
 
+export interface ProxyGroupNode {
+  name: string;
+  nodeType: string;
+  delay: number | null;
+  udp: boolean;
+}
+
+export interface ProxyGroup {
+  name: string;
+  groupType: "select" | "url-test" | "relay" | "fallback" | "load-balance" | string;
+  now: string | null;
+  all: ProxyGroupNode[];
+}
+
 export interface MihomoStatus {
   available: boolean;
   phase: string;
   proxyUrl: string | null;
   selected: string | null;
   nodes: string[];
-  error: string | null;
-}
-
-export interface WarpStatus {
-  available: boolean;
-  registered: boolean;
-  phase: "stopped" | "starting" | "registering" | "connecting" | "connected" | "reconnecting" | "error";
-  proxyUrl: string | null;
-  exitIp: string | null;
-  country: string | null;
+  groups: ProxyGroup[];
   error: string | null;
 }
 

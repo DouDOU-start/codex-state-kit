@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{FromRequestParts, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, Version};
 use axum::response::{IntoResponse, Response};
 use futures_util::{future::join_all, StreamExt};
@@ -28,12 +29,12 @@ use crate::logs::ObservedStream;
 use crate::logs::{self, LogEntry, NetworkLogDetails, StreamLifecycle};
 use crate::mihomo::{MihomoRuntime, MihomoStatus};
 use crate::settings::{
-    save_settings, NetworkRoutePolicy, OutboundMode, Settings, SettingsPatch, StateMissPolicy,
-    TokenReusePolicy,
+    save_settings, OutboundMode, Settings, SettingsPatch, StateMissPolicy, TokenReusePolicy,
 };
 use crate::traffic::{AccountTraffic, RequestActivity, TrafficTracker};
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
-use crate::warp::{WarpRuntime, WarpStatus};
+use crate::ws_bridge;
+use crate::ws_upstream::{WsDial, WsUpstreamPool};
 
 const TOKEN_FETCH_PAUSED_MESSAGE: &str = "已暂停获取 Token";
 const TOKEN_MANUAL_REFRESH_MESSAGE: &str = "正在重新获取 Token…";
@@ -42,6 +43,7 @@ const SSE_IDLE_AFTER_CHUNK: Duration = Duration::from_secs(90);
 /// 响应头已到但还没有任何正文时，多等一会儿，避免误杀长思考。
 const SSE_IDLE_BEFORE_CHUNK: Duration = Duration::from_secs(180);
 const SSE_IDLE_TIMEOUT_EVENT: &[u8] = b"data: {\"type\":\"response.incomplete\"}\n\n";
+const UPSTREAM_TRANSPORT_HEADER: &str = "x-csk-upstream-transport";
 
 fn business_stream_idle_timeout(chunks: u64) -> Duration {
     #[cfg(test)]
@@ -291,10 +293,7 @@ pub struct Status {
     pub proxy_error: Option<String>,
     pub attach_error: Option<String>,
     pub outbound_proxy: String,
-    pub upstream_proxy: String,
     pub outbound_mode: OutboundMode,
-    pub warp_http2: bool,
-    pub warp: WarpStatus,
     pub mihomo_subscription: String,
     pub mihomo_node: String,
     pub mihomo: MihomoStatus,
@@ -310,17 +309,18 @@ pub struct Status {
     pub state_miss_policy: StateMissPolicy,
     pub token_reuse_policy: TokenReusePolicy,
     pub state_fetch_model: String,
-    pub network_route_policy: NetworkRoutePolicy,
     pub forced_model: String,
     pub configured_models: Vec<String>,
     pub token_fetch_paused: bool,
     pub token_max_age_mins: u32,
     pub token_prefetch_age_mins: u32,
     pub diag_log_path: String,
+    pub ws_upstream_enabled: bool,
+    pub ws_upstream_connected: bool,
+    pub ws_upstream_connected_at: Option<String>,
 }
 
 pub struct App {
-    pub warp: WarpRuntime,
     pub mihomo: MihomoRuntime,
     pub settings: Mutex<Settings>,
     pub logs: Mutex<VecDeque<LogEntry>>,
@@ -347,11 +347,12 @@ pub struct App {
     degraded: AtomicBool,
     degraded_at: Mutex<Option<String>>,
     pub degrade_notify: Notify,
-    pub warp_wake: Notify,
+    pub sidecar_wake: Notify,
     /// 新模型被发现时通知 fetch 循环立即唤醒
     model_notify: Notify,
     /// 是否已注册 settings.models 中的种子模型
     seeds_registered: AtomicBool,
+    ws_upstream: WsUpstreamPool,
     #[cfg(test)]
     oauth_token_url: std::sync::Mutex<Option<String>>,
 }
@@ -377,19 +378,11 @@ impl Drop for IdentityGenerationChange<'_> {
 
 impl App {
     pub fn new(settings: Settings) -> Result<Self> {
-        Self::with_warp(settings, WarpRuntime::default())
+        Self::with_mihomo(settings, MihomoRuntime::default())
     }
 
-    pub fn with_warp(settings: Settings, warp: WarpRuntime) -> Result<Self> {
-        Self::with_sidecars(settings, warp, MihomoRuntime::default())
-    }
-
-    pub fn with_sidecars(
-        settings: Settings,
-        warp: WarpRuntime,
-        mihomo: MihomoRuntime,
-    ) -> Result<Self> {
-        let business_proxy = resolved_business_proxy(&settings, &warp, &mihomo);
+    pub fn with_mihomo(settings: Settings, mihomo: MihomoRuntime) -> Result<Self> {
+        let business_proxy = resolved_proxy(&settings, &mihomo);
         let http = pooled_upstream(business_proxy_key(&business_proxy, None)?)?;
         let billing_path = crate::home_dir().join(if cfg!(debug_assertions) {
             ".codex-state-kit-dev-billing.sqlite3"
@@ -405,7 +398,6 @@ impl App {
         turn_state.set_reuse_policy(settings.token_reuse_policy);
         turn_state.set_lifetime(turn_state::MAX_AGE_SECS, turn_state::PREFETCH_AGE_SECS);
         Ok(Self {
-            warp,
             mihomo,
             settings: Mutex::new(settings),
             logs: Mutex::new(VecDeque::with_capacity(80)),
@@ -431,9 +423,10 @@ impl App {
             degraded: AtomicBool::new(false),
             degraded_at: Mutex::new(None),
             degrade_notify: Notify::new(),
-            warp_wake: Notify::new(),
+            sidecar_wake: Notify::new(),
             model_notify: Notify::new(),
             seeds_registered: AtomicBool::new(false),
+            ws_upstream: WsUpstreamPool::new(),
             #[cfg(test)]
             oauth_token_url: std::sync::Mutex::new(None),
         })
@@ -605,6 +598,7 @@ impl App {
             Path::new(&settings.codex_home),
             &format!("http://{}", settings.proxy_listen),
         );
+        let ws = self.ws_upstream.snapshot().await;
         Status {
             proxy_listen: settings.proxy_listen,
             upstream: settings.upstream,
@@ -614,10 +608,7 @@ impl App {
             proxy_error: self.proxy_error.lock().await.clone(),
             attach_error: None,
             outbound_proxy: settings.outbound_proxy,
-            upstream_proxy: settings.upstream_proxy,
             outbound_mode: settings.outbound_mode,
-            warp_http2: settings.warp_http2,
-            warp: self.warp.status(),
             mihomo_subscription: settings.mihomo_subscription.clone(),
             mihomo_node: settings.mihomo_node.clone(),
             mihomo: self.mihomo.status(),
@@ -633,13 +624,15 @@ impl App {
             state_miss_policy: settings.state_miss_policy,
             token_reuse_policy: settings.token_reuse_policy,
             state_fetch_model: settings.state_fetch_model,
-            network_route_policy: settings.network_route_policy,
             forced_model: settings.forced_model,
             configured_models: settings.models,
             token_fetch_paused: settings.token_fetch_paused,
             token_max_age_mins: settings.token_max_age_mins,
             token_prefetch_age_mins: settings.token_prefetch_age_mins,
             diag_log_path: diag::path().display().to_string(),
+            ws_upstream_enabled: settings.ws_upstream_enabled,
+            ws_upstream_connected: ws.connected,
+            ws_upstream_connected_at: ws.connected_at,
         }
     }
 
@@ -762,7 +755,6 @@ impl App {
     fn fetch_settings(&self, settings: &Settings) -> Result<Settings> {
         let mut effective = settings.clone();
         match effective.outbound_mode {
-            OutboundMode::Warp => effective.outbound_proxy = self.warp.proxy_url()?,
             OutboundMode::Mihomo => effective.outbound_proxy = self.mihomo.proxy_url()?,
             OutboundMode::Manual => {}
         }
@@ -774,7 +766,7 @@ impl App {
 
     async fn refresh_business_http(&self) -> Result<()> {
         let settings = self.settings.lock().await.clone();
-        let proxy = resolved_business_proxy(&settings, &self.warp, &self.mihomo);
+        let proxy = resolved_proxy(&settings, &self.mihomo);
         let session = self.turn_state.lock().await.bound_proxy_session();
         let key = business_proxy_key(&proxy, session.as_deref())?;
         *self.http.lock().await = pooled_upstream(key)?;
@@ -1199,56 +1191,6 @@ impl App {
         }
         match result {
             Ok(fetched) => {
-                if !settings.same_network() {
-                    let business = resolved_business_proxy(settings, &self.warp, &self.mihomo);
-                    let verify_client = match upstream_http_client(&business) {
-                        Ok(client) => client,
-                        Err(err) => {
-                            details.turn_state_action = "rejected_reverify".into();
-                            self.record_fetch(started, details, billing_request.take())
-                                .await;
-                            return Err(FetchOnceError::probing(
-                                format!("[{model}] 业务出口复验失败: {err:#}"),
-                                FetchRetryClass::Normal,
-                                true,
-                            ));
-                        }
-                    };
-                    let mut verify_settings = fetch_settings.clone();
-                    verify_settings.outbound_proxy = business;
-                    let verify_started = Instant::now();
-                    let mut verify_billing = self.begin_internal_billing(
-                        "reverify",
-                        verify_started,
-                        &creds.account_id,
-                        creds.email.as_deref(),
-                        model,
-                    );
-                    let mut verify_details = NetworkLogDetails::default();
-                    let verify_result = fetch::validate_carried_ticket(
-                        &verify_client,
-                        &verify_settings,
-                        creds,
-                        model,
-                        &fetched.token,
-                        &fetched.routing_cookies,
-                        &mut verify_details,
-                    )
-                    .await;
-                    if let Some(request) = verify_billing.take() {
-                        self.settle_internal_billing(request, &verify_details);
-                    }
-                    if let Err(err) = verify_result {
-                        details.turn_state_action = "rejected_reverify".into();
-                        self.record_fetch(started, details, billing_request.take())
-                            .await;
-                        return Err(FetchOnceError::probing(
-                            format!("[{model}] 业务出口复验未通过: {err:#}"),
-                            FetchRetryClass::Normal,
-                            true,
-                        ));
-                    }
-                }
                 let token = fetched.token;
                 if self.fetch_generation.load(Ordering::SeqCst) != generation {
                     details.turn_state_action = "discarded_stale_config".into();
@@ -1643,6 +1585,11 @@ impl ProxyHandle {
         result
     }
 
+    pub async fn reconnect_ws_upstream(&self) -> Result<Status> {
+        self.app.ws_upstream.invalidate().await;
+        Ok(self.managed_status().await)
+    }
+
     pub async fn managed_status(&self) -> Status {
         let mut status = self.app.status().await;
         status.attach_error = self.attach_error.lock().expect("attach error").clone();
@@ -1782,21 +1729,10 @@ impl ProxyHandle {
 
     pub async fn apply_settings(&self, patch: SettingsPatch) -> Result<Status> {
         let next = patch.into_settings()?;
-        let _change = if next.outbound_mode == OutboundMode::Manual {
-            loop {
-                self.app.warp.cancel_connect();
-                tokio::select! {
-                    guard = self.settings_change.lock() => break guard,
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-                }
-            }
-        } else {
-            self.settings_change.lock().await
-        };
+        let _change = self.settings_change.lock().await;
         let old = self.app.settings.lock().await.clone();
-        let next_business = resolved_business_proxy(&next, &self.app.warp, &self.app.mihomo);
-        let next_http =
-            if resolved_business_proxy(&old, &self.app.warp, &self.app.mihomo) != next_business {
+        let next_business = resolved_proxy(&next, &self.app.mihomo);
+        let next_http = if resolved_proxy(&old, &self.app.mihomo) != next_business {
                 Some(pooled_upstream(business_proxy_key(&next_business, None)?)?)
             } else {
                 None
@@ -1811,7 +1747,6 @@ impl ProxyHandle {
         }
         let route_changed = old.outbound_proxy != next.outbound_proxy
             || old.outbound_mode != next.outbound_mode
-            || old.warp_http2 != next.warp_http2
             || old.upstream != next.upstream
             || old.codex_home != next.codex_home
             || old.mihomo_subscription != next.mihomo_subscription
@@ -1828,14 +1763,12 @@ impl ProxyHandle {
             fetch_change_guard = Some(self.app.fetch_gate.lock().await);
             if route_changed {
                 self.app.turn_state.lock().await.invalidate_all();
+                self.app.ws_upstream.invalidate().await;
             }
             *self.app.fetch_error.lock().await = None;
             *self.app.fetch_ok_at.lock().await = None;
             self.app.degraded.store(false, Ordering::Relaxed);
             *self.app.degraded_at.lock().await = None;
-            if route_changed && next.outbound_mode != OutboundMode::Warp {
-                self.app.warp.stop().await;
-            }
             if route_changed && next.outbound_mode != OutboundMode::Mihomo {
                 self.app.mihomo.stop().await;
             }
@@ -1849,6 +1782,9 @@ impl ProxyHandle {
             if let Some(http) = next_http {
                 *self.app.http.lock().await = http;
             }
+        }
+        if old.ws_upstream_enabled != next.ws_upstream_enabled && !route_changed {
+            self.app.ws_upstream.invalidate().await;
         }
         if fetch_changed {
             self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
@@ -1921,25 +1857,15 @@ impl ProxyHandle {
             }
             let _ = self.app.refresh_business_http().await;
         }
-        self.app.warp_wake.notify_one();
+        self.app.sidecar_wake.notify_one();
         Ok(self.managed_status().await)
     }
 
-    pub async fn run_warp_supervisor(&self) {
+    pub async fn run_sidecar_supervisor(&self) {
         loop {
             let mode = self.app.settings.lock().await.outbound_mode;
             let mut wait = Duration::from_secs(20);
-            if mode == OutboundMode::Warp {
-                let phase = self.app.warp.status().phase;
-                if matches!(phase.as_str(), "stopped" | "error") {
-                    if let Err(err) = self.connect_warp(true).await {
-                        eprintln!("embedded WARP: {err:#}");
-                        wait = Duration::from_secs(60);
-                    }
-                } else {
-                    self.app.warp.check_health().await;
-                }
-            } else if mode == OutboundMode::Mihomo {
+            if mode == OutboundMode::Mihomo {
                 let phase = self.app.mihomo.status().phase;
                 if matches!(phase.as_str(), "stopped" | "error") {
                     let settings = self.app.settings.lock().await.clone();
@@ -1953,7 +1879,7 @@ impl ProxyHandle {
             }
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {},
-                _ = self.app.warp_wake.notified() => {},
+                _ = self.app.sidecar_wake.notified() => {},
             }
         }
     }
@@ -1966,13 +1892,6 @@ impl ProxyHandle {
         let settings = self.app.settings.lock().await.clone();
         let target = crate::latency::probe_target(&settings.upstream)?;
         let samples = match kind {
-            "warp" => {
-                let result = match self.app.warp.proxy_url() {
-                    Ok(endpoint) => crate::latency::probe_through_proxy(&endpoint, &target).await,
-                    Err(err) => Err(err),
-                };
-                vec![crate::latency::sample_from_result("warp", result)]
-            }
             "manual" => {
                 let raw = proxy
                     .filter(|value| !value.trim().is_empty())
@@ -1986,55 +1905,6 @@ impl ProxyHandle {
             _ => anyhow::bail!("未知的检测对象"),
         };
         Ok(crate::latency::LatencyReport { target, samples })
-    }
-
-    pub async fn connect_warp(&self, accept_terms: bool) -> Result<Status> {
-        let _change = self.settings_change.lock().await;
-        let settings = self.app.settings.lock().await.clone();
-        if settings.outbound_mode != OutboundMode::Warp {
-            anyhow::bail!("请先选择内置 WARP 模式");
-        }
-        let fetch_transition = self.app.fetch_transition.lock().await;
-        self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
-        self.app.fetch_change_notify.notify_waiters();
-        self.stop_fetch_loop().await;
-        let fetch_change = self.app.fetch_gate.lock().await;
-        let result = self
-            .app
-            .warp
-            .connect(accept_terms, settings.warp_http2)
-            .await;
-        self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
-        self.app.reset_fetch_schedule().await;
-        self.app.fetch_change_notify.notify_waiters();
-        *self.app.fetch_error.lock().await = None;
-        *self.app.fetch_ok_at.lock().await = None;
-        drop(fetch_change);
-        drop(fetch_transition);
-        self.start_fetch_loop().await;
-        result?;
-        self.app.refresh_business_http().await?;
-        Ok(self.app.status().await)
-    }
-
-    pub async fn stop_warp(&self) -> Status {
-        let _change = self.settings_change.lock().await;
-        let fetch_transition = self.app.fetch_transition.lock().await;
-        self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
-        self.app.fetch_change_notify.notify_waiters();
-        self.stop_fetch_loop().await;
-        let fetch_change = self.app.fetch_gate.lock().await;
-        self.app.warp.stop().await;
-        let _ = self.app.refresh_business_http().await;
-        self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
-        self.app.reset_fetch_schedule().await;
-        self.app.fetch_change_notify.notify_waiters();
-        *self.app.fetch_error.lock().await = None;
-        *self.app.fetch_ok_at.lock().await = None;
-        drop(fetch_change);
-        drop(fetch_transition);
-        self.start_fetch_loop().await;
-        self.app.status().await
     }
 }
 
@@ -2055,16 +1925,7 @@ async fn bind_listen(addr: SocketAddr) -> Result<TcpListener> {
 
 async fn proxy(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
     if is_websocket(&req) {
-        // WebSocket 升级需要 Cloudflare cookie（由 Codex 客户端维护），
-        // 代理自建的连接没有 cookie 会被 Cloudflare 403 拒绝。
-        // 返回 426 Upgrade Required —— 官方 Codex 客户端检测到此状态码后
-        // 会自动永久切换到 HTTP SSE 流式传输（见 client.rs FallbackToHttp 逻辑）。
-        eprintln!("[ws] 拒绝 WS 升级（无 Cloudflare cookie），返回 426 触发客户端回退到 HTTP SSE");
-        return (
-            StatusCode::UPGRADE_REQUIRED,
-            "WebSocket not supported by proxy, use HTTP SSE",
-        )
-            .into_response();
+        return proxy_ws(app, req).await;
     }
     proxy_http(app, req).await
 }
@@ -2094,7 +1955,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
     )
     .await
     {
-        Ok(resp) => {
+        Ok(mut resp) => {
             details.response_header_ms = Some(started.elapsed().as_millis());
             details.response_content_encoding = Some(logs::safe_content_encoding(
                 resp.headers()
@@ -2146,9 +2007,17 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                             .trim()
                             .eq_ignore_ascii_case("text/event-stream")
                     });
-            if is_sse {
+            if let Some(transport) = resp
+                .headers()
+                .get(UPSTREAM_TRANSPORT_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+            {
+                details.transport = transport;
+            } else if is_sse {
                 details.transport = "http_sse".into();
             }
+            resp.headers_mut().remove(UPSTREAM_TRANSPORT_HEADER);
             let metrics = logs::ResponseBodyMetrics::new(
                 resp.headers()
                     .get(header::CONTENT_ENCODING)
@@ -2620,16 +2489,8 @@ impl Drop for ResponseLogTracker {
     }
 }
 
-fn resolved_business_proxy(
-    settings: &Settings,
-    warp: &WarpRuntime,
-    mihomo: &MihomoRuntime,
-) -> String {
-    if !settings.same_network() {
-        return settings.upstream_proxy.clone();
-    }
+fn resolved_proxy(settings: &Settings, mihomo: &MihomoRuntime) -> String {
     match settings.outbound_mode {
-        OutboundMode::Warp => warp.proxy_url().unwrap_or_default(),
         OutboundMode::Mihomo => mihomo.proxy_url().unwrap_or_default(),
         OutboundMode::Manual => settings.outbound_proxy.clone(),
     }
@@ -2637,9 +2498,8 @@ fn resolved_business_proxy(
 
 fn business_network_details(settings: &Settings, upstream: &str, proxy: &str) -> NetworkLogDetails {
     let mut details = logs::network_details(upstream, proxy);
-    if settings.same_network() && !proxy.trim().is_empty() {
+    if !proxy.trim().is_empty() {
         details.route_kind = match settings.outbound_mode {
-            OutboundMode::Warp => logs::ROUTE_EMBEDDED_WARP.into(),
             OutboundMode::Mihomo => logs::ROUTE_EMBEDDED_MIHOMO.into(),
             OutboundMode::Manual => logs::ROUTE_MANUAL_PROXY.into(),
         };
@@ -2667,6 +2527,7 @@ fn pooled_upstream(key: String) -> Result<PooledUpstream> {
     Ok(PooledUpstream { key, client })
 }
 
+#[cfg(test)]
 fn business_http_client(template: &str, session: Option<&str>) -> Result<reqwest::Client> {
     Ok(pooled_upstream(business_proxy_key(template, session)?)?.client)
 }
@@ -2767,11 +2628,8 @@ async fn wait_for_request_state(
         }
         if current.codex_home != request_settings.codex_home
             || current.upstream != request_settings.upstream
-            || current.upstream_proxy != request_settings.upstream_proxy
             || current.outbound_proxy != request_settings.outbound_proxy
             || current.outbound_mode != request_settings.outbound_mode
-            || current.warp_http2 != request_settings.warp_http2
-            || current.network_route_policy != request_settings.network_route_policy
             || current.forced_model != request_settings.forced_model
         {
             return Err(state_wait_error(
@@ -2831,7 +2689,7 @@ async fn forward_http_tracked(
 ) -> Result<Response> {
     let (upstream, home, upstream_proxy, state_miss_policy, request_settings) = {
         let settings = app.settings.lock().await;
-        let business_proxy = resolved_business_proxy(&settings, &app.warp, &app.mihomo);
+        let business_proxy = resolved_proxy(&settings, &app.mihomo);
         (
             settings.upstream.clone(),
             settings.codex_home.clone(),
@@ -2842,22 +2700,7 @@ async fn forward_http_tracked(
     };
     let effective_proxy = fetch::outbound_proxy_for_client(&upstream_proxy);
     *details = business_network_details(&request_settings, &upstream, &effective_proxy);
-    if request_settings.same_network()
-        && request_settings.outbound_mode == OutboundMode::Warp
-        && upstream_proxy.trim().is_empty()
-    {
-        anyhow::bail!(
-            "{}",
-            app.warp
-                .proxy_url()
-                .err()
-                .map(|err| err.to_string())
-                .unwrap_or_else(|| { "内置 WARP 正在自动连接，请稍候。".into() })
-        );
-    }
-    if request_settings.same_network()
-        && request_settings.outbound_mode == OutboundMode::Mihomo
-        && upstream_proxy.trim().is_empty()
+    if request_settings.outbound_mode == OutboundMode::Mihomo && upstream_proxy.trim().is_empty()
     {
         anyhow::bail!(
             "{}",
@@ -3230,19 +3073,6 @@ async fn forward_http_tracked(
     } else {
         upstream_proxy.clone()
     };
-    let http = app.business_client(&resolved_proxy).await?;
-    let mut builder = http
-        .request(
-            reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?,
-            target,
-        )
-        .body(bytes);
-    for (name, value) in &parts.headers {
-        if is_hop(name) {
-            continue;
-        }
-        builder = builder.header(name, value);
-    }
     if let Some(account) = parts
         .headers
         .get("chatgpt-account-id")
@@ -3251,6 +3081,42 @@ async fn forward_http_tracked(
         .filter(|value| !value.is_empty())
     {
         *activity = Some(app.traffic.begin(account, Instant::now()));
+    }
+    if ws_bridge::should_bridge_http(
+        request_settings.ws_upstream_enabled,
+        parts.method.as_str(),
+        path,
+        &target,
+    ) {
+        match forward_responses_over_ws(
+            app,
+            &target,
+            &resolved_proxy,
+            &parts.headers,
+            &bytes,
+            started,
+            details,
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                eprintln!("[ws] 上游 WebSocket 失败: {err:#}，回退到 HTTP");
+            }
+        }
+    }
+    let http = app.business_client(&resolved_proxy).await?;
+    let mut builder = http
+        .request(
+            reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?,
+            &target,
+        )
+        .body(bytes);
+    for (name, value) in &parts.headers {
+        if is_hop(name) {
+            continue;
+        }
+        builder = builder.header(name, value);
     }
     let upstream_resp = match builder.send().await {
         Ok(response) => response,
@@ -3343,9 +3209,349 @@ async fn forward_http_tracked(
     Ok(response)
 }
 
-// WebSocket 代理已移除 — 所有 WS 升级请求在 proxy() 入口返回 426，
-// 触发 Codex CLI 自动切换到 HTTP SSE 模式。
-// 这保证了所有请求都经过 proxy_http()，可以可靠地提取 model 并注入对应 token。
+const WS_REQUEST_HEADERS: &[&str] = &[
+    "originator",
+    "user-agent",
+    "version",
+    "x-codex-installation-id",
+    "x-codex-routing-hint",
+];
+
+async fn forward_responses_over_ws(
+    app: &App,
+    target: &str,
+    proxy: &str,
+    headers: &HeaderMap,
+    bytes: &[u8],
+    started: Instant,
+    details: &mut NetworkLogDetails,
+) -> Result<Response> {
+    let mut frame =
+        ws_bridge::http_body_to_ws_request(bytes).map_err(|err| anyhow::anyhow!(err))?;
+    if let Some(token) = headers
+        .get(turn_state::HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+    {
+        ws_bridge::ensure_turn_state(&mut frame, token);
+    }
+    let dial = ws_dial(target, proxy, headers)?;
+    let rx = app.ws_upstream.open_turn(dial, frame).await?;
+    let header_ms = started.elapsed().as_millis();
+    details.transport = "http_to_ws".into();
+    details.response_header_ms = Some(header_ms);
+    details.http_version = Some("websocket".into());
+    if let Ok(ws_url) = ws_bridge::upstream_to_ws_url(target) {
+        details.final_origin = Some(logs::endpoint_origin(&ws_url));
+    }
+    details.stream_lifecycle = Some(Arc::new(StreamLifecycle::new(started, header_ms)));
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Some(Ok(text)) => {
+                let line = Bytes::from(ws_bridge::ws_event_to_sse_line(&text));
+                Some((Ok::<Bytes, std::io::Error>(line), rx))
+            }
+            Some(Err(err)) => {
+                let line = Bytes::from(format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"type": "response.incomplete", "error": err})
+                ));
+                Some((Ok(line), rx))
+            }
+            None => None,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(UPSTREAM_TRANSPORT_HEADER, "http_to_ws")
+        .body(Body::from_stream(stream))
+        .context("构造 WebSocket SSE 响应")
+}
+
+fn ws_dial(target: &str, proxy: &str, headers: &HeaderMap) -> Result<WsDial> {
+    let url = ws_bridge::upstream_to_ws_url(target).map_err(|err| anyhow::anyhow!(err))?;
+    Ok(WsDial {
+        url,
+        proxy: fetch::outbound_proxy_for_client(proxy),
+        authorization: header_string(headers, "authorization"),
+        account_id: header_string(headers, "chatgpt-account-id"),
+        extra_headers: WS_REQUEST_HEADERS
+            .iter()
+            .filter_map(|name| {
+                let value = header_string(headers, name);
+                (!value.is_empty()).then(|| ((*name).to_string(), value))
+            })
+            .collect(),
+    })
+}
+
+fn header_string(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+async fn proxy_ws(app: Arc<App>, req: Request<Body>) -> Response {
+    if !app.settings.lock().await.ws_upstream_enabled {
+        eprintln!("[ws] 上游 WebSocket 已关闭，返回 426");
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "WebSocket upstream is disabled",
+        )
+            .into_response();
+    }
+    let headers = req.headers().clone();
+    let (mut parts, _body) = req.into_parts();
+    match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(upgrade) => upgrade.on_upgrade(move |socket| async move {
+            if let Err(err) = client_ws_session(app, headers, socket).await {
+                eprintln!("[ws] 客户端会话结束: {err:#}");
+            }
+        }),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+async fn client_ws_session(
+    app: Arc<App>,
+    client_headers: HeaderMap,
+    mut socket: WebSocket,
+) -> Result<()> {
+    loop {
+        let message = match socket.recv().await {
+            Some(Ok(message)) => message,
+            Some(Err(err)) => return Err(err).context("读取客户端 WebSocket"),
+            None => return Ok(()),
+        };
+        let text = match message {
+            WsMessage::Text(text) => text.to_string(),
+            WsMessage::Close(_) => return Ok(()),
+            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => continue,
+        };
+        let started = Instant::now();
+        let frame = prepare_client_ws_frame(&app, &text).await?;
+        let model = frame
+            .get("model")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        let account = header_string(&client_headers, "chatgpt-account-id");
+        let billing = if account.is_empty() {
+            None
+        } else {
+            app.begin_internal_billing("business", started, &account, None, &model)
+        };
+        let dial = match current_ws_dial(&app, &client_headers).await {
+            Ok(dial) => dial,
+            Err(err) => {
+                let mut metrics = logs::ResponseBodyMetrics::new("");
+                finish_client_ws_turn(
+                    &app,
+                    &client_headers,
+                    &model,
+                    started,
+                    billing,
+                    &mut metrics,
+                    true,
+                )
+                .await;
+                let fail = serde_json::json!({"type":"error","error":{"message": err.to_string()}});
+                let _ = socket.send(WsMessage::text(fail.to_string())).await;
+                continue;
+            }
+        };
+        let mut rx = match app.ws_upstream.open_turn(dial, frame).await {
+            Ok(rx) => rx,
+            Err(err) => {
+                let mut metrics = logs::ResponseBodyMetrics::new("");
+                finish_client_ws_turn(
+                    &app,
+                    &client_headers,
+                    &model,
+                    started,
+                    billing,
+                    &mut metrics,
+                    true,
+                )
+                .await;
+                let fail = serde_json::json!({"type":"error","error":{"message": err.to_string()}});
+                let _ = socket.send(WsMessage::text(fail.to_string())).await;
+                continue;
+            }
+        };
+        let mut metrics = logs::ResponseBodyMetrics::new("");
+        let mut failed = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                Ok(json) => {
+                    let line = ws_bridge::ws_event_to_sse_line(&json);
+                    metrics.observe(line.as_bytes(), started.elapsed().as_millis(), true);
+                    if socket.send(WsMessage::text(json)).await.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    failed = true;
+                    let fail = serde_json::json!({"type":"response.incomplete"});
+                    let _ = socket.send(WsMessage::text(fail.to_string())).await;
+                    break;
+                }
+            }
+        }
+        metrics.finish(started.elapsed().as_millis());
+        finish_client_ws_turn(
+            &app,
+            &client_headers,
+            &model,
+            started,
+            billing,
+            &mut metrics,
+            failed,
+        )
+        .await;
+    }
+}
+
+async fn prepare_client_ws_frame(app: &App, text: &str) -> Result<serde_json::Value> {
+    let mut frame: serde_json::Value =
+        serde_json::from_str(text).context("客户端 WebSocket 帧不是 JSON")?;
+    let settings = app.settings.lock().await.clone();
+    if let Some(model) = settings.forced_model() {
+        ws_bridge::rewrite_model_in_ws_frame(&mut frame, model);
+    }
+    if frame.get("type").is_none() {
+        frame["type"] = serde_json::json!("response.create");
+    }
+    let encoded = serde_json::to_vec(&frame).context("无法序列化客户端 WebSocket 帧")?;
+    let passthrough = matches!(
+        settings.state_miss_policy,
+        StateMissPolicy::Passthrough | StateMissPolicy::StripAll
+    );
+    if !passthrough
+        && !turn_state::is_same_turn_follow_up(&encoded)
+        && !turn_state::ws_has_turn_state(text)
+    {
+        let model = frame
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        if let Some(model) = model.as_deref() {
+            app.turn_state.lock().await.register_model(model);
+        }
+        let token = {
+            let store = app.turn_state.lock().await;
+            model
+                .as_deref()
+                .and_then(|model| store.peek_for_model(model))
+                .and_then(|value| turn_state::injectable_http_token(&value))
+        };
+        if let Some(token) = token {
+            if let Some(stamped) = turn_state::stamp_ws_json(
+                &serde_json::to_string(&frame).unwrap_or_default(),
+                &token,
+            ) {
+                if let Ok(value) = serde_json::from_str(&stamped) {
+                    frame = value;
+                }
+            }
+        }
+    }
+    Ok(frame)
+}
+
+async fn current_ws_dial(app: &App, client_headers: &HeaderMap) -> Result<WsDial> {
+    let settings = app.settings.lock().await.clone();
+    let mut headers = client_headers.clone();
+    if let Some((creds, true)) = app
+        .sync_request_identity(Path::new(&settings.codex_home))
+        .await
+    {
+        if !login::apply_chatgpt_credentials_headers(&mut headers, &creds) {
+            anyhow::bail!("无法应用 ChatGPT 鉴权请求头");
+        }
+    }
+    let template = resolved_proxy(&settings, &app.mihomo);
+    if settings.outbound_mode == OutboundMode::Mihomo && template.trim().is_empty() {
+        anyhow::bail!(
+            "{}",
+            app.mihomo
+                .proxy_url()
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "订阅节点正在连接，请稍候。".into())
+        );
+    }
+    let proxy = app.ws_upstream.resolve_proxy(&template, None).await?;
+    ws_dial(&settings.upstream, &proxy, &headers)
+}
+
+async fn finish_client_ws_turn(
+    app: &App,
+    headers: &HeaderMap,
+    model: &str,
+    started: Instant,
+    billing: Option<BillingRequest>,
+    metrics: &mut logs::ResponseBodyMetrics,
+    failed: bool,
+) {
+    if let Some(request) = billing {
+        let usage_complete = metrics.usage_seen()
+            && metrics.input_tokens().is_some()
+            && metrics.output_tokens().is_some();
+        request.settle(UsageOutcome {
+            state: if failed {
+                UsageState::Interrupted
+            } else if usage_complete {
+                UsageState::Measured
+            } else {
+                UsageState::MissingUsage
+            },
+            finished_at: Some(chrono::Utc::now().to_rfc3339()),
+            http_status: Some(if failed { 502 } else { 200 }),
+            response_model: metrics.upstream_response_model().map(str::to_owned),
+            usage: TokenUsage {
+                input_tokens: metrics.input_tokens(),
+                cached_input_tokens: metrics.cached_input_tokens(),
+                output_tokens: metrics.output_tokens(),
+            },
+            usage_source: metrics.usage_seen().then(|| "provider_response".into()),
+            error_kind: failed.then(|| "ws_upstream".into()),
+        });
+    }
+    let settings = app.settings.lock().await.clone();
+    let proxy = resolved_proxy(&settings, &app.mihomo);
+    let mut details = business_network_details(
+        &settings,
+        &settings.upstream,
+        &fetch::outbound_proxy_for_client(&proxy),
+    );
+    details.transport = "ws_to_ws".into();
+    details.flow = "business".into();
+    details.model = Some(logs::safe_text(model, 80)).filter(|value| !value.is_empty());
+    details.http_version = Some("websocket".into());
+    details.response_header_ms = Some(started.elapsed().as_millis());
+    details.output_tokens = metrics.output_tokens();
+    details.first_token_ms = metrics.first_token_ms();
+    let account = header_string(headers, "chatgpt-account-id");
+    details.account_id = (!account.is_empty()).then_some(account);
+    details.in_progress = false;
+    if failed {
+        details.error_kind = Some("ws_upstream".into());
+    }
+    app.record(
+        "WS",
+        "/responses",
+        if failed { 502 } else { 200 },
+        started,
+        details,
+    )
+    .await;
+}
 
 fn is_hop(name: &HeaderName) -> bool {
     HOP_BY_HOP
@@ -3400,9 +3606,9 @@ mod tests {
     }
 
     #[test]
-    fn warp_route_never_falls_back_to_saved_manual_proxy() {
+    fn mihomo_without_sidecar_does_not_use_saved_manual_proxy() {
         let settings = Settings {
-            outbound_mode: OutboundMode::Warp,
+            outbound_mode: OutboundMode::Mihomo,
             outbound_proxy: "http://127.0.0.1:7890".into(),
             ..Settings::default()
         };
@@ -3850,14 +4056,9 @@ mod tests {
             outbound_proxy:
                 "socks5://xmtt1126849-region-DE-sid-{session}-t-120:pass@us.arxlabs.io:3010".into(),
             outbound_mode: OutboundMode::Manual,
-            network_route_policy: NetworkRoutePolicy::SameNetwork,
             ..Settings::default()
         };
-        let template = resolved_business_proxy(
-            &settings,
-            &WarpRuntime::default(),
-            &MihomoRuntime::default(),
-        );
+        let template = resolved_proxy(&settings, &MihomoRuntime::default());
         assert!(fetch::has_session_placeholder(&template));
         assert!(fetch::apply_bound_session(&template, None).is_err());
         assert!(fetch::apply_bound_session(&template, Some("1Z5jzVPs"))
@@ -4066,7 +4267,6 @@ mod tests {
         let app = Arc::new(
             App::new(Settings {
                 token_reuse_policy: TokenReusePolicy::PerModel,
-                network_route_policy: NetworkRoutePolicy::Separate,
                 upstream: format!("http://{}", listener.local_addr().unwrap()),
                 codex_home: home.path().display().to_string(),
                 ..Settings::default()
@@ -4182,7 +4382,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app = Arc::new(
             App::new(Settings {
-                network_route_policy: NetworkRoutePolicy::Separate,
                 upstream: format!("http://{}", listener.local_addr().unwrap()),
                 codex_home: home.path().display().to_string(),
                 ..Settings::default()

@@ -47,13 +47,6 @@ function ticketRoute(status: Status): string[] {
   if (status.outboundMode === "mihomo") {
     return ["State Kit", mihomoHop(status), safeNetworkUrl(status.upstream, true)];
   }
-  if (status.outboundMode === "warp") {
-    const endpoint = status.warp.proxyUrl ? safeNetworkUrl(status.warp.proxyUrl) : "WARP 本地端点待连接";
-    const exit = status.warp.exitIp
-      ? `出口 ${status.warp.exitIp}${status.warp.country ? ` · ${status.warp.country}` : ""}`
-      : "出口待验证";
-    return ["State Kit", `内置 WARP · ${endpoint} · ${exit}`, safeNetworkUrl(status.upstream, true)];
-  }
   return [
     "State Kit",
     status.outboundProxy ? `手动代理 · ${safeNetworkUrl(effectiveProxyUrl(status.outboundProxy))}${status.turnState?.boundProxySession ? ` · session ${status.turnState.boundProxySession}` : ""}` : "手动代理未配置",
@@ -62,28 +55,20 @@ function ticketRoute(status: Status): string[] {
 }
 
 function businessRoute(status: Status): string[] {
-  const sameNetwork = (status.networkRoutePolicy ?? "same_network") === "same_network";
-  const hop = sameNetwork
-    ? status.outboundMode === "warp" || status.outboundMode === "mihomo"
-      ? ticketRoute(status)[1]
-      : status.outboundProxy
-        ? `同网代理 · ${safeNetworkUrl(effectiveProxyUrl(status.outboundProxy))}${status.turnState?.boundProxySession ? ` · session ${status.turnState.boundProxySession}` : ""}`
-        : "同网代理未配置"
-    : status.upstreamProxy
-      ? `上游转发代理 · ${safeNetworkUrl(effectiveProxyUrl(status.upstreamProxy))}`
-      : "系统默认网络（可能受环境代理影响）";
   return [
     "Codex",
     `本机代理 · http://${status.proxyListen}`,
-    hop,
+    ticketRoute(status)[1],
     safeNetworkUrl(status.upstream, true),
   ];
 }
 
 function routeLabel(entry: LogEntry): string {
   switch (entry.routeKind) {
+    case "embedded_mihomo":
+      return `订阅节点 · ${entry.proxyEndpoint || "本地端点"} → ${entry.targetOrigin || "上游"}`;
     case "embedded_warp":
-      return `内置 WARP · ${entry.proxyEndpoint || "本地端点"} → ${entry.targetOrigin || "上游"}`;
+      return `历史 WARP 线路 · ${entry.proxyEndpoint || "本地端点"} → ${entry.targetOrigin || "上游"}`;
     case "manual_proxy":
       return `手动代理 · ${entry.proxyEndpoint || "已配置"}${entry.proxySession ? ` · session ${entry.proxySession}` : ""} → ${entry.targetOrigin || "上游"}`;
     case "explicit_proxy":
@@ -153,7 +138,10 @@ function displayTime(value: string): string {
 }
 
 function transportLabel(value: string): string {
-  return value === "http_sse" ? "HTTP SSE" : "HTTP";
+  if (value === "http_sse") return "HTTP SSE";
+  if (value === "http_to_ws") return "HTTP→WS";
+  if (value === "ws_to_ws") return "WS→WS";
+  return "HTTP";
 }
 
 function requestLabel(entry: LogEntry): string {
@@ -211,7 +199,8 @@ function modelComparison(entry: LogEntry): "一致" | "不一致" | "无法比�
 }
 
 function ResponseModel({ entry }: { entry: LogEntry }) {
-  if (!entry.model && !entry.upstreamResponseModel && entry.transport !== "http_sse") return null;
+  const streamed = entry.transport === "http_sse" || entry.transport === "http_to_ws" || entry.transport === "ws_to_ws";
+  if (!entry.model && !entry.upstreamResponseModel && !streamed) return null;
   const comparison = modelComparison(entry);
   const missing = entry.flow === "token_fetch" ? "未读取（仅响应头）" : entry.inProgress ? "等待返回" : "未获取";
   return (

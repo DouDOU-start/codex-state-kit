@@ -85,20 +85,18 @@ fn patch(settings: &Settings, policy: TokenReusePolicy) -> SettingsPatch {
         upstream: settings.upstream.clone(),
         codex_home: settings.codex_home.clone(),
         outbound_proxy: settings.outbound_proxy.clone(),
-        upstream_proxy: settings.upstream_proxy.clone(),
         outbound_mode: settings.outbound_mode,
-        warp_http2: settings.warp_http2,
         models: settings.models.clone(),
         state_miss_policy: settings.state_miss_policy,
         token_reuse_policy: policy,
         state_fetch_model: settings.state_fetch_model.clone(),
-        network_route_policy: settings.network_route_policy,
         forced_model: settings.forced_model.clone(),
         token_fetch_paused: settings.token_fetch_paused,
         token_max_age_mins: settings.token_max_age_mins,
         token_prefetch_age_mins: settings.token_prefetch_age_mins,
         mihomo_subscription: String::new(),
         mihomo_node: String::new(),
+        ws_upstream_enabled: settings.ws_upstream_enabled,
     }
 }
 

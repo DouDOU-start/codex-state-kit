@@ -12,10 +12,12 @@ import {
   setModelBoundTokenLen,
   openUrl,
   startChatgptLogin,
-  openWarpTerms as openWarpTermsApi,
   probeOutboundLatency,
+  mihomoSelect,
+  mihomoGroupDelay,
+  reconnectWsUpstream,
 } from "@/lib/api";
-import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy, NetworkRoutePolicy, SettingsPatch, ProbeKind, LatencyReport } from "@/types";
+import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy, TokenReusePolicy, SettingsPatch, ProbeKind, LatencyReport } from "@/types";
 
 function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): SettingsPatch {
   return {
@@ -23,9 +25,7 @@ function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): Sett
     upstream: status.upstream,
     codexHome: status.codexHome,
     outboundProxy: status.outboundProxy,
-    upstreamProxy: status.upstreamProxy,
     outboundMode: status.outboundMode,
-    warpHttp2: status.warpHttp2,
     mihomoSubscription: status.mihomoSubscription ?? "",
     mihomoNode: status.mihomoNode ?? "",
     stateMissPolicy: status.stateMissPolicy,
@@ -34,9 +34,9 @@ function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): Sett
     tokenFetchPaused: status.tokenFetchPaused ?? false,
     tokenMaxAgeMins: status.tokenMaxAgeMins ?? 40,
     tokenPrefetchAgeMins: status.tokenPrefetchAgeMins ?? 35,
-    networkRoutePolicy: status.networkRoutePolicy ?? "same_network",
     forcedModel: status.forcedModel ?? "",
     models: status.configuredModels,
+    wsUpstreamEnabled: status.wsUpstreamEnabled !== false,
     ...overrides,
   };
 }
@@ -56,8 +56,9 @@ export function useCodexStateKit() {
   const [device, setDevice] = useState<LoginStart | null>(null);
   const [banner, setBanner] = useState<Banner | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<"login" | "save" | "refresh" | "warp" | null>(null);
+  const [busy, setBusy] = useState<"login" | "save" | "refresh" | null>(null);
   const [probing, setProbing] = useState<ProbeKind | null>(null);
+  const [probingGroup, setProbingGroup] = useState<string | null>(null);
   const [latency, setLatency] = useState<Partial<Record<ProbeKind, LatencyReport>>>({});
   const request = useRef<Promise<void> | null>(null);
   const pollTimer = useRef<number | null>(null);
@@ -120,9 +121,9 @@ export function useCodexStateKit() {
 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
-  const persistSettings = useCallback(async (home: string, outboundProxy: string, current: Status, outboundMode = current.outboundMode, warpHttp2 = current.warpHttp2, upstreamProxy = current.upstreamProxy) => {
-    if (home === current.codexHome && outboundProxy === current.outboundProxy && outboundMode === current.outboundMode && warpHttp2 === current.warpHttp2 && upstreamProxy === current.upstreamProxy) return current;
-    return setConfig(patchFrom(current, { codexHome: home, outboundProxy, upstreamProxy, outboundMode, warpHttp2 }));
+  const persistSettings = useCallback(async (home: string, outboundProxy: string, current: Status, outboundMode = current.outboundMode) => {
+    if (home === current.codexHome && outboundProxy === current.outboundProxy && outboundMode === current.outboundMode) return current;
+    return setConfig(patchFrom(current, { codexHome: home, outboundProxy, outboundMode }));
   }, []);
 
   const saveMihomo = useCallback(async (subscription: string, node: string) => {
@@ -143,7 +144,7 @@ export function useCodexStateKit() {
     }
   }, []);
 
-  const saveSettings = useCallback(async (home: string, outboundProxy: string, outboundMode?: OutboundMode, warpHttp2?: boolean, upstreamProxy?: string) => {
+  const saveSettings = useCallback(async (home: string, outboundProxy: string, outboundMode?: OutboundMode) => {
     setBusy("save");
     try {
       const latest = await getStatus();
@@ -152,7 +153,7 @@ export function useCodexStateKit() {
         setDevice(null);
         await cancelChatgptLogin();
       }
-      const next = await persistSettings(home.trim(), outboundProxy, latest, outboundMode, warpHttp2, upstreamProxy?.trim());
+      const next = await persistSettings(home.trim(), outboundProxy, latest, outboundMode);
       if (next.codexHome !== latest.codexHome) {
         await loadLogin(next.codexHome);
       }
@@ -164,11 +165,6 @@ export function useCodexStateKit() {
       setBusy(null);
     }
   }, [persistSettings, loadLogin, stopPolling]);
-
-  const openWarpTerms = useCallback(async () => {
-    try { await openWarpTermsApi(); }
-    catch (cause) { setBanner({ kind: "error", text: errorMessage(cause) }); }
-  }, []);
 
   const probeLatency = useCallback(async (kind: ProbeKind, proxy?: string) => {
     setProbing(kind);
@@ -260,21 +256,42 @@ export function useCodexStateKit() {
     }
   }, []);
 
-  const setNetworkRoutePolicy = useCallback(async (networkRoutePolicy: NetworkRoutePolicy) => {
+  const selectMihomoNode = useCallback(async (group: string, node: string) => {
     setBusy("save");
     try {
-      const latest = await getStatus();
-      const next = await setConfig(patchFrom(latest, { networkRoutePolicy }));
-      setStatus(next);
-      setBanner({ kind: "ok", text: networkRoutePolicy === "same_network"
-        ? "已启用同网策略：获取 292 与业务发送走同一条代理。"
-        : "已恢复分路：Token 走获取代理，业务走上游转发代理。" });
+      await mihomoSelect(group, node);
+      setStatus(await getStatus());
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
     } finally {
       setBusy(null);
     }
   }, []);
+
+  const probeMihomoGroup = useCallback(async (group: string) => {
+    setProbingGroup(group);
+    try {
+      await mihomoGroupDelay(group);
+      setStatus(await getStatus());
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setProbingGroup(null);
+    }
+  }, []);
+
+  const probeAllMihomo = useCallback(async () => {
+    const groups = (status?.mihomo.groups ?? []).filter((group) => group.groupType === "select" || group.groupType === "url-test");
+    setProbingGroup("*");
+    try {
+      await Promise.all(groups.map((group) => mihomoGroupDelay(group.name)));
+      setStatus(await getStatus());
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setProbingGroup(null);
+    }
+  }, [status]);
 
   const refetchTurnState = useCallback(async () => {
     setBusy("refresh");
@@ -399,6 +416,33 @@ export function useCodexStateKit() {
     }
   }, [device]);
 
+  const setWsUpstreamEnabled = useCallback(async (enabled: boolean) => {
+    setBusy("save");
+    try {
+      const latest = await getStatus();
+      const next = await setConfig(patchFrom(latest, { wsUpstreamEnabled: enabled }));
+      setStatus(next);
+      setBanner({ kind: "ok", text: enabled ? "上游已改为 WebSocket，失败时回退 HTTP" : "上游已改回 HTTP" });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const reconnectUpstream = useCallback(async () => {
+    setBusy("save");
+    try {
+      const next = await reconnectWsUpstream();
+      setStatus(next);
+      setBanner({ kind: "ok", text: "已断开上游 WebSocket，下次请求会重新连接" });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
   const bindTokenLen = useCallback(async (len: number | null) => {
     try {
       const next = await setBoundTokenLen(len);
@@ -433,13 +477,17 @@ export function useCodexStateKit() {
     setTokenReusePolicy,
     saveStateFetchModel,
     setTokenFetchPaused,
-    setNetworkRoutePolicy,
     saveForcedModel,
     refetchTurnState,
-    openWarpTerms,
     probing,
+    probingGroup,
     latency,
     probeLatency,
+    selectMihomoNode,
+    probeMihomoGroup,
+    probeAllMihomo,
+    setWsUpstreamEnabled,
+    reconnectUpstream,
     startLogin,
     importRefreshLogin,
     importAccessLogin,

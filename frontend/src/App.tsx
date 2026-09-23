@@ -9,18 +9,17 @@ import Network from "lucide-react/dist/esm/icons/network.js";
 import Terminal from "lucide-react/dist/esm/icons/terminal.js";
 import CircleCheck from "lucide-react/dist/esm/icons/circle-check.js";
 import Radio from "lucide-react/dist/esm/icons/radio.js";
-import Cloud from "lucide-react/dist/esm/icons/cloud.js";
 import Waypoints from "lucide-react/dist/esm/icons/waypoints.js";
 import Pause from "lucide-react/dist/esm/icons/pause.js";
 import Play from "lucide-react/dist/esm/icons/play.js";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import { AppShell } from "@/components/AppShell";
 import { BillingPanel } from "@/components/BillingPanel";
+import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
 import { NetworkLogDialog } from "@/components/NetworkLogDialog";
-import { WarpPanel } from "@/components/WarpPanel";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { LoginMode, Status, TurnStateView, StateMissPolicy, TokenReusePolicy, NetworkRoutePolicy, LatencySample } from "@/types";
+import type { LoginMode, Status, TurnStateView, StateMissPolicy, TokenReusePolicy, LatencySample } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -174,7 +173,6 @@ export default function App() {
   const fwd = useCodexStateKit();
   const [codexHome, setCodexHome] = useState("");
   const [outboundProxy, setOutboundProxy] = useState("");
-  const [upstreamProxy, setUpstreamProxy] = useState("");
   const [mihomoSubscription, setMihomoSubscription] = useState("");
   const [mihomoNode, setMihomoNode] = useState("");
   const [forcedModel, setForcedModel] = useState("");
@@ -191,7 +189,6 @@ export default function App() {
     hydrated.current = true;
     setCodexHome(fwd.status.codexHome);
     setOutboundProxy(fwd.status.outboundProxy ?? "");
-    setUpstreamProxy(fwd.status.upstreamProxy ?? "");
     setMihomoSubscription(fwd.status.mihomoSubscription ?? "");
     setMihomoNode(fwd.status.mihomoNode ?? "");
     setForcedModel(fwd.status.forcedModel ?? "");
@@ -239,7 +236,7 @@ export default function App() {
   const degrade = degradeChip(fwd.status);
   const copy = tokenCopy(
     turn,
-    fwd.status.fetchError ?? (fwd.status.outboundMode === "warp" ? fwd.status.warp.error : fwd.status.outboundMode === "mihomo" ? fwd.status.mihomo?.error : null),
+    fwd.status.fetchError ?? (fwd.status.outboundMode === "mihomo" ? fwd.status.mihomo?.error : null),
     fwd.status.tokenReusePolicy,
     fetchPaused,
   );
@@ -516,33 +513,25 @@ export default function App() {
         <div className="panel dash-grid">
         <section className="connection-section panel--proxy">
           <header>
-            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站网络</h2><p>{(fwd.status.networkRoutePolicy ?? "same_network") === "same_network" ? "获取 292 与业务发送使用同一条线路" : "Token 获取与业务转发可分开配置"}</p></div></div>
+            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站网络</h2><p>获取 Token 与业务发送共用这一条出站线路</p></div></div>
             <span className="section-step">01</span>
           </header>
-          <div className="token-reuse-policy network-route-policy" role="group" aria-labelledby="network-route-policy-label">
-            <div className="token-reuse-policy__heading">
-              <strong id="network-route-policy-label">网络策略</strong>
-              <span>自动保存 · 即时生效</span>
-            </div>
-            <div className="token-reuse-policy__options">
-              <label className="token-reuse-option">
-                <input type="radio" name="network-route-policy" value="same_network"
-                  checked={(fwd.status.networkRoutePolicy ?? "same_network") === "same_network"} disabled={fwd.busy !== null}
-                  onChange={() => void fwd.setNetworkRoutePolicy("same_network" as NetworkRoutePolicy)} />
-                <span><strong>同网获取并发送 <small>默认</small></strong><span>用当前代理打 292，拿到后业务请求走同一条线路</span></span>
-              </label>
-              <label className="token-reuse-option">
-                <input type="radio" name="network-route-policy" value="separate"
-                  checked={fwd.status.networkRoutePolicy === "separate"} disabled={fwd.busy !== null}
-                  onChange={() => void fwd.setNetworkRoutePolicy("separate")} />
-                <span><strong>Token 与业务分路 <small>旧</small></strong><span>Token 走获取代理，业务单独走上游转发代理</span></span>
-              </label>
-            </div>
-          </div>
           <div className="proxy-mode" role="group" aria-label="出站代理模式">
-            <button type="button" aria-pressed={fwd.status.outboundMode === "warp"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "warp")}><Cloud size={15} />内置 WARP</button>
             <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "manual")}><Network size={14} />手动代理</button>
             <button type="button" aria-pressed={fwd.status.outboundMode === "mihomo"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveMihomo(mihomoSubscription, mihomoNode)}><Waypoints size={14} />订阅节点</button>
+          </div>
+          <div className="ws-line">
+            <label>
+              <input
+                type="checkbox"
+                checked={fwd.status.wsUpstreamEnabled !== false}
+                disabled={fwd.busy !== null}
+                onChange={(event) => void fwd.setWsUpstreamEnabled(event.target.checked)}
+              />
+              上游走 WebSocket
+            </label>
+            <span>{fwd.status.wsUpstreamConnected ? `已连接${fwd.status.wsUpstreamConnectedAt ? ` · ${fwd.status.wsUpstreamConnectedAt}` : ""}` : "未连接"}</span>
+            <button type="button" className="text-button" disabled={fwd.busy !== null} onClick={() => void fwd.reconnectUpstream()}>重连</button>
           </div>
           {fwd.status.outboundMode === "manual" ? <>
           <label className="field">
@@ -561,15 +550,15 @@ export default function App() {
               }}
             />
           </label>
-          <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。可把出口写成 {'{session}'}，打票时自动轮换；拿到稳定 292 后绑定该 session 发业务。{(fwd.status.networkRoutePolicy ?? "same_network") === "same_network" ? " 同网策略下，业务转发也使用绑定后的同一条线路。" : ""}</p>
+          <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。可把出口写成 {'{session}'}，打票时自动轮换；拿到稳定 292 后绑定该 session，业务也走同一条线路。</p>
           <div className="latency-row">
             <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null} onClick={() => void fwd.probeLatency("manual", outboundProxy)}>
               {fwd.probing === "manual" ? "测试中" : "测延迟"}
             </button>
             {delayText(fwd.latency.manual?.samples[0]) ? <span className={fwd.latency.manual?.samples[0]?.delayMs != null ? "latency-row__ok" : "latency-row__bad"}>{delayText(fwd.latency.manual?.samples[0])}</span> : null}
           </div>
-          </> : fwd.status.outboundMode === "mihomo" ? (
-          <div className="warp-panel">
+          </> : (
+          <div className="mihomo-panel">
             <label className="field">
               <span>订阅地址</span>
               <input
@@ -586,63 +575,63 @@ export default function App() {
                 }}
               />
             </label>
-            <label className="field">
-              <span>当前节点</span>
-              <select
-                disabled={fwd.busy !== null || (fwd.status.mihomo?.nodes.length ?? 0) === 0}
-                value={mihomoNode || fwd.status.mihomo?.selected || ""}
-                onChange={(event) => {
-                  setMihomoNode(event.target.value);
-                  void fwd.saveMihomo(mihomoSubscription, event.target.value);
-                }}
-              >
-                {(fwd.status.mihomo?.nodes.length ?? 0) === 0 ? <option value="">连接后列出节点</option> : null}
-                {(fwd.status.mihomo?.nodes ?? []).map((node) => {
-                  const sample = fwd.latency.mihomo?.samples.find((item) => item.name === node);
-                  const mark = sample ? (sample.delayMs != null ? ` · ${sample.delayMs} ms` : " · 超时") : "";
-                  return <option key={node} value={node}>{node}{mark}</option>;
-                })}
-              </select>
-            </label>
-            <div className="latency-row">
-              <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null || (isTauri && fwd.status.mihomo?.phase !== "connected")} onClick={() => void fwd.probeLatency("mihomo")}>
-                {fwd.probing === "mihomo" ? "测试中" : "测延迟"}
-              </button>
-              {delayText(selectedNodeDelay) ? (
-                <span className={selectedNodeDelay?.delayMs != null ? "latency-row__ok" : "latency-row__bad"}>
-                  {delayText(selectedNodeDelay)}
-                </span>
-              ) : null}
-            </div>
-            {fwd.status.mihomo?.error ? <p className="warp-error">{fwd.status.mihomo.error}</p> : null}
+            {(fwd.status.mihomo?.groups.length ?? 0) > 0 ? (
+              <>
+                {fwd.status.mihomo.groups.map((group) => (
+                  <MihomoGroupPanel
+                    key={group.name}
+                    group={group}
+                    probing={fwd.probingGroup === group.name || fwd.probingGroup === "*"}
+                    onSelect={(node) => void fwd.selectMihomoNode(group.name, node)}
+                    onProbe={() => void fwd.probeMihomoGroup(group.name)}
+                  />
+                ))}
+                <div className="latency-row">
+                  <button type="button" className="token-fetch-toggle" disabled={fwd.probingGroup !== null || (isTauri && fwd.status.mihomo?.phase !== "connected")} onClick={() => void fwd.probeAllMihomo()}>
+                    {fwd.probingGroup === "*" ? "测试中" : "测全部延迟"}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <label className="field">
+                  <span>当前节点</span>
+                  <select
+                    disabled={fwd.busy !== null || (fwd.status.mihomo?.nodes.length ?? 0) === 0}
+                    value={mihomoNode || fwd.status.mihomo?.selected || ""}
+                    onChange={(event) => {
+                      setMihomoNode(event.target.value);
+                      void fwd.saveMihomo(mihomoSubscription, event.target.value);
+                    }}
+                  >
+                    {(fwd.status.mihomo?.nodes.length ?? 0) === 0 ? <option value="">连接后列出节点</option> : null}
+                    {(fwd.status.mihomo?.nodes ?? []).map((node) => {
+                      const sample = fwd.latency.mihomo?.samples.find((item) => item.name === node);
+                      const mark = sample ? (sample.delayMs != null ? ` · ${sample.delayMs} ms` : " · 超时") : "";
+                      return <option key={node} value={node}>{node}{mark}</option>;
+                    })}
+                  </select>
+                </label>
+                <div className="latency-row">
+                  <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null || (isTauri && fwd.status.mihomo?.phase !== "connected")} onClick={() => void fwd.probeLatency("mihomo")}>
+                    {fwd.probing === "mihomo" ? "测试中" : "测延迟"}
+                  </button>
+                  {delayText(selectedNodeDelay) ? (
+                    <span className={selectedNodeDelay?.delayMs != null ? "latency-row__ok" : "latency-row__bad"}>
+                      {delayText(selectedNodeDelay)}
+                    </span>
+                  ) : null}
+                </div>
+              </>
+            )}
+            {fwd.status.mihomo?.error ? <p className="mihomo-error">{fwd.status.mihomo.error}</p> : null}
             <p className="panel__hint">
               {fwd.status.mihomo?.phase === "connected"
                 ? `已连接${fwd.status.mihomo.selected ? ` · ${fwd.status.mihomo.selected}` : ""}${fwd.status.mihomo.proxyUrl ? ` · ${fwd.status.mihomo.proxyUrl}` : ""}`
-                : "内核随应用内置。同网时打票和业务都走选中节点；分路时打票走订阅节点，业务走上游转发代理并复验。"}
+                : "内核随应用内置。打票和业务都走这条订阅线路。"}
             </p>
           </div>
-          ) : <WarpPanel status={fwd.status.warp} probing={fwd.probing === "warp"} delayText={delayText(fwd.latency.warp?.samples[0])} onProbe={() => void fwd.probeLatency("warp")} onTerms={() => void fwd.openWarpTerms()} />}
-          {(fwd.status.networkRoutePolicy ?? "same_network") === "same_network" ? (
-            <p className="panel__hint">业务请求会复用上面这条出站线路，不再单独填写上游转发代理。</p>
-          ) : <>
-          <label className="field">
-            <span>上游转发代理</span>
-            <input
-              type="text"
-              spellCheck={false}
-              autoComplete="off"
-              disabled={fwd.busy !== null}
-              value={upstreamProxy}
-              placeholder="http://127.0.0.1:7897"
-              onChange={(event) => setUpstreamProxy(event.target.value)}
-              onBlur={() => void fwd.saveSettings(codexHome, outboundProxy, undefined, undefined, upstreamProxy)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") void fwd.saveSettings(codexHome, outboundProxy, undefined, undefined, upstreamProxy);
-              }}
-            />
-          </label>
-          <p className="panel__hint">仅用于业务转发，留空保持默认网络行为。支持 HTTP / HTTPS / SOCKS，失焦或 Enter 自动保存。</p>
-          </>}
+          )}
         </section>
 
         <section className="connection-section">

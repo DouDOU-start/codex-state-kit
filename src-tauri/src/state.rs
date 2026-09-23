@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use codex_state_kit::browser_login::BrowserLogin;
 use codex_state_kit::mihomo::{MihomoPaths, MihomoRuntime};
-use codex_state_kit::warp::{WarpPaths, WarpRuntime};
 use codex_state_kit::{load_settings, App, PendingLogin, ProxyHandle};
 
 #[derive(Clone)]
@@ -41,11 +40,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn initialize(warp_paths: WarpPaths, mihomo_paths: MihomoPaths) -> Result<Self> {
+    pub fn initialize(mihomo_paths: MihomoPaths) -> Result<Self> {
         let settings = load_settings();
-        let app = Arc::new(App::with_sidecars(
+        let app = Arc::new(App::with_mihomo(
             settings,
-            WarpRuntime::new(Some(warp_paths)),
             MihomoRuntime::new(Some(mihomo_paths)),
         )?);
         let proxy = ProxyHandle::new(app);
@@ -77,7 +75,7 @@ impl AppState {
         }));
         let proxy = self.proxy.clone();
         tasks.push(tauri::async_runtime::spawn(async move {
-            proxy.run_warp_supervisor().await;
+            proxy.run_sidecar_supervisor().await;
         }));
     }
 
@@ -98,7 +96,6 @@ impl AppState {
             return Err(err);
         }
         // Await cleanup before the Windows updater exits the process directly.
-        self.proxy.app().warp.stop().await;
         self.proxy.app().mihomo.stop().await;
         self.proxy.stop().await;
         self.restored.store(true, Ordering::SeqCst);
@@ -133,7 +130,6 @@ impl AppState {
         }
         let proxy = self.proxy.clone();
         tauri::async_runtime::spawn(async move {
-            proxy.app().warp.stop().await;
             proxy.app().mihomo.stop().await;
             proxy.stop().await;
         });

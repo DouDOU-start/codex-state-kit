@@ -10,6 +10,7 @@ import type {
   SettingsPatch,
   Status,
   LatencyReport,
+  LatencySample,
   BillingRecord,
   BillingQuery,
   BillingRecordsPage,
@@ -40,7 +41,6 @@ const defaultStatus = (): Status => ({
   tokenMaxAgeMins: 40,
   tokenPrefetchAgeMins: 35,
   diagLogPath: "",
-  networkRoutePolicy: "same_network",
   forcedModel: "",
   configuredModels: [],
   currentAccountId: "mock-account-b",
@@ -54,18 +54,7 @@ const defaultStatus = (): Status => ({
   proxyError: null,
   attachError: null,
   outboundProxy: "socks5://proxy.example.test:44445",
-  upstreamProxy: "socks5://proxy.example.test:44445",
   outboundMode: "manual",
-  warpHttp2: false,
-  warp: {
-    available: true,
-    registered: true,
-    phase: "stopped",
-    proxyUrl: null,
-    exitIp: null,
-    country: null,
-    error: null,
-  },
   mihomoSubscription: "",
   mihomoNode: "",
   mihomo: {
@@ -74,6 +63,7 @@ const defaultStatus = (): Status => ({
     proxyUrl: null,
     selected: null,
     nodes: [],
+    groups: [],
     error: null,
   },
   fetchError: null,
@@ -81,6 +71,9 @@ const defaultStatus = (): Status => ({
   turnState: emptyTurnState(),
   degraded: false,
   degradedAt: null,
+  wsUpstreamEnabled: true,
+  wsUpstreamConnected: false,
+  wsUpstreamConnectedAt: null,
   logs: [{
     id: 1,
     accountId: "mock-account-a",
@@ -213,8 +206,14 @@ let mockConfig: CodexConfigView = {
 function cloneStatus(): Status {
   return {
     ...mockStatus,
-    warp: { ...mockStatus.warp },
-    mihomo: { ...mockStatus.mihomo, nodes: [...mockStatus.mihomo.nodes] },
+    mihomo: {
+      ...mockStatus.mihomo,
+      nodes: [...mockStatus.mihomo.nodes],
+      groups: mockStatus.mihomo.groups.map((group) => ({
+        ...group,
+        all: group.all.map((node) => ({ ...node })),
+      })),
+    },
     accountTraffic: { ...mockStatus.accountTraffic },
     turnState: { ...mockStatus.turnState },
     logs: mockStatus.logs.map((entry) => ({ ...entry })),
@@ -229,22 +228,19 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
   if (isTauri) {
     return invoke<Status>("set_config", { settings });
   }
-  const tokenRouteChanged = settings.outboundMode !== mockStatus.outboundMode || settings.warpHttp2 !== mockStatus.warpHttp2 || settings.outboundProxy !== mockStatus.outboundProxy || settings.codexHome !== mockStatus.codexHome || settings.upstream !== mockStatus.upstream || settings.mihomoSubscription !== mockStatus.mihomoSubscription || settings.mihomoNode !== mockStatus.mihomoNode;
-  if (tokenRouteChanged && (settings.outboundMode === "manual" || settings.warpHttp2 !== mockStatus.warpHttp2)) {
-    await stopWarp();
-  }
+  const tokenRouteChanged = settings.outboundMode !== mockStatus.outboundMode || settings.outboundProxy !== mockStatus.outboundProxy || settings.codexHome !== mockStatus.codexHome || settings.upstream !== mockStatus.upstream || settings.mihomoSubscription !== mockStatus.mihomoSubscription || settings.mihomoNode !== mockStatus.mihomoNode;
   if (tokenRouteChanged) {
     mockStatus.turnState = emptyTurnState();
   }
+  const selected = settings.mihomoNode || "node-a";
+  const nodes = settings.mihomoNode ? [settings.mihomoNode, "node-b"] : ["node-a", "node-b"];
   mockStatus = {
     ...mockStatus,
     proxyListen: settings.proxyListen,
     upstream: settings.upstream,
     codexHome: settings.codexHome,
     outboundProxy: settings.outboundProxy,
-    upstreamProxy: settings.upstreamProxy,
     outboundMode: settings.outboundMode,
-    warpHttp2: settings.warpHttp2,
     mihomoSubscription: settings.mihomoSubscription,
     mihomoNode: settings.mihomoNode,
     mihomo: settings.outboundMode === "mihomo"
@@ -252,25 +248,30 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
           available: true,
           phase: "connected",
           proxyUrl: "http://127.0.0.1:52190",
-          selected: settings.mihomoNode || "node-a",
-          nodes: settings.mihomoNode ? [settings.mihomoNode] : ["node-a", "node-b"],
+          selected,
+          nodes,
+          groups: [{
+            name: "Kit",
+            groupType: "select",
+            now: selected,
+            all: nodes.map((name) => ({ name, nodeType: "ss", delay: null, udp: true })),
+          }],
           error: null,
         }
-      : { ...mockStatus.mihomo, phase: "stopped", proxyUrl: null, error: null },
+      : { ...mockStatus.mihomo, phase: "stopped", proxyUrl: null, selected: null, groups: [], error: null },
     stateMissPolicy: settings.stateMissPolicy,
     tokenReusePolicy: settings.tokenReusePolicy,
     stateFetchModel: settings.stateFetchModel,
     tokenFetchPaused: settings.tokenFetchPaused ?? false,
     tokenMaxAgeMins: settings.tokenMaxAgeMins ?? 40,
     tokenPrefetchAgeMins: settings.tokenPrefetchAgeMins ?? 35,
-    networkRoutePolicy: settings.networkRoutePolicy,
     forcedModel: settings.forcedModel,
     configuredModels: settings.models,
+    wsUpstreamEnabled: settings.wsUpstreamEnabled !== false,
     proxyOk: true,
   };
   mockConfig.codexHome = settings.codexHome;
   mockConfig.suggestedBaseUrl = `http://${settings.proxyListen}`;
-  if (tokenRouteChanged && settings.outboundMode === "warp") await connectWarp(true);
   return cloneStatus();
 }
 
@@ -291,9 +292,7 @@ export async function refreshTurnState(): Promise<Status> {
   if (isTauri) {
     return invoke<Status>("refresh_turn_state");
   }
-  const ready = mockStatus.outboundMode === "warp"
-    ? mockStatus.warp.phase === "connected"
-    : mockStatus.outboundMode === "mihomo"
+  const ready = mockStatus.outboundMode === "mihomo"
       ? mockStatus.mihomo.phase === "connected"
       : Boolean(mockStatus.outboundProxy);
   mockStatus = {
@@ -343,25 +342,37 @@ export async function probeOutboundLatency(kind: ProbeKind, proxy?: string): Pro
     };
   }
   if (kind === "manual" && !proxy?.trim() && !mockStatus.outboundProxy.trim()) throw new Error("请先填写代理地址");
-  return { target, samples: [{ name: kind, delayMs: kind === "warp" ? 240 : 128, error: null }] };
+  return { target, samples: [{ name: kind, delayMs: 128, error: null }] };
 }
 
-export async function connectWarp(acceptTerms: boolean): Promise<Status> {
-  if (isTauri) return invoke<Status>("connect_warp", { acceptTerms });
-  if (!mockStatus.warp.registered && !acceptTerms) throw new Error("请先同意 Cloudflare 服务条款");
-  mockStatus.warp = { available: true, registered: true, phase: "connected", proxyUrl: "socks5h://127.0.0.1:40000", exitIp: "192.0.2.1", country: null, error: null };
+export async function mihomoSelect(group: string, node: string): Promise<void> {
+  if (isTauri) return invoke<void>("mihomo_select", { group, node });
+  const target = mockStatus.mihomo.groups.find((item) => item.name === group);
+  if (target?.groupType === "select") target.now = node;
+  mockStatus.mihomo.selected = node;
+}
+
+export async function mihomoGroupDelay(group: string): Promise<LatencySample[]> {
+  if (isTauri) return invoke<LatencySample[]>("mihomo_group_delay", { group });
+  await new Promise((resolve) => window.setTimeout(resolve, 300));
+  const target = mockStatus.mihomo.groups.find((item) => item.name === group);
+  const names = target?.all.map((node) => node.name) ?? mockStatus.mihomo.nodes;
+  return names.map((name, index) => {
+    const delayMs = index === names.length - 1 && names.length > 1 ? null : 90 + index * 40;
+    const node = target?.all.find((item) => item.name === name);
+    if (node) node.delay = delayMs;
+    return { name, delayMs, error: delayMs == null ? "超时" : null };
+  });
+}
+
+export async function reconnectWsUpstream(): Promise<Status> {
+  if (isTauri) return invoke<Status>("ws_upstream_reconnect");
+  mockStatus = {
+    ...mockStatus,
+    wsUpstreamConnected: false,
+    wsUpstreamConnectedAt: null,
+  };
   return cloneStatus();
-}
-
-export async function stopWarp(): Promise<Status> {
-  if (isTauri) return invoke<Status>("stop_warp");
-  mockStatus.warp = { ...mockStatus.warp, phase: "stopped", proxyUrl: null, exitIp: null, country: null, error: null };
-  return cloneStatus();
-}
-
-export async function openWarpTerms(): Promise<void> {
-  if (isTauri) return invoke<void>("open_warp_terms");
-  window.open("https://www.cloudflare.com/application/terms/", "_blank", "noopener,noreferrer");
 }
 
 export async function getLoginStatus(home?: string): Promise<LoginStatus> {

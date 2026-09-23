@@ -288,15 +288,16 @@ pub(crate) async fn fetch_turn_state_with_cookies(
 ) -> Result<FetchedTicket> {
     let url = responses_url(&settings.upstream);
     let effective_proxy = outbound_proxy_for_client(&settings.outbound_proxy);
+    let route_kind = match settings.outbound_mode {
+        OutboundMode::Mihomo => logs::ROUTE_EMBEDDED_MIHOMO,
+        OutboundMode::Manual => logs::ROUTE_MANUAL_PROXY,
+    };
     *details = logs::token_network_details(
         &settings.upstream,
         &effective_proxy,
-        settings.outbound_mode == OutboundMode::Warp,
+        route_kind,
         model,
     );
-    if settings.outbound_mode == OutboundMode::Mihomo {
-        details.route_kind = logs::ROUTE_EMBEDDED_MIHOMO.into();
-    }
     let probe = probe_body(model);
     details.account_id = Some(logs::safe_text(&creds.account_id, 128));
     details.account_email = creds
@@ -404,78 +405,6 @@ pub(crate) async fn fetch_turn_state_with_cookies(
         previous_response_id: outcome.previous_response_id,
         routing_cookies,
     })
-}
-
-pub(crate) async fn validate_carried_ticket(
-    client: &reqwest::Client,
-    settings: &Settings,
-    creds: &ChatGptCredentials,
-    model: &str,
-    carried_state: &str,
-    request_cookies: &[RoutingCookie],
-    details: &mut NetworkLogDetails,
-) -> Result<()> {
-    let url = responses_url(&settings.upstream);
-    let effective_proxy = outbound_proxy_for_client(&settings.outbound_proxy);
-    *details = logs::token_network_details(
-        &settings.upstream,
-        &effective_proxy,
-        settings.outbound_mode == OutboundMode::Warp,
-        model,
-    );
-    if settings.outbound_mode == OutboundMode::Mihomo {
-        details.route_kind = logs::ROUTE_EMBEDDED_MIHOMO.into();
-    }
-    let probe = probe_body(model);
-    details.account_id = Some(logs::safe_text(&creds.account_id, 128));
-    details.account_email = creds
-        .email
-        .as_deref()
-        .map(|email| logs::safe_text(email, 254));
-    let (mut request, wire_len) =
-        codex_probe_request(client, &url, creds, &probe, Some(carried_state))?;
-    details.body_bytes = wire_len;
-    let request_started = Instant::now();
-    if let Some(cookie) = chatgpt_cookies::request_header(
-        request_cookies,
-        chatgpt_cookies::is_chatgpt_https_url(&url),
-    ) {
-        request = request.header(http::header::COOKIE, cookie);
-    }
-    let response = request.send().await.with_context(|| {
-        proxy_auth_hint(&settings.outbound_proxy).unwrap_or_else(|| "业务出口复验连不上".into())
-    })?;
-    details.response_header_ms = Some(request_started.elapsed().as_millis());
-    details.response_status = Some(response.status().as_u16());
-    if response.status() != reqwest::StatusCode::OK {
-        details.turn_state_action = "rejected_reverify".into();
-        bail!("业务出口拒绝复验请求 ({})", response.status());
-    }
-    let returned = response
-        .headers()
-        .get(HEADER_NAME)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    if returned
-        .as_deref()
-        .is_some_and(turn_state::is_degraded_token)
-    {
-        details.turn_state_action = "rejected_degraded".into();
-        bail!("业务出口复验返回降级 turn-state");
-    }
-    let outcome = read_probe_outcome(response).await;
-    if !outcome.completed {
-        details.turn_state_action = "rejected_incomplete".into();
-        bail!("业务出口复验响应未完整结束");
-    }
-    if outcome.model.as_deref() != Some(model) {
-        details.turn_state_action = "rejected_model".into();
-        bail!("业务出口复验返回的模型与请求模型不一致");
-    }
-    details.turn_state_action = "reverified".into();
-    Ok(())
 }
 
 fn is_response_id(id: &str) -> bool {
@@ -1232,49 +1161,6 @@ mod tests {
             .unwrap_err();
             assert_eq!(details.turn_state_action, action);
         }
-    }
-
-    #[tokio::test]
-    async fn reverify_keeps_carried_ticket_and_rejects_312() {
-        let carried = token_for_len(turn_state::QUALITY_TOKEN_LEN);
-        let (upstream, _) = serve(StatusCode::OK, Some(carried.clone())).await;
-        let settings = Settings {
-            upstream,
-            ..Settings::default()
-        };
-        let mut details = NetworkLogDetails::default();
-        validate_carried_ticket(
-            &http_client("").unwrap(),
-            &settings,
-            &creds(),
-            "gpt-6-astra",
-            &carried,
-            &[],
-            &mut details,
-        )
-        .await
-        .unwrap();
-        assert_eq!(details.turn_state_action, "reverified");
-
-        let degraded = token_for_len(turn_state::DEGRADED_TOKEN_LEN);
-        let (upstream, _) = serve(StatusCode::OK, Some(degraded)).await;
-        let settings = Settings {
-            upstream,
-            ..Settings::default()
-        };
-        let mut details = NetworkLogDetails::default();
-        validate_carried_ticket(
-            &http_client("").unwrap(),
-            &settings,
-            &creds(),
-            "gpt-6-astra",
-            &carried,
-            &[],
-            &mut details,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(details.turn_state_action, "rejected_degraded");
     }
 
     #[tokio::test]
