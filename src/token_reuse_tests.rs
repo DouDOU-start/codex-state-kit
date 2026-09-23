@@ -171,7 +171,8 @@ async fn one_shared_probe_serves_all_models_until_prefetch() {
                 .await
                 .unwrap();
             let (headers, body) = received.recv().await.unwrap();
-            assert_eq!(headers[turn_state::HEADER_NAME], fresh);
+            // 业务请求不再注入 Kit 管理的 Turn-State，共享票只留在本地。
+            assert!(!headers.contains_key(turn_state::HEADER_NAME));
             assert_eq!(
                 body["model"], model,
                 "sharing must not rewrite the requested model"
