@@ -258,7 +258,10 @@ export interface BillingUsageTotals {
   unknownUsageCount: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheWriteTokens?: number;
   outputTokens: number;
+  /** Already included in outputTokens. */
+  reasoningTokens?: number;
   costNanos: number | null;
 }
 
@@ -298,9 +301,20 @@ export interface BillingRecord {
   responseModel?: string | null;
   inputTokens?: number | null;
   cachedInputTokens?: number | null;
+  cacheWriteTokens?: number | null;
   outputTokens?: number | null;
+  /** Already included in outputTokens. */
+  reasoningTokens?: number | null;
   usageSource?: string | null;
   pricingRuleId?: number | null;
+  /** Catalog key (or manual rule model) the cost was priced with. */
+  pricingModel?: string | null;
+  serviceTier?: ServiceTier | null;
+  longContext?: boolean;
+  inputCostNanos?: number | null;
+  cacheReadCostNanos?: number | null;
+  cacheWriteCostNanos?: number | null;
+  outputCostNanos?: number | null;
   costNanos?: number | null;
   currency?: string | null;
   errorKind?: string | null;
@@ -321,4 +335,37 @@ export interface BillingRecordsPage {
   total: number;
   limit: number;
   offset: number;
+}
+
+export type ServiceTier = "standard" | "priority" | "flex";
+
+/** USD per token. */
+export interface PriceRates {
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+  output: number;
+}
+
+export interface ModelPriceRow {
+  model: string;
+  standard: PriceRates;
+  priority: PriceRates;
+  flex: PriceRates;
+  longContext: { threshold: number; inputMultiplier: number; outputMultiplier: number } | null;
+}
+
+export interface PricingCatalogInfo {
+  source: "bundled" | "cache" | "remote";
+  sha256: string;
+  modelCount: number;
+  remoteUrl: string;
+  lastCheckedAt?: string | null;
+  lastUpdatedAt?: string | null;
+  lastError?: string | null;
+}
+
+export interface PricingView {
+  info: PricingCatalogInfo;
+  models: ModelPriceRow[];
 }

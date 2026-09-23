@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::attach::{self, is_attached};
-use crate::billing::{BillingStore, RequestStart, TokenUsage, UsageOutcome, UsageState};
+use crate::billing::{BillingStore, RequestStart, UsageOutcome, UsageState};
 use crate::chatgpt_cookies::{self, RoutingCookie};
 use crate::diag;
 use crate::fetch;
@@ -395,7 +395,14 @@ impl App {
         let billing = if cfg!(test) {
             BillingStore::open_in_memory()?
         } else {
-            BillingStore::open(billing_path)?
+            let pricing = crate::pricing::PriceBook::load(crate::home_dir().join(
+                if cfg!(debug_assertions) {
+                    ".codex-state-kit-dev-pricing.json"
+                } else {
+                    ".codex-state-kit-pricing.json"
+                },
+            ));
+            BillingStore::open(billing_path, Arc::new(pricing))?
         };
         let mut turn_state = TurnStateStore::load();
         turn_state.set_reuse_policy(settings.token_reuse_policy);
@@ -1473,6 +1480,7 @@ impl App {
             started_at,
             requested_model: Some(model.to_owned()),
             sent_model: Some(model.to_owned()),
+            service_tier: None,
         }) {
             Ok(_) => Some(BillingRequest::new(self.billing.clone(), request_id)),
             Err(error) => {
@@ -1886,6 +1894,39 @@ impl ProxyHandle {
         }
         self.app.sidecar_wake.notify_one();
         Ok(self.managed_status().await)
+    }
+
+    /// Keeps model prices in sync with sub2api's price repo: checks the
+    /// published sha256 every 10 minutes and swaps in a newer catalog.
+    /// Retries after a minute when the outbound line is not ready yet.
+    pub async fn run_pricing_supervisor(&self) {
+        loop {
+            let wait = match self.sync_pricing().await {
+                Ok(_) => crate::pricing::SYNC_INTERVAL,
+                Err(err) => {
+                    eprintln!("[pricing] 同步模型价格失败: {err:#}");
+                    Duration::from_secs(60)
+                }
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// Fetches the price catalog through the configured outbound line.
+    pub async fn sync_pricing(&self) -> Result<crate::pricing::CatalogInfo> {
+        let settings = self.app.settings.lock().await.clone();
+        let (proxy, _) = fetch::resolve_probe_proxy(&resolved_proxy(&settings, &self.app.mihomo));
+        let client = fetch::http_client(&proxy)?;
+        let pricing = self.app.billing.pricing();
+        if pricing.sync(&client).await? {
+            let info = pricing.info();
+            eprintln!(
+                "[pricing] 已更新模型价格：{} 个模型，sha256 {}",
+                info.model_count,
+                &info.sha256[..info.sha256.len().min(12)]
+            );
+        }
+        Ok(pricing.info())
     }
 
     pub async fn run_sidecar_supervisor(&self) {
@@ -2349,16 +2390,13 @@ impl ResponseLogTracker {
             finished_at: Some(chrono::Utc::now().to_rfc3339()),
             http_status: Some(self.entry.status),
             response_model: self.metrics.upstream_response_model().map(str::to_owned),
-            usage: TokenUsage {
-                input_tokens: self.metrics.input_tokens(),
-                cached_input_tokens: self.metrics.cached_input_tokens(),
-                output_tokens: self.metrics.output_tokens(),
-            },
+            usage: self.metrics.token_usage(),
             usage_source: self
                 .metrics
                 .usage_seen()
                 .then(|| "provider_response".into()),
             error_kind: self.entry.error_kind.clone(),
+            service_tier: self.metrics.service_tier().map(str::to_owned),
         });
         self.billing_settled = true;
     }
@@ -2481,11 +2519,8 @@ impl Drop for ResponseLogTracker {
                     state: UsageState::Interrupted,
                     finished_at: Some(chrono::Utc::now().to_rfc3339()),
                     http_status: Some(self.entry.status),
-                    usage: TokenUsage {
-                        input_tokens: self.metrics.input_tokens(),
-                        cached_input_tokens: self.metrics.cached_input_tokens(),
-                        output_tokens: self.metrics.output_tokens(),
-                    },
+                    usage: self.metrics.token_usage(),
+                    service_tier: self.metrics.service_tier().map(str::to_owned),
                     usage_source: self
                         .metrics
                         .usage_seen()
@@ -2874,6 +2909,11 @@ async fn forward_http_tracked(
                 started_at: chrono::Utc::now().to_rfc3339(),
                 requested_model: request_model.clone(),
                 sent_model,
+                service_tier: crate::body_model::extract_str_field(
+                    &bytes,
+                    content_encoding.as_deref(),
+                    "service_tier",
+                ),
             })
             .context("begin durable billing record")?;
         *billing_request = Some(BillingRequest::new(app.billing.clone(), request_id));
@@ -3315,13 +3355,10 @@ async fn finish_client_ws_turn(
             finished_at: Some(chrono::Utc::now().to_rfc3339()),
             http_status: Some(if failed { 502 } else { 200 }),
             response_model: metrics.upstream_response_model().map(str::to_owned),
-            usage: TokenUsage {
-                input_tokens: metrics.input_tokens(),
-                cached_input_tokens: metrics.cached_input_tokens(),
-                output_tokens: metrics.output_tokens(),
-            },
+            usage: metrics.token_usage(),
             usage_source: metrics.usage_seen().then(|| "provider_response".into()),
             error_kind: failed.then(|| "ws_upstream".into()),
+            service_tier: metrics.service_tier().map(str::to_owned),
         });
     }
     let settings = app.settings.lock().await.clone();
@@ -3447,6 +3484,7 @@ mod tests {
                 started_at: chrono::Utc::now().to_rfc3339(),
                 requested_model: Some("gpt-test".into()),
                 sent_model: Some("gpt-test".into()),
+                service_tier: None,
             })
             .unwrap();
         {

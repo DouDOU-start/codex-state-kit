@@ -522,8 +522,11 @@ pub struct ResponseMetrics {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cached_input_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
     usage_seen: bool,
     upstream_response_model: Option<String>,
+    service_tier: Option<String>,
     line: Vec<u8>,
     data: Vec<u8>,
     skip_event: bool,
@@ -739,6 +742,21 @@ impl ResponseMetrics {
         self.upstream_response_model.as_deref()
     }
 
+    /// `service_tier` the provider reports for the response.
+    pub fn service_tier(&self) -> Option<&str> {
+        self.service_tier.as_deref()
+    }
+
+    pub fn token_usage(&self) -> crate::billing::TokenUsage {
+        crate::billing::TokenUsage {
+            input_tokens: self.input_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            output_tokens: self.output_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+        }
+    }
+
     pub fn completed(&self) -> bool {
         self.completed
     }
@@ -814,6 +832,20 @@ impl ResponseMetrics {
                 self.upstream_response_model = Some(model);
             }
         }
+        if self.service_tier.is_none() || terminal {
+            if let Some(tier) = [
+                json.pointer("/response/service_tier"),
+                json.get("service_tier"),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(|tier| safe_text(tier, 24))
+            .find(|tier| !tier.is_empty())
+            {
+                self.service_tier = Some(tier);
+            }
+        }
         if self.is_sse
             && json.get("type").and_then(serde_json::Value::as_str) == Some("response.completed")
         {
@@ -852,6 +884,24 @@ impl ResponseMetrics {
         }
         if let Some(tokens) = find_cached_input_tokens(usage) {
             self.cached_input_tokens = Some(tokens);
+        }
+        if let Some(tokens) = find_detail_tokens(
+            usage,
+            &["input_tokens_details", "prompt_tokens_details"],
+            &[
+                "cache_write_tokens",
+                "cache_creation_tokens",
+                "cache_creation_input_tokens",
+            ],
+        ) {
+            self.cache_write_tokens = Some(tokens);
+        }
+        if let Some(tokens) = find_detail_tokens(
+            usage,
+            &["output_tokens_details", "completion_tokens_details"],
+            &["reasoning_tokens"],
+        ) {
+            self.reasoning_tokens = Some(tokens);
         }
     }
 }
@@ -923,6 +973,15 @@ fn has_visible_output(value: &serde_json::Value) -> bool {
 fn find_usage_tokens(usage: &serde_json::Value, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .find_map(|key| usage.get(*key).and_then(serde_json::Value::as_u64))
+}
+
+/// Reads `usage.<details>.<key>`, falling back to a top-level `usage.<key>`.
+fn find_detail_tokens(usage: &serde_json::Value, details: &[&str], keys: &[&str]) -> Option<u64> {
+    details
+        .iter()
+        .filter_map(|name| usage.get(*name).filter(|value| value.is_object()))
+        .find_map(|details| find_usage_tokens(details, keys))
+        .or_else(|| find_usage_tokens(usage, keys))
 }
 
 fn find_cached_input_tokens(usage: &serde_json::Value) -> Option<u64> {
@@ -1220,6 +1279,27 @@ mod tests {
     }
 
     #[test]
+    fn metrics_read_cache_writes_reasoning_and_service_tier() {
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(
+            br#"data: {"type":"response.created","response":{"model":"gpt-5.1-codex","service_tier":"auto"}}
+
+data: {"type":"response.completed","response":{"service_tier":"priority","usage":{"input_tokens":900,"input_tokens_details":{"cached_tokens":500,"cache_write_tokens":100},"output_tokens":80,"output_tokens_details":{"reasoning_tokens":30}}}}
+
+"#,
+            10,
+            true,
+        );
+        let usage = metrics.token_usage();
+        assert_eq!(usage.input_tokens, Some(900));
+        assert_eq!(usage.cached_input_tokens, Some(500));
+        assert_eq!(usage.cache_write_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(80));
+        assert_eq!(usage.reasoning_tokens, Some(30));
+        assert_eq!(metrics.service_tier(), Some("priority"));
+    }
+
+    #[test]
     fn metrics_recover_from_oversized_events_and_keep_memory_bounded() {
         let mut metrics = ResponseMetrics::default();
         metrics.observe(&vec![b'x'; 512 * 1024], 10, true);
@@ -1252,6 +1332,7 @@ mod tests {
         assert_eq!(responses.input_tokens(), Some(120));
         assert_eq!(responses.output_tokens(), Some(34));
         assert_eq!(responses.cached_input_tokens(), Some(17));
+        assert_eq!(responses.token_usage().cache_write_tokens, None);
 
         let mut chat = ResponseMetrics::default();
         chat.observe(

@@ -17,6 +17,8 @@ import type {
   BillingRecordsPage,
   BillingSummary,
   BillingUsageTotals,
+  ModelPriceRow,
+  PricingView,
 } from "@/types";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
@@ -529,7 +531,7 @@ const mockBillingSummary = (): BillingSummary => {
   previous.measuredRequestCount = 1;
   previous.inputTokens = 1_420;
   previous.outputTokens = 684;
-  previous.costNanos = 1_240_000;
+  previous.costNanos = 96_800_000;
   const current = emptyBillingTotals();
   current.requestCount = 3;
   current.measuredRequestCount = 2;
@@ -537,7 +539,7 @@ const mockBillingSummary = (): BillingSummary => {
   current.inputTokens = 12_480;
   current.cachedInputTokens = 2_048;
   current.outputTokens = 2_316;
-  current.costNanos = 8_460_000;
+  current.costNanos = 17_612_800;
   return {
     generatedAt: new Date().toISOString(),
     from: null,
@@ -583,10 +585,19 @@ const mockBillingRecords: BillingRecord[] = [
     responseModel: "gpt-6-sol",
     inputTokens: 4_608,
     cachedInputTokens: 1_024,
+    cacheWriteTokens: 0,
     outputTokens: 1_024,
+    reasoningTokens: 512,
     usageSource: "provider_response",
-    pricingRuleId: 1,
-    costNanos: 4_220_000,
+    pricingRuleId: null,
+    pricingModel: "gpt-6-sol",
+    serviceTier: "standard",
+    longContext: false,
+    inputCostNanos: 7_168_000,
+    cacheReadCostNanos: 204_800,
+    cacheWriteCostNanos: 0,
+    outputCostNanos: 10_240_000,
+    costNanos: 17_612_800,
     currency: "USD",
   },
   {
@@ -621,10 +632,19 @@ const mockBillingRecords: BillingRecord[] = [
     responseModel: "gpt-6-astra",
     inputTokens: 1_420,
     cachedInputTokens: 0,
+    cacheWriteTokens: 0,
     outputTokens: 684,
+    reasoningTokens: 256,
     usageSource: "provider_response",
-    pricingRuleId: 1,
-    costNanos: 1_240_000,
+    pricingRuleId: null,
+    pricingModel: "gpt-6-astra",
+    serviceTier: "priority",
+    longContext: false,
+    inputCostNanos: 28_400_000,
+    cacheReadCostNanos: 0,
+    cacheWriteCostNanos: 0,
+    outputCostNanos: 68_400_000,
+    costNanos: 96_800_000,
     currency: "USD",
   },
 ];
@@ -681,4 +701,55 @@ export async function getBillingRecords(query: BillingQuery = {}): Promise<Billi
     limit,
     offset,
   };
+}
+
+const perToken = (perMillion: number) => perMillion / 1_000_000;
+
+function mockPrice(model: string, input: number, cacheRead: number, output: number, cacheWrite = input, longContext = false): ModelPriceRow {
+  const standard = { input: perToken(input), cacheRead: perToken(cacheRead), cacheWrite: perToken(cacheWrite), output: perToken(output) };
+  const scale = (factor: number) => ({
+    input: standard.input * factor,
+    cacheRead: standard.cacheRead * factor,
+    cacheWrite: standard.cacheWrite * factor,
+    output: standard.output * factor,
+  });
+  return {
+    model,
+    standard,
+    priority: scale(2),
+    flex: scale(0.5),
+    longContext: longContext ? { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 } : null,
+  };
+}
+
+const mockPricing = (): PricingView => ({
+  info: {
+    source: "bundled",
+    sha256: "b746b9d7c04703f4ddeed8a8ba606d358b60e152398578936e17672d3059722b",
+    modelCount: 6,
+    remoteUrl: "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.json",
+    lastCheckedAt: null,
+    lastUpdatedAt: null,
+    lastError: null,
+  },
+  models: [
+    mockPrice("gpt-5.1-codex", 1.25, 0.125, 10),
+    mockPrice("gpt-5.1-codex-mini", 0.25, 0.025, 2),
+    mockPrice("gpt-5.3-codex", 1.75, 0.175, 14),
+    mockPrice("gpt-5.4", 2.5, 0.25, 15, 2.5, true),
+    mockPrice("gpt-6-astra", 10, 1, 50, 12.5, true),
+    mockPrice("gpt-6-sol", 2, 0.2, 10, 2.5, true),
+  ],
+});
+
+export async function getPricing(): Promise<PricingView> {
+  if (isTauri) return invoke<PricingView>("get_pricing");
+  return mockPricing();
+}
+
+export async function syncPricing(): Promise<PricingView> {
+  if (isTauri) return invoke<PricingView>("sync_pricing");
+  const view = mockPricing();
+  view.info.lastCheckedAt = new Date().toISOString();
+  return view;
 }

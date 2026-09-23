@@ -10,6 +10,7 @@ pub mod latency;
 pub mod login;
 pub mod logs;
 pub mod mihomo;
+pub mod pricing;
 pub mod proxy;
 pub mod settings;
 pub mod traffic;

@@ -74,6 +74,24 @@ pub fn rewrite_model_in_body(
     }
 }
 
+/// 读取请求体顶层的字符串字段（如 `service_tier`），支持 zstd / gzip / deflate。
+pub fn extract_str_field(bytes: &[u8], encoding: Option<&str>, key: &str) -> Option<String> {
+    let plain = match detect_body_compression(bytes, encoding) {
+        None => bytes.to_vec(),
+        Some("zstd") => zstd::decode_all(std::io::Cursor::new(bytes)).ok()?,
+        Some("gzip") => decompress_named(bytes, "gzip")?,
+        Some("deflate") => {
+            decompress_named(bytes, "deflate").or_else(|| decompress_named(bytes, "raw_deflate"))?
+        }
+        Some(_) => return None,
+    };
+    serde_json::from_slice::<Value>(&plain)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// Codex HTTP `/responses` 不接受 `previous_response_id`（只有 WebSocket 链式续跑会用），
 /// 走 HTTP 转发前去掉它，否则上游返回 `Invalid previous_response_id`。
 /// 字段不存在、正文无法解析或无法重新压缩时原样返回。
@@ -200,6 +218,21 @@ fn try_decompress_and_extract(bytes: &[u8], method: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_str_field_reads_plain_and_compressed_bodies() {
+        let plain = br#"{"model":"gpt-5.1-codex","service_tier":"priority"}"#;
+        assert_eq!(
+            extract_str_field(plain, None, "service_tier").as_deref(),
+            Some("priority")
+        );
+        let compressed = zstd::encode_all(plain.as_slice(), 3).unwrap();
+        assert_eq!(
+            extract_str_field(&compressed, Some("zstd"), "service_tier").as_deref(),
+            Some("priority")
+        );
+        assert_eq!(extract_str_field(plain, None, "missing"), None);
+    }
 
     #[test]
     fn strip_previous_response_id_removes_only_that_field() {

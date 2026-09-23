@@ -66,6 +66,20 @@ function matchLog(record: BillingRecord, logs: LogEntry[]): LogEntry | undefined
   });
 }
 
+const TIER_LABEL: Record<string, string> = { priority: "Priority", flex: "Flex" };
+
+/** 非零的分项成本，按 输入 / 缓存读 / 缓存写 / 输出 排列。 */
+function costParts(record: BillingRecord): string[] {
+  return ([
+    ["输入", record.inputCostNanos],
+    ["缓存读", record.cacheReadCostNanos],
+    ["缓存写", record.cacheWriteCostNanos],
+    ["输出", record.outputCostNanos],
+  ] as const)
+    .filter(([, nanos]) => nanos != null && nanos > 0)
+    .map(([label, nanos]) => `${label} ${formatMoney(nanos)}`);
+}
+
 function latencyClass(ms: number | null | undefined): string {
   if (ms == null) return "";
   return ms >= 20_000 ? "usage-latency--slow" : "usage-latency--ok";
@@ -127,8 +141,12 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
         `首字 ${formatDuration(log?.firstTokenMs)}`,
         `总耗时 ${formatDuration(log?.ms ?? durationMs(record))}`,
         `in ${record.inputTokens ?? "—"}`,
+        `cache_read ${record.cachedInputTokens ?? 0}`,
+        `cache_write ${record.cacheWriteTokens ?? 0}`,
         `out ${record.outputTokens ?? "—"}`,
+        `reasoning ${record.reasoningTokens ?? 0}`,
         formatMoney(record.costNanos),
+        costParts(record).join(" "),
       ].join("\t");
     }).join("\n");
     try {
@@ -190,23 +208,37 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
                 const first = log?.firstTokenMs ?? null;
                 const total = log?.ms ?? durationMs(record);
                 const model = record.sentModel || record.requestedModel || "未知模型";
+                const tier = record.serviceTier ? TIER_LABEL[record.serviceTier] : undefined;
+                const parts = costParts(record);
                 return (
                   <tr key={record.requestId}>
                     <td className="usage-table__time">
                       <strong>{clock.time}</strong>
                       <small>{clock.date}</small>
                     </td>
-                    <td className="usage-table__model">{model}</td>
+                    <td className="usage-table__model">
+                      <strong>{model}</strong>
+                      {record.pricingModel && record.pricingModel !== model ? <small>按 {record.pricingModel} 计价</small> : null}
+                      {tier || record.longContext ? (
+                        <span className="usage-table__badges">
+                          {tier ? <span className="usage-badge">{tier}</span> : null}
+                          {record.longContext ? <span className="usage-badge usage-badge--warm">长上下文</span> : null}
+                        </span>
+                      ) : null}
+                    </td>
                     <td><span className="usage-type">{typeLabel(record)}</span></td>
                     <td className="usage-table__latency">
                       <span className={latencyClass(first)}>首字 {formatDuration(first)}</span>
                       <span className={latencyClass(total)}>总耗时 {formatDuration(total)}</span>
                     </td>
                     <td className="usage-table__meter">
-                      <span>↓ {formatTokens(record.inputTokens)}{record.cachedInputTokens ? ` · 缓存 ${formatTokens(record.cachedInputTokens)}` : ""}</span>
-                      <span>↑ {formatTokens(record.outputTokens)}</span>
+                      <span>↓ {formatTokens(record.inputTokens)}{record.cachedInputTokens ? ` · 缓存读 ${formatTokens(record.cachedInputTokens)}` : ""}{record.cacheWriteTokens ? ` · 缓存写 ${formatTokens(record.cacheWriteTokens)}` : ""}</span>
+                      <span>↑ {formatTokens(record.outputTokens)}{record.reasoningTokens ? ` · 推理 ${formatTokens(record.reasoningTokens)}` : ""}</span>
                     </td>
-                    <td className="usage-table__cost">{formatMoney(record.costNanos)}</td>
+                    <td className="usage-table__cost">
+                      <strong>{formatMoney(record.costNanos)}</strong>
+                      {parts.map((part) => <small key={part}>{part}</small>)}
+                    </td>
                     <td className="usage-table__client">本机代理</td>
                   </tr>
                 );

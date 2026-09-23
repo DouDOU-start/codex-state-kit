@@ -77,6 +77,10 @@ impl AppState {
         tasks.push(tauri::async_runtime::spawn(async move {
             proxy.run_sidecar_supervisor().await;
         }));
+        let proxy = self.proxy.clone();
+        tasks.push(tauri::async_runtime::spawn(async move {
+            proxy.run_pricing_supervisor().await;
+        }));
     }
 
     fn stop_supervisors(&self) {

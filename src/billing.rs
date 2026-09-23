@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::pricing::{PriceBook, ServiceTier, Usage as PricingUsage};
+
 const PROVIDER_CHATGPT: &str = "chatgpt";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,7 +50,12 @@ impl UsageState {
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Informational: already included in `output_tokens`.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -69,6 +76,9 @@ pub struct RequestStart {
     pub started_at: String,
     pub requested_model: Option<String>,
     pub sent_model: Option<String>,
+    /// `service_tier` from the request body.
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 fn default_provider() -> String {
@@ -85,6 +95,9 @@ pub struct UsageOutcome {
     pub usage: TokenUsage,
     pub usage_source: Option<String>,
     pub error_kind: Option<String>,
+    /// `service_tier` reported by the response.
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -123,12 +136,50 @@ pub struct UsageRecord {
     pub response_model: Option<String>,
     pub input_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
     pub usage_source: Option<String>,
     pub pricing_rule_id: Option<i64>,
+    /// Catalog key (or manual rule model) the cost was priced with.
+    pub pricing_model: Option<String>,
+    /// Billed service tier: `standard`, `priority` or `flex`.
+    pub service_tier: Option<String>,
+    pub long_context: bool,
+    pub input_cost_nanos: Option<i64>,
+    pub cache_read_cost_nanos: Option<i64>,
+    pub cache_write_cost_nanos: Option<i64>,
+    pub output_cost_nanos: Option<i64>,
     pub cost_nanos: Option<i64>,
     pub currency: Option<String>,
     pub error_kind: Option<String>,
+}
+
+/// Columns read by [`row_to_record`], in order.
+const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos";
+
+/// (state, source, provider, sent_model, started_at, requested_service_tier)
+type PendingRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+#[derive(Default)]
+struct Priced {
+    rule_id: Option<i64>,
+    model: Option<String>,
+    tier: Option<ServiceTier>,
+    long_context: bool,
+    input: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+    output: Option<i64>,
+    total: Option<i64>,
+    currency: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -151,7 +202,9 @@ pub struct UsageTotals {
     pub unknown_usage_count: u64,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    pub cache_write_tokens: u64,
     pub output_tokens: u64,
+    pub reasoning_tokens: u64,
     pub cost_nanos: Option<i64>,
     // Kept out of the wire format.  A summary must remain NULL when any row
     // in that bucket has unknown usage or no matching price rule.
@@ -167,7 +220,9 @@ impl Default for UsageTotals {
             unknown_usage_count: 0,
             input_tokens: 0,
             cached_input_tokens: 0,
+            cache_write_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
             cost_nanos: None,
             cost_complete: true,
         }
@@ -208,10 +263,11 @@ pub struct UsageRecordsPage {
 #[derive(Clone)]
 pub struct BillingStore {
     connection: Arc<Mutex<Connection>>,
+    pricing: Arc<PriceBook>,
 }
 
 impl BillingStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>, pricing: Arc<PriceBook>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -221,6 +277,7 @@ impl BillingStore {
             .with_context(|| format!("open billing database {}", path.display()))?;
         let store = Self {
             connection: Arc::new(Mutex::new(connection)),
+            pricing,
         };
         store.configure()?;
         store.migrate()?;
@@ -231,10 +288,15 @@ impl BillingStore {
     pub fn open_in_memory() -> Result<Self> {
         let store = Self {
             connection: Arc::new(Mutex::new(Connection::open_in_memory()?)),
+            pricing: Arc::new(PriceBook::bundled()),
         };
         store.configure()?;
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn pricing(&self) -> &Arc<PriceBook> {
+        &self.pricing
     }
 
     fn connection(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -279,6 +341,34 @@ impl BillingStore {
         // first MVP (which had the marker table but no row) are upgraded too.
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (1)",
+            [],
+        )?;
+        // Version 2: cache writes, reasoning tokens, service tier and a
+        // per-bucket cost breakdown (sub2api's CostBreakdown).
+        let existing: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('usage_records')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (column, kind) in [
+            ("cache_write_tokens", "INTEGER"),
+            ("reasoning_tokens", "INTEGER"),
+            ("requested_service_tier", "TEXT"),
+            ("service_tier", "TEXT"),
+            ("pricing_model", "TEXT"),
+            ("long_context", "INTEGER NOT NULL DEFAULT 0"),
+            ("input_cost_nanos", "INTEGER"),
+            ("cache_read_cost_nanos", "INTEGER"),
+            ("cache_write_cost_nanos", "INTEGER"),
+            ("output_cost_nanos", "INTEGER"),
+        ] {
+            if !existing.iter().any(|name| name == column) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE usage_records ADD COLUMN {column} {kind}"
+                ))?;
+            }
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)",
             [],
         )?;
         Ok(())
@@ -334,8 +424,8 @@ impl BillingStore {
             )?
         };
         tx.execute(
-            "INSERT OR IGNORE INTO usage_records(request_id, account_id, source, started_at, state, requested_model, sent_model) VALUES (?1,?2,?3,?4,'pending',?5,?6)",
-            params![start.request_id, account_db_id, start.source, start.started_at, start.requested_model, start.sent_model],
+            "INSERT OR IGNORE INTO usage_records(request_id, account_id, source, started_at, state, requested_model, sent_model, requested_service_tier) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7)",
+            params![start.request_id, account_db_id, start.source, start.started_at, start.requested_model, start.sent_model, start.service_tier],
         )?;
         tx.commit()?;
         drop(conn);
@@ -346,10 +436,11 @@ impl BillingStore {
     pub fn settle_request(&self, request_id: &str, outcome: UsageOutcome) -> Result<UsageRecord> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
-        let existing: Option<(String, String, String, Option<String>, String)> = tx
-            .query_row("SELECT u.state, u.source, a.provider, u.sent_model, u.started_at FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE u.request_id=?1", params![request_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        let existing: Option<PendingRow> = tx
+            .query_row("SELECT u.state, u.source, a.provider, u.sent_model, u.started_at, u.requested_service_tier FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE u.request_id=?1", params![request_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
             .optional()?;
-        let Some((old_state, source, provider, sent_model, started_at)) = existing else {
+        let Some((old_state, source, provider, sent_model, started_at, requested_tier)) = existing
+        else {
             anyhow::bail!("unknown billing request id {request_id}");
         };
         if old_state != "pending" {
@@ -365,22 +456,28 @@ impl BillingStore {
         } else {
             outcome.state
         };
-        let (pricing_id, currency, cost) = if measured {
-            let pricing_model = outcome.response_model.as_deref().or(sent_model.as_deref());
+        let priced = if measured {
+            // Like sub2api, bill the model that was sent upstream; the
+            // response's model name is only a fallback.
+            let models = [sent_model.as_deref(), outcome.response_model.as_deref()];
+            let tier =
+                ServiceTier::billed(requested_tier.as_deref(), outcome.service_tier.as_deref());
             self.resolve_cost(
                 &tx,
                 &provider,
                 &source,
-                pricing_model,
+                &models,
                 &started_at,
                 &outcome.usage,
+                tier,
             )?
         } else {
-            (None, None, None)
+            Priced::default()
         };
+        let tokens = |value: Option<u64>| value.map(|v| v as i64);
         tx.execute(
-            "UPDATE usage_records SET finished_at=?2, state=?3, http_status=?4, response_model=?5, input_tokens=?6, cached_input_tokens=?7, output_tokens=?8, usage_source=?9, pricing_rule_id=?10, cost_nanos=?11, currency=?12, error_kind=?13 WHERE request_id=?1",
-            params![request_id, outcome.finished_at, state.as_str(), outcome.http_status.map(i64::from), outcome.response_model, outcome.usage.input_tokens.map(|v| v as i64), outcome.usage.cached_input_tokens.map(|v| v as i64), outcome.usage.output_tokens.map(|v| v as i64), outcome.usage_source, pricing_id, cost, currency, outcome.error_kind],
+            "UPDATE usage_records SET finished_at=?2, state=?3, http_status=?4, response_model=?5, input_tokens=?6, cached_input_tokens=?7, output_tokens=?8, usage_source=?9, pricing_rule_id=?10, cost_nanos=?11, currency=?12, error_kind=?13, cache_write_tokens=?14, reasoning_tokens=?15, pricing_model=?16, service_tier=?17, long_context=?18, input_cost_nanos=?19, cache_read_cost_nanos=?20, cache_write_cost_nanos=?21, output_cost_nanos=?22 WHERE request_id=?1",
+            params![request_id, outcome.finished_at, state.as_str(), outcome.http_status.map(i64::from), outcome.response_model, tokens(outcome.usage.input_tokens), tokens(outcome.usage.cached_input_tokens), tokens(outcome.usage.output_tokens), outcome.usage_source, priced.rule_id, priced.total, priced.currency, outcome.error_kind, tokens(outcome.usage.cache_write_tokens), tokens(outcome.usage.reasoning_tokens), priced.model, priced.tier.map(ServiceTier::as_str), priced.long_context, priced.input, priced.cache_read, priced.cache_write, priced.output],
         )?;
         tx.commit()?;
         drop(conn);
@@ -388,37 +485,84 @@ impl BillingStore {
             .context("settled billing record disappeared")
     }
 
+    /// Manual pricing rules (exact model match) take precedence, like
+    /// sub2api's override file; otherwise the live price catalog is used.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_cost(
         &self,
         tx: &rusqlite::Transaction<'_>,
         provider: &str,
         source: &str,
-        model: Option<&str>,
+        models: &[Option<&str>],
         effective_at: &str,
         usage: &TokenUsage,
-    ) -> Result<(Option<i64>, Option<String>, Option<i64>)> {
+        tier: ServiceTier,
+    ) -> Result<Priced> {
         if source != "business" {
-            return Ok((None, None, None));
+            return Ok(Priced::default());
         }
-        let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
-            return Ok((None, None, None));
+        let models: Vec<&str> = models
+            .iter()
+            .flatten()
+            .map(|m| m.trim())
+            .filter(|m| !m.is_empty())
+            .collect();
+        if models.is_empty() {
+            return Ok(Priced::default());
+        }
+        let usage = PricingUsage {
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            cache_read_tokens: usage.cached_input_tokens.unwrap_or(0),
+            cache_write_tokens: usage.cache_write_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens.unwrap_or(0),
         };
-        let rule: Option<(i64, i64, i64, String, i64)> = tx
-            .query_row("SELECT input_nanos_per_million, cached_input_nanos_per_million, output_nanos_per_million, currency, id FROM pricing_rules WHERE provider=?1 AND model=?2 AND effective_from <= ?3 ORDER BY effective_from DESC, id DESC LIMIT 1", params![provider, model, effective_at], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
-            .optional()?;
-        let Some((input_price, cached_price, output_price, currency, id)) = rule else {
-            return Ok((None, None, None));
+        for model in &models {
+            let rule: Option<(i64, i64, i64, String, i64)> = tx
+                .query_row("SELECT input_nanos_per_million, cached_input_nanos_per_million, output_nanos_per_million, currency, id FROM pricing_rules WHERE provider=?1 AND model=?2 AND effective_from <= ?3 ORDER BY effective_from DESC, id DESC LIMIT 1", params![provider, model, effective_at], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+                .optional()?;
+            if let Some((input_price, cached_price, output_price, currency, id)) = rule {
+                // Manual rules have no cache-write or tier prices: cache
+                // writes are billed as input and the tier is ignored.
+                let cached = usage.cache_read_tokens.min(usage.input_tokens);
+                let uncached = usage.input_tokens - cached;
+                let cost = |tokens: u64, price: i64| -> Result<i64> {
+                    i64::try_from(i128::from(tokens) * i128::from(price) / 1_000_000)
+                        .context("billing cost overflow")
+                };
+                let input = cost(uncached, input_price)?;
+                let cache_read = cost(cached, cached_price)?;
+                let output = cost(usage.output_tokens, output_price)?;
+                return Ok(Priced {
+                    rule_id: Some(id),
+                    model: Some((*model).to_string()),
+                    tier: Some(ServiceTier::Standard),
+                    long_context: false,
+                    input: Some(input),
+                    cache_read: Some(cache_read),
+                    cache_write: Some(0),
+                    output: Some(output),
+                    total: Some(input + cache_read + output),
+                    currency: Some(currency),
+                });
+            }
+        }
+        let catalog = self.pricing.current();
+        let Some(found) = models.iter().find_map(|model| catalog.resolve(model)) else {
+            return Ok(Priced::default());
         };
-        let input = usage.input_tokens.unwrap_or(0);
-        let cached = usage.cached_input_tokens.unwrap_or(0).min(input);
-        let output = usage.output_tokens.unwrap_or(0);
-        let uncached = input - cached;
-        let total = (i128::from(uncached) * i128::from(input_price)
-            + i128::from(cached) * i128::from(cached_price)
-            + i128::from(output) * i128::from(output_price))
-            / 1_000_000;
-        let cost = i64::try_from(total).context("billing cost overflow")?;
-        Ok((Some(id), Some(currency), Some(cost)))
+        let cost = found.price.quote(&usage, tier);
+        Ok(Priced {
+            rule_id: None,
+            model: Some(found.key.to_string()),
+            tier: Some(tier),
+            long_context: cost.long_context,
+            input: Some(cost.input),
+            cache_read: Some(cost.cache_read),
+            cache_write: Some(cost.cache_write),
+            output: Some(cost.output),
+            total: Some(cost.total),
+            currency: Some("USD".into()),
+        })
     }
 
     pub fn mark_missing_usage(
@@ -461,7 +605,7 @@ impl BillingStore {
 
     pub fn get_by_id(&self, request_id: &str) -> Result<Option<UsageRecord>> {
         let conn = self.connection();
-        conn.query_row("SELECT u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE u.request_id=?1", params![request_id], row_to_record).optional().map_err(Into::into)
+        conn.query_row(&format!("SELECT {RECORD_COLUMNS} FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE u.request_id=?1"), params![request_id], row_to_record).optional().map_err(Into::into)
     }
 
     pub fn list_usage(&self, filter: UsageFilter) -> Result<UsageRecordsPage> {
@@ -497,7 +641,7 @@ impl BillingStore {
         let total: u64 = conn
             .query_row(&count_sql, refs.as_slice(), |row| row.get::<_, i64>(0))
             .map(|v| v.max(0) as u64)?;
-        let sql = format!("SELECT u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE {where_sql} ORDER BY u.started_at DESC LIMIT ? OFFSET ?");
+        let sql = format!("SELECT {RECORD_COLUMNS} FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE {where_sql} ORDER BY u.started_at DESC LIMIT ? OFFSET ?");
         let mut args: Vec<Box<dyn ToSql>> = values;
         args.push(Box::new(limit as i64));
         args.push(Box::new(offset as i64));
@@ -547,7 +691,7 @@ impl BillingStore {
         }
         let where_sql = clauses.join(" AND ");
         let refs: Vec<&dyn ToSql> = args.iter().map(|v| v.as_ref() as &dyn ToSql).collect();
-        let mut stmt = conn.prepare(&format!("SELECT a.provider,a.upstream_account_id,a.display_email,MIN(u.started_at),MAX(u.started_at),u.source,u.state,COUNT(*),COALESCE(SUM(u.input_tokens),0),COALESCE(SUM(u.cached_input_tokens),0),COALESCE(SUM(u.output_tokens),0),CASE WHEN COUNT(u.cost_nanos)=COUNT(*) THEN SUM(u.cost_nanos) ELSE NULL END FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE {where_sql} GROUP BY a.id,u.source,u.state ORDER BY a.provider,a.upstream_account_id"))?;
+        let mut stmt = conn.prepare(&format!("SELECT a.provider,a.upstream_account_id,a.display_email,MIN(u.started_at),MAX(u.started_at),u.source,u.state,COUNT(*),COALESCE(SUM(u.input_tokens),0),COALESCE(SUM(u.cached_input_tokens),0),COALESCE(SUM(u.output_tokens),0),CASE WHEN COUNT(u.cost_nanos)=COUNT(*) THEN SUM(u.cost_nanos) ELSE NULL END,COALESCE(SUM(u.cache_write_tokens),0),COALESCE(SUM(u.reasoning_tokens),0) FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE {where_sql} GROUP BY a.id,u.source,u.state ORDER BY a.provider,a.upstream_account_id"))?;
         let mut grouped: std::collections::BTreeMap<(String, String), AccountSummary> =
             std::collections::BTreeMap::new();
         let rows = stmt.query_map(refs.as_slice(), |row| {
@@ -564,6 +708,8 @@ impl BillingStore {
                 row.get::<_, i64>(9)?,
                 row.get::<_, i64>(10)?,
                 row.get::<_, Option<i64>>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
             ))
         })?;
         for row in rows {
@@ -580,6 +726,8 @@ impl BillingStore {
                 cached,
                 output,
                 cost,
+                cache_write,
+                reasoning,
             ) = row?;
             let item = grouped
                 .entry((provider.clone(), account_id.clone()))
@@ -604,8 +752,9 @@ impl BillingStore {
             } else {
                 &mut item.internal
             };
-            add_totals(destination, count, &state, input, cached, output, cost);
-            add_totals(&mut item.total, count, &state, input, cached, output, cost);
+            let tokens = [input, cached, cache_write, output, reasoning];
+            add_totals(destination, count, &state, tokens, cost);
+            add_totals(&mut item.total, count, &state, tokens, cost);
         }
         Ok(BillingSummary {
             generated_at: chrono::Utc::now().to_rfc3339(),
@@ -616,15 +765,15 @@ impl BillingStore {
     }
 }
 
+/// `tokens` = [input, cached input, cache write, output, reasoning].
 fn add_totals(
     target: &mut UsageTotals,
     count: i64,
     state: &str,
-    input: i64,
-    cached: i64,
-    output: i64,
+    tokens: [i64; 5],
     cost: Option<i64>,
 ) {
+    let [input, cached, cache_write, output, reasoning] = tokens.map(|v| v.max(0) as u64);
     target.request_count = target.request_count.saturating_add(count.max(0) as u64);
     if state == "measured" {
         target.measured_request_count = target
@@ -635,11 +784,11 @@ fn add_totals(
             .unknown_usage_count
             .saturating_add(count.max(0) as u64);
     }
-    target.input_tokens = target.input_tokens.saturating_add(input.max(0) as u64);
-    target.cached_input_tokens = target
-        .cached_input_tokens
-        .saturating_add(cached.max(0) as u64);
-    target.output_tokens = target.output_tokens.saturating_add(output.max(0) as u64);
+    target.input_tokens = target.input_tokens.saturating_add(input);
+    target.cached_input_tokens = target.cached_input_tokens.saturating_add(cached);
+    target.cache_write_tokens = target.cache_write_tokens.saturating_add(cache_write);
+    target.output_tokens = target.output_tokens.saturating_add(output);
+    target.reasoning_tokens = target.reasoning_tokens.saturating_add(reasoning);
     if target.cost_complete {
         if let Some(cost) = cost {
             target.cost_nanos = Some(target.cost_nanos.unwrap_or(0).saturating_add(cost));
@@ -680,6 +829,19 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         cost_nanos: row.get(17)?,
         currency: row.get(18)?,
         error_kind: row.get(19)?,
+        cache_write_tokens: row
+            .get::<_, Option<i64>>(20)?
+            .and_then(|v| u64::try_from(v).ok()),
+        reasoning_tokens: row
+            .get::<_, Option<i64>>(21)?
+            .and_then(|v| u64::try_from(v).ok()),
+        pricing_model: row.get(22)?,
+        service_tier: row.get(23)?,
+        long_context: row.get::<_, Option<bool>>(24)?.unwrap_or(false),
+        input_cost_nanos: row.get(25)?,
+        cache_read_cost_nanos: row.get(26)?,
+        cache_write_cost_nanos: row.get(27)?,
+        output_cost_nanos: row.get(28)?,
     })
 }
 
@@ -697,6 +859,7 @@ mod tests {
             started_at: "2026-01-01T00:00:00.000Z".into(),
             requested_model: Some("gpt-test".into()),
             sent_model: Some("gpt-test".into()),
+            service_tier: None,
         }
     }
 
@@ -727,9 +890,10 @@ mod tests {
                         input_tokens: Some(1_000),
                         cached_input_tokens: Some(200),
                         output_tokens: Some(500),
+                        ..TokenUsage::default()
                     },
                     usage_source: Some("provider_response".into()),
-                    error_kind: None,
+                    ..UsageOutcome::default()
                 },
             )
             .unwrap();
@@ -767,7 +931,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("billing.sqlite3");
         {
-            let store = BillingStore::open(&path).unwrap();
+            let store = BillingStore::open(&path, Arc::new(PriceBook::bundled())).unwrap();
             store.begin_request(start("r1", "account-a")).unwrap();
             store
                 .mark_missing_usage(
@@ -778,7 +942,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let reopened = BillingStore::open(&path).unwrap();
+        let reopened = BillingStore::open(&path, Arc::new(PriceBook::bundled())).unwrap();
         let record = reopened.get_by_id("r1").unwrap().unwrap();
         assert_eq!(record.account_id, "account-a");
         assert_eq!(record.state, UsageState::MissingUsage);
@@ -847,5 +1011,74 @@ mod tests {
         assert_eq!(account.total.request_count, 2);
         assert_eq!(account.total.cost_nanos, None);
         assert_eq!(account.business.cost_nanos, None);
+    }
+
+    #[test]
+    fn catalog_prices_each_bucket_and_tier() {
+        let store = BillingStore::open_in_memory().unwrap();
+        let mut request = start("codex", "a");
+        request.sent_model = Some("gpt-5.1-codex-high".into());
+        request.service_tier = Some("priority".into());
+        store.begin_request(request).unwrap();
+        let record = store
+            .settle_request(
+                "codex",
+                UsageOutcome {
+                    state: UsageState::Measured,
+                    response_model: Some("gpt-5.1-codex-2026-01-01".into()),
+                    service_tier: Some("default".into()),
+                    usage: TokenUsage {
+                        input_tokens: Some(10_000),
+                        cached_input_tokens: Some(8_000),
+                        output_tokens: Some(1_000),
+                        reasoning_tokens: Some(400),
+                        ..TokenUsage::default()
+                    },
+                    ..UsageOutcome::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(record.pricing_model.as_deref(), Some("gpt-5.1-codex"));
+        assert_eq!(record.service_tier.as_deref(), Some("priority"));
+        assert_eq!(record.pricing_rule_id, None);
+        // Priority: 2000 x $2.5/M + 8000 x $0.25/M + 1000 x $20/M
+        assert_eq!(record.input_cost_nanos, Some(5_000_000));
+        assert_eq!(record.cache_read_cost_nanos, Some(2_000_000));
+        assert_eq!(record.cache_write_cost_nanos, Some(0));
+        assert_eq!(record.output_cost_nanos, Some(20_000_000));
+        assert_eq!(record.cost_nanos, Some(27_000_000));
+        assert_eq!(record.currency.as_deref(), Some("USD"));
+        assert_eq!(record.reasoning_tokens, Some(400));
+        let totals = &store
+            .account_summaries(UsageFilter::default())
+            .unwrap()
+            .accounts[0]
+            .total;
+        assert_eq!(totals.reasoning_tokens, 400);
+        assert_eq!(totals.cost_nanos, Some(27_000_000));
+    }
+
+    #[test]
+    fn migrates_version_one_databases() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("billing.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);\
+                 INSERT INTO schema_migrations VALUES (1);\
+                 CREATE TABLE accounts (id INTEGER PRIMARY KEY, provider TEXT NOT NULL, upstream_account_id TEXT NOT NULL, display_email TEXT, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, UNIQUE(provider, upstream_account_id));\
+                 CREATE TABLE usage_records (request_id TEXT PRIMARY KEY, account_id INTEGER NOT NULL, source TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, state TEXT NOT NULL, http_status INTEGER, requested_model TEXT, sent_model TEXT, response_model TEXT, input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER, usage_source TEXT, pricing_rule_id INTEGER, cost_nanos INTEGER, currency TEXT, error_kind TEXT);\
+                 INSERT INTO accounts VALUES (1,'chatgpt','old','old@example.com','2026-01-01','2026-01-01');\
+                 INSERT INTO usage_records(request_id,account_id,source,started_at,state,input_tokens,output_tokens) VALUES ('old',1,'business','2026-01-01','measured',5,6);",
+            )
+            .unwrap();
+        }
+        let store = BillingStore::open(&path, Arc::new(PriceBook::bundled())).unwrap();
+        let old = store.get_by_id("old").unwrap().unwrap();
+        assert_eq!(old.input_tokens, Some(5));
+        assert_eq!(old.cache_write_tokens, None);
+        assert!(!old.long_context);
+        store.begin_request(start("new", "old")).unwrap();
     }
 }

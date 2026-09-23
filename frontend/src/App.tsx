@@ -14,10 +14,12 @@ import Waypoints from "lucide-react/dist/esm/icons/waypoints.js";
 import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.js";
 import Settings2 from "lucide-react/dist/esm/icons/settings-2.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
+import BadgeDollarSign from "lucide-react/dist/esm/icons/badge-dollar-sign.js";
 import { AppShell } from "@/components/AppShell";
 import { BillingPanel } from "@/components/BillingPanel";
 import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
 import { UsageRecordsPanel } from "@/components/UsageRecordsPanel";
+import { PricingPanel } from "@/components/PricingPanel";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
 import type { LoginMode, Status, LatencySample, VmIdentityView } from "@/types";
@@ -43,11 +45,12 @@ function degradeChip(status: Status) {
   return { label: "312 降智", className: "runtime-chip runtime-chip--down" };
 }
 
-type TabId = "overview" | "records" | "network" | "account" | "device";
+type TabId = "overview" | "records" | "pricing" | "network" | "account" | "device";
 
 const TABS: { id: TabId; label: string; Icon: typeof Activity }[] = [
   { id: "overview", label: "概览", Icon: LayoutDashboard },
   { id: "records", label: "使用记录", Icon: ScrollText },
+  { id: "pricing", label: "模型价格", Icon: BadgeDollarSign },
   { id: "network", label: "出站网络", Icon: Network },
   { id: "account", label: "Codex 接入", Icon: Terminal },
   { id: "device", label: "虚拟设备", Icon: Monitor },
@@ -303,6 +306,10 @@ export default function App() {
 
         <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-records" aria-labelledby="tab-records" hidden={tab !== "records"}>
           <UsageRecordsPanel active={tab === "records"} status={fwd.status} />
+        </section>
+
+        <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-pricing" aria-labelledby="tab-pricing" hidden={tab !== "pricing"}>
+          <PricingPanel active={tab === "pricing"} />
         </section>
 
         <section className="panel tab-panel" role="tabpanel" id="tabpanel-network" aria-labelledby="tab-network" hidden={tab !== "network"}>

@@ -46,6 +46,8 @@ pub fn run() {
             commands::get_billing_summary,
             commands::get_billing_records,
             commands::set_billing_pricing,
+            commands::get_pricing,
+            commands::sync_pricing,
             commands::set_config,
             commands::refresh_turn_state,
             commands::get_codex_config,

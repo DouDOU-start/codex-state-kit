@@ -1,4 +1,5 @@
 use codex_state_kit::billing::{BillingSummary, PricingRuleSpec, UsageFilter, UsageRecordsPage};
+use codex_state_kit::pricing::{CatalogInfo, ModelPriceRow};
 use codex_state_kit::{
     exchange_refresh_token, import_access_token as persist_access_token, inspect_codex_config,
     login_status, persist_refresh_token_import, poll_device_login, start_device_login,
@@ -193,6 +194,35 @@ pub async fn set_billing_pricing(
     rule: PricingRuleSpec,
 ) -> CommandResult<i64> {
     command(state.core().billing.add_pricing_rule(rule))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingView {
+    pub info: CatalogInfo,
+    pub models: Vec<ModelPriceRow>,
+}
+
+fn pricing_view(state: &AppState) -> PricingView {
+    let core = state.core();
+    let pricing = core.billing.pricing();
+    PricingView {
+        info: pricing.info(),
+        models: pricing.rows(),
+    }
+}
+
+/// The live model price catalog (bundled, cached or synced from remote).
+#[tauri::command(async)]
+pub async fn get_pricing(state: State<'_, AppState>) -> CommandResult<PricingView> {
+    Ok(pricing_view(&state))
+}
+
+/// Checks the remote price catalog now instead of waiting for the next tick.
+#[tauri::command(async)]
+pub async fn sync_pricing(state: State<'_, AppState>) -> CommandResult<PricingView> {
+    command(state.proxy.sync_pricing().await)?;
+    Ok(pricing_view(&state))
 }
 
 #[tauri::command(async)]
