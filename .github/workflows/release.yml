@@ -73,20 +73,20 @@ jobs:
             runner: windows-latest
             rust_target: ""
             target_args: ""
-            warp_platform: windows
-            warp_arch: amd64
+            core_platform: windows
+            core_arch: amd64
           - name: macOS Apple Silicon
             runner: macos-latest
             rust_target: aarch64-apple-darwin
             target_args: --target aarch64-apple-darwin
-            warp_platform: macos
-            warp_arch: arm64
+            core_platform: macos
+            core_arch: arm64
           - name: macOS Intel
             runner: macos-15-intel
             rust_target: x86_64-apple-darwin
             target_args: --target x86_64-apple-darwin
-            warp_platform: macos
-            warp_arch: amd64
+            core_platform: macos
+            core_arch: amd64
 
     steps:
       - name: 拉取代码
@@ -131,23 +131,14 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - name: 准备 WARP 内核（Windows）
-        if: matrix.warp_platform == 'windows'
-        shell: pwsh
-        run: ./tools/prepare-warp.ps1
-
-      - name: 准备 WARP 内核（macOS）
-        if: matrix.warp_platform == 'macos'
-        run: bash ./tools/prepare-warp.sh "${{ matrix.warp_arch }}"
-
       - name: 准备 Mihomo 内核（Windows）
-        if: matrix.warp_platform == 'windows'
+        if: matrix.core_platform == 'windows'
         shell: pwsh
         run: ./tools/prepare-mihomo.ps1
 
       - name: 准备 Mihomo 内核（macOS）
-        if: matrix.warp_platform == 'macos'
-        run: bash ./tools/prepare-mihomo.sh "${{ matrix.warp_arch }}"
+        if: matrix.core_platform == 'macos'
+        run: bash ./tools/prepare-mihomo.sh "${{ matrix.core_arch }}"
 
       - name: 安装前端依赖
         run: corepack pnpm install --frozen-lockfile

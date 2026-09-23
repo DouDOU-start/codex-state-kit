@@ -13,16 +13,18 @@ import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
 import BadgeDollarSign from "lucide-react/dist/esm/icons/badge-dollar-sign.js";
 import { AppShell } from "@/components/AppShell";
 import { BillingPanel } from "@/components/BillingPanel";
+import { REFRESH_OPTIONS } from "@/components/RefreshControl";
 import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
 import { downgradeLabel, UsageRecordsPanel } from "@/components/UsageRecordsPanel";
 import { PricingPanel } from "@/components/PricingPanel";
 import { AccountsPanel, accountName } from "@/components/AccountsPanel";
 import { AddAccountDialog } from "@/components/AddAccountDialog";
 import { Select } from "@/components/Select";
+import { LatencyProbe } from "@/components/LatencyProbe";
 import { useNotice, useNotify } from "@/components/Notifier";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { Status, LatencySample, VmIdentityView } from "@/types";
+import type { Status, VmIdentityView } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -32,12 +34,6 @@ function chipLabel(status: Status) {
 function chipClass(status: Status) {
   if (status.attached) return "runtime-chip runtime-chip--accent";
   return status.proxyOk ? "runtime-chip" : "runtime-chip runtime-chip--down";
-}
-
-function delayText(sample?: LatencySample | null): string | null {
-  if (!sample) return null;
-  if (sample.delayMs != null) return `${sample.delayMs} ms`;
-  return sample.error || "超时";
 }
 
 type TabId = "overview" | "records" | "pricing" | "network" | "account" | "device";
@@ -52,6 +48,18 @@ const TABS: { id: TabId; label: string; Icon: typeof Activity }[] = [
 ];
 
 const TAB_STORAGE_KEY = "codex-state-kit.tab";
+const REFRESH_STORAGE_KEY = "codex-state-kit.refresh-ms";
+
+/** Auto-refresh interval for the overview and usage records; 1 s by default. */
+function savedRefreshMs(): number {
+  try {
+    const saved = window.localStorage.getItem(REFRESH_STORAGE_KEY);
+    if (saved !== null && REFRESH_OPTIONS.some((option) => option.value === saved)) return Number(saved);
+  } catch {
+    // storage unavailable
+  }
+  return 1000;
+}
 
 function initialTab(): TabId {
   try {
@@ -78,6 +86,15 @@ export default function App() {
   const [vmTerminal, setVmTerminal] = useState("xterm-256color");
   const [addAccountOpen, setAddAccountOpen] = useState(false);
   const [tab, setTab] = useState<TabId>(initialTab);
+  const [refreshMs, setRefreshMs] = useState(savedRefreshMs);
+  const changeRefreshMs = (intervalMs: number) => {
+    setRefreshMs(intervalMs);
+    try {
+      window.localStorage.setItem(REFRESH_STORAGE_KEY, String(intervalMs));
+    } catch {
+      // storage unavailable
+    }
+  };
   const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
   const hydrated = useRef(false);
   const { notify, confirm } = useNotify();
@@ -302,12 +319,15 @@ export default function App() {
         <BillingPanel
           currentAccountId={fwd.status.currentAccountId}
           currentAccountEmail={fwd.status.currentAccountEmail}
+          active={tab === "overview"}
+          refreshMs={refreshMs}
+          onRefreshMsChange={changeRefreshMs}
         />
         </div>
 
 
         <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-records" aria-labelledby="tab-records" hidden={tab !== "records"}>
-          <UsageRecordsPanel active={tab === "records"} status={fwd.status} />
+          <UsageRecordsPanel active={tab === "records"} status={fwd.status} refreshMs={refreshMs} onRefreshMsChange={changeRefreshMs} />
         </section>
 
         <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-pricing" aria-labelledby="tab-pricing" hidden={tab !== "pricing"}>
@@ -323,36 +343,32 @@ export default function App() {
             <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "manual")}><Network size={14} />手动代理</button>
             <button type="button" aria-pressed={fwd.status.outboundMode === "mihomo"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveMihomo(mihomoSubscription, mihomoNode)}><Waypoints size={14} />订阅节点</button>
           </div>
-          <div className="ws-line">
-            <label>
-              <input
-                type="checkbox"
-                checked={fwd.status.wsUpstreamEnabled !== false}
-                disabled={fwd.busy !== null}
-                onChange={(event) => void fwd.setWsUpstreamEnabled(event.target.checked)}
-              />
-              上游走 WebSocket
-            </label>
-            <span>{fwd.status.wsUpstreamConnected ? `已连接${fwd.status.wsUpstreamConnectedAt ? ` · ${fwd.status.wsUpstreamConnectedAt}` : ""}` : "未连接"}</span>
-            <button type="button" className="text-button" disabled={fwd.busy !== null} onClick={() => void fwd.reconnectUpstream()}>重连</button>
-          </div>
           {fwd.status.outboundMode === "manual" ? <>
-          <label className="field">
-            <span>代理 URL</span>
-            <input
-              type="text"
-              spellCheck={false}
-              autoComplete="off"
-              disabled={fwd.busy !== null}
-              value={outboundProxy}
-              placeholder="socks5://user-region-DE-sid-{session}-t-120:pass@host:3010"
-              onChange={(event) => setOutboundProxy(event.target.value)}
-              onBlur={() => void fwd.saveSettings(codexHome, outboundProxy)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") void fwd.saveSettings(codexHome, outboundProxy);
-              }}
-            />
-          </label>
+          <div className="field">
+            <span id="outbound-proxy-label">代理 URL</span>
+            <div className="field-row">
+              <input
+                type="text"
+                aria-labelledby="outbound-proxy-label"
+                spellCheck={false}
+                autoComplete="off"
+                disabled={fwd.busy !== null}
+                value={outboundProxy}
+                placeholder="socks5://user-region-DE-sid-{session}-t-120:pass@host:3010"
+                onChange={(event) => setOutboundProxy(event.target.value)}
+                onBlur={() => void fwd.saveSettings(codexHome, outboundProxy)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void fwd.saveSettings(codexHome, outboundProxy);
+                }}
+              />
+              <LatencyProbe
+                probing={fwd.probing === "manual"}
+                disabled={fwd.probing !== null || !outboundProxy.trim()}
+                sample={fwd.latency.manual?.samples[0]}
+                onProbe={() => void fwd.probeLatency("manual", outboundProxy)}
+              />
+            </div>
+          </div>
           <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。可把出口写成 {'{session}'}，Kit 自动生成会话出口；同一条上游连接沿用同一个 session。</p>
           <div className="system-proxy">
             <label className="system-proxy__toggle">
@@ -372,12 +388,6 @@ export default function App() {
                   : "未检测到系统代理，直连代理服务器"}
             </span>
             <p>适用于 Clash Verge 等只开了系统代理、没开 TUN 的情况：代理服务器需要翻墙才能连上时，Kit 会先经系统代理再连到它。开关 Clash 的系统代理后自动跟随，无需重启。</p>
-          </div>
-          <div className="latency-row">
-            <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null} onClick={() => void fwd.probeLatency("manual", outboundProxy)}>
-              {fwd.probing === "manual" ? "测试中" : "测延迟"}
-            </button>
-            {delayText(fwd.latency.manual?.samples[0]) ? <span className={fwd.latency.manual?.samples[0]?.delayMs != null ? "latency-row__ok" : "latency-row__bad"}>{delayText(fwd.latency.manual?.samples[0])}</span> : null}
           </div>
           </> : (
           <div className="mihomo-panel">
@@ -410,6 +420,7 @@ export default function App() {
               <>
                 <div className="field">
                   <span>当前节点</span>
+                  <div className="field-row">
                   <Select
                     ariaLabel="当前节点"
                     placeholder="连接后列出节点"
@@ -428,16 +439,13 @@ export default function App() {
                       void fwd.saveMihomo(mihomoSubscription, node);
                     }}
                   />
-                </div>
-                <div className="latency-row">
-                  <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null || (isTauri && fwd.status.mihomo?.phase !== "connected")} onClick={() => void fwd.probeLatency("mihomo")}>
-                    {fwd.probing === "mihomo" ? "测试中" : "测延迟"}
-                  </button>
-                  {delayText(selectedNodeDelay) ? (
-                    <span className={selectedNodeDelay?.delayMs != null ? "latency-row__ok" : "latency-row__bad"}>
-                      {delayText(selectedNodeDelay)}
-                    </span>
-                  ) : null}
+                  <LatencyProbe
+                    probing={fwd.probing === "mihomo"}
+                    disabled={fwd.probing !== null || (isTauri && fwd.status.mihomo?.phase !== "connected")}
+                    sample={selectedNodeDelay}
+                    onProbe={() => void fwd.probeLatency("mihomo")}
+                  />
+                  </div>
                 </div>
               </>
             )}

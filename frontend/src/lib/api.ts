@@ -68,9 +68,6 @@ const defaultStatus = (): Status => ({
     userAgent: "codex_cli_rs/0.155.0 (Mac OS 15.5.0; arm64) xterm-256color",
     versionLocked: false,
   },
-  wsUpstreamEnabled: true,
-  wsUpstreamConnected: false,
-  wsUpstreamConnectedAt: null,
   chainSystemProxy: true,
   systemProxy: { enabled: true, detected: "HTTP 127.0.0.1:7897", lastError: null },
   lastDowngrade: {
@@ -203,7 +200,6 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
         }
       : { ...mockStatus.mihomo, phase: "stopped", proxyUrl: null, selected: null, groups: [], error: null },
     forcedModel: settings.forcedModel,
-    wsUpstreamEnabled: settings.wsUpstreamEnabled !== false,
     chainSystemProxy: settings.chainSystemProxy !== false,
     systemProxy: { ...(mockStatus.systemProxy ?? { detected: null, lastError: null }), enabled: settings.chainSystemProxy !== false },
     proxyOk: true,
@@ -307,16 +303,6 @@ export async function detectVmCliVersion(): Promise<Status> {
       userAgent: mockUserAgent(profile),
       versionLocked: false,
     },
-  };
-  return cloneStatus();
-}
-
-export async function reconnectWsUpstream(): Promise<Status> {
-  if (isTauri) return invoke<Status>("ws_upstream_reconnect");
-  mockStatus = {
-    ...mockStatus,
-    wsUpstreamConnected: false,
-    wsUpstreamConnectedAt: null,
   };
   return cloneStatus();
 }
@@ -637,6 +623,12 @@ export async function getBillingSummary(period: Pick<BillingQuery, "from" | "to"
     });
   }
   return cloneBillingSummary(mockBillingSummary());
+}
+
+/** Changes whenever usage records are written; poll it to know when to reload. */
+export async function getBillingRevision(): Promise<number> {
+  if (isTauri) return invoke<number>("get_billing_revision");
+  return 0;
 }
 
 export async function getBillingRecords(query: BillingQuery = {}): Promise<BillingRecordsPage> {

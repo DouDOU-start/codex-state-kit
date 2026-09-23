@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::downgrade::{DowngradeReport, DowngradeSignals, Verdict};
@@ -283,6 +284,9 @@ pub struct BillingStore {
     pricing: Arc<PriceBook>,
     /// Latest downgraded request settled since Kit started.
     last_downgrade: Arc<Mutex<Option<DowngradeEvent>>>,
+    /// Bumped on every write, so the UI can poll cheaply and reload only
+    /// when something changed.
+    revision: Arc<AtomicU64>,
 }
 
 /// A downgraded request, surfaced to the UI as a notice.
@@ -309,6 +313,7 @@ impl BillingStore {
             connection: Arc::new(Mutex::new(connection)),
             pricing,
             last_downgrade: Arc::new(Mutex::new(None)),
+            revision: Arc::default(),
         };
         store.configure()?;
         store.migrate()?;
@@ -321,6 +326,7 @@ impl BillingStore {
             connection: Arc::new(Mutex::new(Connection::open_in_memory()?)),
             pricing: Arc::new(PriceBook::bundled()),
             last_downgrade: Arc::new(Mutex::new(None)),
+            revision: Arc::default(),
         };
         store.configure()?;
         store.migrate()?;
@@ -329,6 +335,15 @@ impl BillingStore {
 
     pub fn pricing(&self) -> &Arc<PriceBook> {
         &self.pricing
+    }
+
+    /// Changes whenever a record or price rule is written.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
+    }
+
+    fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn last_downgrade(&self) -> Option<DowngradeEvent> {
@@ -473,6 +488,7 @@ impl BillingStore {
         )?;
         tx.commit()?;
         drop(conn);
+        self.bump_revision();
         self.get_by_id(&start.request_id)?
             .context("billing insert did not produce a record")
     }
@@ -533,6 +549,7 @@ impl BillingStore {
         )?;
         tx.commit()?;
         drop(conn);
+        self.bump_revision();
         let record = self
             .get_by_id(request_id)?
             .context("settled billing record disappeared")?;
@@ -744,6 +761,7 @@ impl BillingStore {
             .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
         let conn = self.connection();
         conn.execute("INSERT INTO pricing_rules(provider,model,input_nanos_per_million,cached_input_nanos_per_million,output_nanos_per_million,currency,effective_from) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(provider,model,effective_from) DO UPDATE SET input_nanos_per_million=excluded.input_nanos_per_million,cached_input_nanos_per_million=excluded.cached_input_nanos_per_million,output_nanos_per_million=excluded.output_nanos_per_million,currency=excluded.currency", params![spec.provider, spec.model, spec.input_nanos_per_million, spec.cached_input_nanos_per_million, spec.output_nanos_per_million, spec.currency, effective])?;
+        self.bump_revision();
         Ok(conn.query_row(
             "SELECT id FROM pricing_rules WHERE provider=?1 AND model=?2 AND effective_from=?3",
             params![spec.provider, spec.model, effective],
@@ -1092,6 +1110,27 @@ mod tests {
         assert_eq!(account.total.request_count, 2);
         assert_eq!(account.total.cost_nanos, None);
         assert_eq!(account.business.cost_nanos, None);
+    }
+
+    #[test]
+    fn revision_changes_on_every_write() {
+        let store = BillingStore::open_in_memory().unwrap();
+        let initial = store.revision();
+        store.begin_request(start("rev", "a")).unwrap();
+        let begun = store.revision();
+        assert!(begun > initial);
+        store.list_usage(UsageFilter::default()).unwrap();
+        assert_eq!(store.revision(), begun, "reads leave it alone");
+        store
+            .settle_request(
+                "rev",
+                UsageOutcome {
+                    state: UsageState::MissingUsage,
+                    ..UsageOutcome::default()
+                },
+            )
+            .unwrap();
+        assert!(store.revision() > begun);
     }
 
     #[test]

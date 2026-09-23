@@ -1,11 +1,19 @@
-//! 到 Codex 上游的单条 WebSocket 连接。
+//! 到 Codex 上游的 WebSocket 连接池。
 //!
-//! 一条连接一次只能跑一轮。`open_turn` 持有连接锁直到收到结束事件，HTTP 桥和客户端
-//! WebSocket 共用它。连接超过 55 分钟、认证或代理变化时会在下一轮重建。
+//! 与官方客户端一样，一条连接一次只跑一轮：并发请求各用一条连接，最多
+//! `MAX_CONNECTIONS` 条。带 `previous_response_id` 的续跑回到产生该响应的连接，
+//! 上游只在同一条连接上认得它。
+//!
+//! 后台反复调用 [`WsUpstreamPool::maintain`]：预先握手一条空闲连接待用，定期
+//! ping 保活，快到期前换新，账号或线路变化后立即重新预热，多出来的空闲连接
+//! 闲置一段时间后关闭。空闲时被对端断开的连接，在下一轮发送前后自动重连重发。
+//! 握手失败后退避一段时间，期间 HTTP 请求直接走 SSE，不再逐个尝试 WebSocket。
 //!
 //! tungstenite 0.26 的 `WebSocketConfig` 没有 permessage-deflate，这里用默认配置。
 
+use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -15,7 +23,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
+use tokio::sync::{mpsc, Mutex, Notify, OwnedMutexGuard};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tokio_tungstenite::WebSocketStream;
 use url::Url;
@@ -23,14 +31,19 @@ use url::Url;
 use crate::outbound;
 use crate::ws_bridge;
 
+/// 上游约一小时断开一条连接，留出余量。
 const MAX_AGE: Duration = Duration::from_secs(55 * 60);
+/// 空闲连接用到这个岁数就提前换新，避免请求撞上到期。
+const REFRESH_AGE: Duration = Duration::from_secs(50 * 60);
+const MAX_CONNECTIONS: usize = 8;
+/// 预热那一条之外的空闲连接，闲置这么久后关闭。
+const SPARE_IDLE: Duration = Duration::from_secs(10 * 60);
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKOFF_START: Duration = Duration::from_secs(5);
+const BACKOFF_MAX: Duration = Duration::from_secs(120);
+/// 每条连接记住它产生的最近这么多个响应 ID，用来把续跑送回原连接。
+const REMEMBERED_RESPONSES: usize = 256;
 const OPENAI_BETA: &str = "responses_websockets=2026-02-06";
-
-#[derive(Clone, Debug)]
-pub struct WsSnapshot {
-    pub connected: bool,
-    pub connected_at: Option<String>,
-}
 
 #[derive(Clone)]
 pub struct WsDial {
@@ -52,20 +65,65 @@ impl WsDial {
 
 #[derive(Clone, Default)]
 pub struct WsUpstreamPool {
-    inner: Arc<Mutex<Inner>>,
+    shared: Arc<Shared>,
 }
 
 #[derive(Default)]
-struct Inner {
-    live: Option<Live>,
-    connected_at: Option<String>,
-    sticky_session: Option<String>,
+struct Shared {
+    slots: std::sync::Mutex<Vec<Arc<Slot>>>,
+    sticky_session: std::sync::Mutex<Option<String>>,
+    backoff: std::sync::Mutex<Backoff>,
+    /// Bumped by `invalidate`; connections from an older generation are
+    /// replaced before their next turn.
+    generation: AtomicU64,
+    changed: Notify,
+    /// Model of the latest turn, so a warm-up handshake carries the same
+    /// routing hint as real requests.
+    last_model: std::sync::Mutex<String>,
 }
+
+#[derive(Default)]
+struct Backoff {
+    until: Option<Instant>,
+    delay: Duration,
+}
+
+#[derive(Default)]
+struct Slot {
+    conn: Arc<Mutex<Option<Live>>>,
+    /// Response ids produced on the current connection, newest last.
+    responses: std::sync::Mutex<VecDeque<String>>,
+}
+
+impl Slot {
+    fn owns(&self, response_id: &str) -> bool {
+        lock(&self.responses).iter().any(|id| id == response_id)
+    }
+
+    fn remember(&self, response_id: &str) {
+        let mut responses = lock(&self.responses);
+        if responses.back().is_some_and(|last| last == response_id) {
+            return;
+        }
+        responses.push_back(response_id.to_string());
+        while responses.len() > REMEMBERED_RESPONSES {
+            responses.pop_front();
+        }
+    }
+
+    fn forget(&self) {
+        lock(&self.responses).clear();
+    }
+}
+
+type ConnGuard = OwnedMutexGuard<Option<Live>>;
 
 struct Live {
     ws: WebSocketStream<BoxIo>,
     connected_at: Instant,
+    idle_since: Instant,
     key: String,
+    generation: u64,
     /// Handshake response headers (`openai-model`, safety buffering, …).
     headers: http::HeaderMap,
 }
@@ -75,31 +133,64 @@ enum Read {
     Fail(String),
 }
 
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl WsUpstreamPool {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub async fn snapshot(&self) -> WsSnapshot {
-        let guard = self.inner.lock().await;
-        let connected = guard
-            .live
-            .as_ref()
-            .is_some_and(|live| live.connected_at.elapsed() < MAX_AGE);
-        WsSnapshot {
-            connected,
-            connected_at: connected.then(|| guard.connected_at.clone()).flatten(),
-        }
-    }
-
+    /// Drops every connection (in-flight turns finish first) and re-warms:
+    /// called when the account, device or outbound line changes.
     pub async fn invalidate(&self) {
-        let mut guard = self.inner.lock().await;
-        guard.live = None;
-        guard.connected_at = None;
-        guard.sticky_session = None;
+        self.shared.generation.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.shared.sticky_session) = None;
+        *lock(&self.shared.backoff) = Backoff::default();
+        let slots = lock(&self.shared.slots).clone();
+        for slot in slots {
+            if let Ok(mut conn) = slot.conn.clone().try_lock_owned() {
+                *conn = None;
+            }
+            slot.forget();
+        }
+        self.shared.changed.notify_one();
     }
 
-    /// `{session}` 在一条连接的存活期内保持不变。调用方已解析好的地址原样返回。
+    pub fn last_model(&self) -> String {
+        lock(&self.shared.last_model).clone()
+    }
+
+    /// Resolves when `invalidate` asked for a re-warm.
+    pub async fn changed(&self) {
+        self.shared.changed.notified().await;
+    }
+
+    /// False while backing off after a failed handshake: HTTP requests then
+    /// go straight to SSE.
+    pub fn available(&self) -> bool {
+        lock(&self.shared.backoff)
+            .until
+            .is_none_or(|until| Instant::now() >= until)
+    }
+
+    /// Number of open connections, for tests and diagnostics.
+    pub fn open_connections(&self) -> usize {
+        lock(&self.shared.slots)
+            .iter()
+            .filter(|slot| {
+                slot.conn
+                    .clone()
+                    .try_lock_owned()
+                    .map_or(true, |conn| conn.is_some())
+            })
+            .count()
+    }
+
+    /// `{session}` 在连接池的生命周期内保持不变。调用方已解析好的地址原样返回。
     pub async fn resolve_proxy(&self, template: &str, bound: Option<&str>) -> Result<String> {
         let template = template.trim();
         if !outbound::has_session_placeholder(template) {
@@ -110,11 +201,9 @@ impl WsUpstreamPool {
                 &outbound::apply_bound_session(template, Some(session))?,
             ));
         }
-        let mut guard = self.inner.lock().await;
-        if guard.sticky_session.is_none() {
-            guard.sticky_session = Some(outbound::generate_proxy_session());
-        }
-        let session = guard.sticky_session.clone().context("缺少代理 session")?;
+        let session = lock(&self.shared.sticky_session)
+            .get_or_insert_with(outbound::generate_proxy_session)
+            .clone();
         Ok(outbound::dial_proxy_for_client(
             &outbound::replace_session_placeholder(template, &session),
         ))
@@ -127,24 +216,279 @@ impl WsUpstreamPool {
         dial: WsDial,
         payload: Value,
     ) -> Result<(mpsc::Receiver<Result<String, String>>, http::HeaderMap)> {
-        let mut guard = self.inner.clone().lock_owned().await;
-        ensure(&mut guard, &dial).await?;
-        let headers = guard
-            .live
+        if let Some(model) = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            *lock(&self.shared.last_model) = model.to_string();
+        }
+        let (slot, mut conn) = self.pick_slot(&payload).await;
+        let had_connection = conn.is_some();
+        self.ensure(&mut conn, &slot, &dial).await?;
+        if send_frame(&mut conn, &payload).await.is_err() {
+            // An idle connection the upstream already closed: redial once.
+            *conn = None;
+            slot.forget();
+            if !had_connection {
+                anyhow::bail!("发送上游 WebSocket 帧失败");
+            }
+            self.ensure(&mut conn, &slot, &dial).await?;
+            send_frame(&mut conn, &payload).await.inspect_err(|_| {
+                *conn = None;
+            })?;
+        }
+        let headers = conn
             .as_ref()
             .map(|live| live.headers.clone())
             .unwrap_or_default();
-        if let Err(err) = send_frame(&mut guard, &payload).await {
-            guard.live = None;
-            guard.connected_at = None;
-            return Err(err);
-        }
         let (tx, rx) = mpsc::channel(32);
+        let pool = self.clone();
         tokio::spawn(async move {
-            drive(guard, dial, payload, tx).await;
+            pool.drive(slot, conn, dial, payload, tx).await;
         });
         Ok((rx, headers))
     }
+
+    /// Keeps one idle connection for `dial` warm and healthy; call it
+    /// periodically. Busy connections are left alone.
+    pub async fn maintain(&self, dial: &WsDial) {
+        if !self.available() {
+            return;
+        }
+        let key = dial.key();
+        let generation = self.generation();
+        let slots = lock(&self.shared.slots).clone();
+        let mut warm = false;
+        for slot in &slots {
+            let Ok(mut conn) = slot.conn.clone().try_lock_owned() else {
+                continue;
+            };
+            let Some(live) = conn.as_mut() else {
+                continue;
+            };
+            let outdated = live.key != key
+                || live.generation != generation
+                || live.connected_at.elapsed() >= REFRESH_AGE;
+            let spare = warm && live.idle_since.elapsed() >= SPARE_IDLE;
+            if outdated || spare || ping(live).await.is_err() {
+                close(&mut conn).await;
+                slot.forget();
+                continue;
+            }
+            warm = true;
+        }
+        if warm {
+            return;
+        }
+        let Some((slot, mut conn)) = self.idle_slot() else {
+            return;
+        };
+        if let Err(err) = self.ensure(&mut conn, &slot, dial).await {
+            eprintln!("[ws] 预热上游 WebSocket 失败: {err:#}");
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::SeqCst)
+    }
+
+    /// An idle slot without a connection, adding one when there is room.
+    fn idle_slot(&self) -> Option<(Arc<Slot>, ConnGuard)> {
+        let mut slots = lock(&self.shared.slots);
+        for slot in slots.iter() {
+            if let Ok(conn) = slot.conn.clone().try_lock_owned() {
+                if conn.is_none() {
+                    return Some((slot.clone(), conn));
+                }
+            }
+        }
+        if slots.len() >= MAX_CONNECTIONS {
+            return None;
+        }
+        let slot = Arc::new(Slot::default());
+        slots.push(slot.clone());
+        let conn = slot.conn.clone().try_lock_owned().ok()?;
+        Some((slot, conn))
+    }
+
+    /// The connection for a turn: the one that produced its
+    /// `previous_response_id`, else an idle one (open connections first), else
+    /// a new one, else whichever frees up first.
+    async fn pick_slot(&self, payload: &Value) -> (Arc<Slot>, ConnGuard) {
+        let previous = payload
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let slots = lock(&self.shared.slots).clone();
+        if let Some(owner) = previous.and_then(|id| slots.iter().find(|slot| slot.owns(id))) {
+            let conn = owner.conn.clone().lock_owned().await;
+            return (owner.clone(), conn);
+        }
+        let mut empty = None;
+        for slot in &slots {
+            if let Ok(conn) = slot.conn.clone().try_lock_owned() {
+                if conn.is_some() {
+                    return (slot.clone(), conn);
+                }
+                if empty.is_none() {
+                    empty = Some((slot.clone(), conn));
+                }
+            }
+        }
+        if let Some(found) = empty {
+            return found;
+        }
+        if let Some(found) = self.idle_slot() {
+            return found;
+        }
+        let waiting = slots
+            .iter()
+            .map(|slot| Box::pin(slot.conn.clone().lock_owned()));
+        let (conn, index, _) = futures_util::future::select_all(waiting).await;
+        (slots[index].clone(), conn)
+    }
+
+    async fn ensure(&self, conn: &mut ConnGuard, slot: &Slot, dial: &WsDial) -> Result<()> {
+        let key = dial.key();
+        let generation = self.generation();
+        let fresh = conn.as_ref().is_some_and(|live| {
+            live.key == key
+                && live.generation == generation
+                && connection_fresh(live.connected_at.elapsed())
+        });
+        if fresh {
+            return Ok(());
+        }
+        close(conn).await;
+        slot.forget();
+        match connect_upstream(dial).await {
+            Ok((ws, headers)) => {
+                *lock(&self.shared.backoff) = Backoff::default();
+                let now = Instant::now();
+                **conn = Some(Live {
+                    ws,
+                    connected_at: now,
+                    idle_since: now,
+                    key,
+                    generation,
+                    headers,
+                });
+                Ok(())
+            }
+            Err(err) => {
+                let mut backoff = lock(&self.shared.backoff);
+                backoff.delay = if backoff.delay.is_zero() {
+                    BACKOFF_START
+                } else {
+                    (backoff.delay * 2).min(BACKOFF_MAX)
+                };
+                backoff.until = Some(Instant::now() + backoff.delay);
+                Err(err)
+            }
+        }
+    }
+
+    async fn drive(
+        &self,
+        slot: Arc<Slot>,
+        mut conn: ConnGuard,
+        dial: WsDial,
+        mut payload: Value,
+        tx: mpsc::Sender<Result<String, String>>,
+    ) {
+        let mut saw_event = false;
+        let mut retried_limit = false;
+        let mut retried_missing = false;
+        let mut retried_closed = false;
+        loop {
+            match read_one(&mut conn, saw_event).await {
+                Read::Event(text) => {
+                    if !saw_event
+                        && !retried_limit
+                        && ws_bridge::ws_error_code(&text).as_deref()
+                            == Some("websocket_connection_limit_reached")
+                    {
+                        retried_limit = true;
+                        *conn = None;
+                        slot.forget();
+                        *lock(&self.shared.sticky_session) = None;
+                        if self.ensure(&mut conn, &slot, &dial).await.is_err()
+                            || send_frame(&mut conn, &payload).await.is_err()
+                        {
+                            *conn = None;
+                            let _ = tx
+                                .send(Err("上游 WebSocket 达到连接时限，重连失败".into()))
+                                .await;
+                            break;
+                        }
+                        continue;
+                    }
+                    if !saw_event
+                        && !retried_missing
+                        && ws_bridge::ws_error_code(&text).as_deref()
+                            == Some("previous_response_not_found")
+                    {
+                        retried_missing = true;
+                        ws_bridge::strip_previous_response_id(&mut payload);
+                        if send_frame(&mut conn, &payload).await.is_err() {
+                            *conn = None;
+                            slot.forget();
+                            let _ = tx.send(Err("链式响应已失效，重发失败".into())).await;
+                            break;
+                        }
+                        continue;
+                    }
+                    if let Some(id) = response_id(&text) {
+                        slot.remember(&id);
+                    }
+                    let terminal = ws_bridge::is_terminal_event(&text);
+                    saw_event = true;
+                    if tx.send(Ok(text)).await.is_err() {
+                        *conn = None;
+                        slot.forget();
+                        break;
+                    }
+                    if terminal {
+                        break;
+                    }
+                }
+                Read::Fail(message) => {
+                    *conn = None;
+                    slot.forget();
+                    // Closed before answering at all: the connection died
+                    // while idle, so redial and resend once.
+                    if !saw_event && !retried_closed && message == CLOSED {
+                        retried_closed = true;
+                        if self.ensure(&mut conn, &slot, &dial).await.is_ok()
+                            && send_frame(&mut conn, &payload).await.is_ok()
+                        {
+                            continue;
+                        }
+                        *conn = None;
+                    }
+                    let _ = tx.send(Err(message)).await;
+                    break;
+                }
+            }
+        }
+        if let Some(live) = conn.as_mut() {
+            live.idle_since = Instant::now();
+        }
+    }
+}
+
+const CLOSED: &str = "上游 WebSocket 连接已关闭";
+
+fn response_id(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    value
+        .pointer("/response/id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 fn connection_fresh(age: Duration) -> bool {
@@ -165,34 +509,38 @@ fn idle_timeout(saw_event: bool) -> Duration {
     }
 }
 
-async fn ensure(inner: &mut Inner, dial: &WsDial) -> Result<()> {
-    let key = dial.key();
-    let fresh = inner
-        .live
-        .as_ref()
-        .is_some_and(|live| live.key == key && connection_fresh(live.connected_at.elapsed()));
-    if fresh {
-        return Ok(());
+async fn close(conn: &mut Option<Live>) {
+    if let Some(mut live) = conn.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), live.ws.close(None)).await;
     }
-    let replacing = inner.live.is_some();
-    inner.live = None;
-    inner.connected_at = None;
-    if replacing {
-        inner.sticky_session = None;
-    }
-    let (ws, headers) = connect_upstream(dial).await?;
-    inner.connected_at = Some(chrono::Utc::now().to_rfc3339());
-    inner.live = Some(Live {
-        ws,
-        connected_at: Instant::now(),
-        key,
-        headers,
-    });
-    Ok(())
 }
 
-async fn send_frame(inner: &mut Inner, payload: &Value) -> Result<()> {
-    let live = inner.live.as_mut().context("上游 WebSocket 未连接")?;
+/// Pings an idle connection and waits for the pong, answering the
+/// upstream's own pings meanwhile.
+async fn ping(live: &mut Live) -> Result<()> {
+    live.ws
+        .send(Message::Ping(Vec::new().into()))
+        .await
+        .context("发送 ping 失败")?;
+    tokio::time::timeout(PING_TIMEOUT, async {
+        loop {
+            match live.ws.next().await {
+                Some(Ok(Message::Pong(_))) => return Ok(()),
+                Some(Ok(Message::Ping(payload))) => {
+                    live.ws.send(Message::Pong(payload)).await?;
+                }
+                Some(Ok(Message::Close(_))) | None => anyhow::bail!("连接已关闭"),
+                Some(Ok(_)) => {}
+                Some(Err(err)) => return Err(err.into()),
+            }
+        }
+    })
+    .await
+    .context("ping 超时")?
+}
+
+async fn send_frame(conn: &mut Option<Live>, payload: &Value) -> Result<()> {
+    let live = conn.as_mut().context("上游 WebSocket 未连接")?;
     let text = serde_json::to_string(payload).context("无法序列化 WebSocket 请求")?;
     live.ws
         .send(Message::text(text))
@@ -201,86 +549,16 @@ async fn send_frame(inner: &mut Inner, payload: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn drive(
-    mut guard: OwnedMutexGuard<Inner>,
-    dial: WsDial,
-    mut payload: Value,
-    tx: mpsc::Sender<Result<String, String>>,
-) {
-    let mut saw_event = false;
-    let mut retried_limit = false;
-    let mut retried_missing = false;
-    loop {
-        match read_one(&mut guard, saw_event).await {
-            Read::Event(text) => {
-                if !saw_event
-                    && !retried_limit
-                    && ws_bridge::ws_error_code(&text).as_deref()
-                        == Some("websocket_connection_limit_reached")
-                {
-                    retried_limit = true;
-                    guard.live = None;
-                    guard.connected_at = None;
-                    guard.sticky_session = None;
-                    if ensure(&mut guard, &dial).await.is_err()
-                        || send_frame(&mut guard, &payload).await.is_err()
-                    {
-                        let _ = tx
-                            .send(Err("上游 WebSocket 达到连接时限，重连失败".into()))
-                            .await;
-                        break;
-                    }
-                    continue;
-                }
-                if !saw_event
-                    && !retried_missing
-                    && ws_bridge::ws_error_code(&text).as_deref()
-                        == Some("previous_response_not_found")
-                {
-                    retried_missing = true;
-                    ws_bridge::strip_previous_response_id(&mut payload);
-                    if send_frame(&mut guard, &payload).await.is_err() {
-                        guard.live = None;
-                        guard.connected_at = None;
-                        let _ = tx.send(Err("链式响应已失效，重发失败".into())).await;
-                        break;
-                    }
-                    continue;
-                }
-                let terminal = ws_bridge::is_terminal_event(&text);
-                saw_event = true;
-                if tx.send(Ok(text)).await.is_err() {
-                    guard.live = None;
-                    guard.connected_at = None;
-                    break;
-                }
-                if terminal {
-                    break;
-                }
-            }
-            Read::Fail(message) => {
-                guard.live = None;
-                guard.connected_at = None;
-                let _ = tx.send(Err(message)).await;
-                break;
-            }
-        }
-    }
-}
-
-async fn read_one(inner: &mut Inner, saw_event: bool) -> Read {
+async fn read_one(conn: &mut Option<Live>, saw_event: bool) -> Read {
     let idle = idle_timeout(saw_event);
     loop {
-        if inner.live.is_none() {
+        let Some(live) = conn.as_mut() else {
             return Read::Fail("上游 WebSocket 未连接".into());
-        }
-        let message = {
-            let live = inner.live.as_mut().expect("live");
-            if !connection_fresh(live.connected_at.elapsed()) {
-                return Read::Fail("上游 WebSocket 连接已到期".into());
-            }
-            tokio::time::timeout(idle, live.ws.next()).await
         };
+        if !connection_fresh(live.connected_at.elapsed()) {
+            return Read::Fail("上游 WebSocket 连接已到期".into());
+        }
+        let message = tokio::time::timeout(idle, live.ws.next()).await;
         match message {
             Err(_) => {
                 return Read::Fail(if saw_event {
@@ -289,18 +567,14 @@ async fn read_one(inner: &mut Inner, saw_event: bool) -> Read {
                     "上游 WebSocket 在首个事件前静默超时".into()
                 });
             }
-            Ok(None) => return Read::Fail("上游 WebSocket 连接已关闭".into()),
+            Ok(None) | Ok(Some(Ok(Message::Close(_)))) => return Read::Fail(CLOSED.into()),
             Ok(Some(Err(err))) => {
                 return Read::Fail(format!("上游 WebSocket 读取失败: {err}"));
             }
             Ok(Some(Ok(Message::Ping(payload)))) => {
-                let live = inner.live.as_mut().expect("live");
                 if live.ws.send(Message::Pong(payload)).await.is_err() {
                     return Read::Fail("上游 WebSocket Pong 失败".into());
                 }
-            }
-            Ok(Some(Ok(Message::Close(_)))) => {
-                return Read::Fail("上游 WebSocket 连接已关闭".into());
             }
             Ok(Some(Ok(Message::Text(text)))) => return Read::Event(text.to_string()),
             Ok(Some(Ok(Message::Pong(_) | Message::Binary(_) | Message::Frame(_)))) => {}
@@ -667,9 +941,7 @@ mod tests {
         let second = rx.recv().await.unwrap().unwrap();
         assert!(ws_bridge::is_terminal_event(&second));
         assert!(rx.recv().await.is_none());
-        let snapshot = pool.snapshot().await;
-        assert!(snapshot.connected);
-        assert!(snapshot.connected_at.is_some());
+        assert_eq!(pool.open_connections(), 1);
     }
 
     #[tokio::test]
@@ -756,5 +1028,208 @@ mod tests {
         let event = rx.recv().await.unwrap().unwrap();
         assert!(event.contains("response.completed"));
         assert!(!event.contains("connection_limit"));
+    }
+
+    fn local_dial(addr: std::net::SocketAddr) -> WsDial {
+        WsDial {
+            url: format!("ws://{addr}/responses"),
+            proxy: String::new(),
+            authorization: "Bearer test".into(),
+            account_id: "acct".into(),
+            extra_headers: vec![],
+        }
+    }
+
+    /// A local upstream: every connection answers each `response.create`
+    /// with `response.completed` whose id names the connection and turn.
+    /// Frames with `"model":"slow"` wait for `release` first; a connection
+    /// numbered in `close_after_one` closes after its first turn.
+    fn spawn_upstream(
+        listener: tokio::net::TcpListener,
+        release: Arc<Notify>,
+        close_after_one: Option<usize>,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let release = release.clone();
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let mut turn = 0;
+                    while let Some(Ok(message)) = ws.next().await {
+                        match message {
+                            Message::Ping(payload) => {
+                                let _ = ws.send(Message::Pong(payload)).await;
+                            }
+                            Message::Text(text) => {
+                                turn += 1;
+                                if text.contains("\"model\":\"slow\"") {
+                                    release.notified().await;
+                                }
+                                let done = format!(
+                                    r#"{{"type":"response.completed","response":{{"id":"resp_{index}_{turn}"}}}}"#
+                                );
+                                if ws.send(Message::text(done)).await.is_err() {
+                                    return;
+                                }
+                                if close_after_one == Some(index) {
+                                    let _ = ws.close(None).await;
+                                    return;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        accepted
+    }
+
+    async fn completed_id(pool: &WsUpstreamPool, dial: WsDial, payload: Value) -> String {
+        let (mut rx, _) = pool.open_turn(dial, payload).await.unwrap();
+        let event = rx.recv().await.unwrap().unwrap();
+        response_id(&event).unwrap()
+    }
+
+    #[tokio::test]
+    async fn concurrent_turns_do_not_wait_for_each_other() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dial = local_dial(listener.local_addr().unwrap());
+        let release = Arc::new(Notify::new());
+        let accepted = spawn_upstream(listener, release.clone(), None);
+        let pool = WsUpstreamPool::new();
+        let (mut slow, _) = pool
+            .open_turn(
+                dial.clone(),
+                json!({"type":"response.create","model":"slow"}),
+            )
+            .await
+            .unwrap();
+        // The second turn finishes on its own connection while the first waits.
+        let fast = tokio::time::timeout(
+            Duration::from_secs(2),
+            completed_id(
+                &pool,
+                dial.clone(),
+                json!({"type":"response.create","model":"m"}),
+            ),
+        )
+        .await
+        .expect("a concurrent turn must not queue behind a running one");
+        assert_eq!(fast, "resp_1_1");
+        release.notify_one();
+        let slow_id = response_id(&slow.recv().await.unwrap().unwrap()).unwrap();
+        assert_eq!(slow_id, "resp_0_1");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn follow_ups_return_to_the_connection_that_answered() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dial = local_dial(listener.local_addr().unwrap());
+        let release = Arc::new(Notify::new());
+        spawn_upstream(listener, release.clone(), None);
+        let pool = WsUpstreamPool::new();
+        // Open two connections: a slow turn on the first, a quick one on the second.
+        let (mut slow, _) = pool
+            .open_turn(
+                dial.clone(),
+                json!({"type":"response.create","model":"slow"}),
+            )
+            .await
+            .unwrap();
+        let second = completed_id(
+            &pool,
+            dial.clone(),
+            json!({"type":"response.create","model":"m"}),
+        )
+        .await;
+        assert_eq!(second, "resp_1_1");
+        release.notify_one();
+        slow.recv().await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Both connections are idle now; the follow-up still goes to the second.
+        let follow_up = completed_id(
+            &pool,
+            dial,
+            json!({"type":"response.create","model":"m","previous_response_id": second}),
+        )
+        .await;
+        assert_eq!(follow_up, "resp_1_2");
+    }
+
+    #[tokio::test]
+    async fn a_connection_closed_while_idle_is_redialed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dial = local_dial(listener.local_addr().unwrap());
+        let accepted = spawn_upstream(listener, Arc::new(Notify::new()), Some(0));
+        let pool = WsUpstreamPool::new();
+        let first = completed_id(
+            &pool,
+            dial.clone(),
+            json!({"type":"response.create","model":"m"}),
+        )
+        .await;
+        assert_eq!(first, "resp_0_1");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            completed_id(&pool, dial, json!({"type":"response.create","model":"m"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second, "resp_1_1");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn maintain_warms_pings_and_rewarms_after_invalidate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dial = local_dial(listener.local_addr().unwrap());
+        let accepted = spawn_upstream(listener, Arc::new(Notify::new()), None);
+        let pool = WsUpstreamPool::new();
+        pool.maintain(&dial).await;
+        assert_eq!(pool.open_connections(), 1);
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        // A healthy warm connection is only pinged, not replaced.
+        pool.maintain(&dial).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        // The first turn uses the warm connection instead of dialing.
+        let id = completed_id(
+            &pool,
+            dial.clone(),
+            json!({"type":"response.create","model":"m"}),
+        )
+        .await;
+        assert_eq!(id, "resp_0_1");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pool.invalidate().await;
+        assert_eq!(pool.open_connections(), 0);
+        tokio::time::timeout(Duration::from_secs(1), pool.changed())
+            .await
+            .expect("invalidate wakes the keeper");
+        pool.maintain(&dial).await;
+        assert_eq!(pool.open_connections(), 1);
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_handshake_backs_off() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dial = local_dial(closed.local_addr().unwrap());
+        drop(closed);
+        let pool = WsUpstreamPool::new();
+        assert!(pool.available());
+        pool.maintain(&dial).await;
+        assert!(!pool.available());
+        assert_eq!(pool.open_connections(), 0);
+        // Changing the line clears the backoff.
+        pool.invalidate().await;
+        assert!(pool.available());
     }
 }

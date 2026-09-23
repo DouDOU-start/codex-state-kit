@@ -69,11 +69,6 @@ pub async fn mihomo_select(
 }
 
 #[tauri::command(async)]
-pub async fn ws_upstream_reconnect(state: State<'_, AppState>) -> CommandResult<Status> {
-    command(state.proxy.reconnect_ws_upstream().await)
-}
-
-#[tauri::command(async)]
 pub async fn update_vm_identity(
     state: State<'_, AppState>,
     profile: codex_state_kit::identity::VmProfile,
@@ -166,6 +161,13 @@ pub async fn get_billing_summary(
         to,
         ..UsageFilter::default()
     }))
+}
+
+/// Changes whenever usage records are written; the UI polls this cheaply
+/// and reloads records and summaries only when it moves.
+#[tauri::command(async)]
+pub async fn get_billing_revision(state: State<'_, AppState>) -> CommandResult<u64> {
+    Ok(state.core().billing.revision())
 }
 
 /// Query persisted request-level billing records with optional account/time,

@@ -71,7 +71,6 @@ fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
         forced_model: settings.forced_model.clone(),
         mihomo_subscription: String::new(),
         mihomo_node: String::new(),
-        ws_upstream_enabled: settings.ws_upstream_enabled,
         chain_system_proxy: settings.chain_system_proxy,
     }
 }

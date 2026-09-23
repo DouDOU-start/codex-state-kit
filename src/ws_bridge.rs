@@ -6,11 +6,13 @@ use serde_json::{json, Value};
 
 /// 只对 https 上游尝试 WebSocket。本地测试用的 `http://` 模拟端必须继续走 reqwest，
 /// 否则一次 WebSocket 握手会占掉只能 accept 一次的 TCP 桩。
-pub fn should_bridge_http(enabled: bool, method: &str, path: &str, target: &str) -> bool {
-    enabled
-        && method.eq_ignore_ascii_case("POST")
-        && path.contains("/responses")
-        && target.starts_with("https://")
+pub fn should_bridge_http(method: &str, path: &str, target: &str) -> bool {
+    method.eq_ignore_ascii_case("POST") && path.contains("/responses") && uses_websocket(target)
+}
+
+/// Whether business turns to this upstream go over WebSocket at all.
+pub fn uses_websocket(upstream: &str) -> bool {
+    upstream.trim().starts_with("https://")
 }
 
 /// 由设置里的 HTTP 上游地址推导 WebSocket 地址。已是 `/responses` 时不重复拼接。
@@ -199,25 +201,16 @@ mod tests {
     #[test]
     fn http_upstreams_stay_on_reqwest() {
         assert!(!should_bridge_http(
-            true,
             "POST",
             "/responses",
             "http://127.0.0.1:9/responses"
         ));
         assert!(should_bridge_http(
-            true,
             "POST",
             "/v1/responses",
             "https://chatgpt.com/backend-api/codex/responses"
         ));
         assert!(!should_bridge_http(
-            false,
-            "POST",
-            "/responses",
-            "https://chatgpt.com/backend-api/codex/responses"
-        ));
-        assert!(!should_bridge_http(
-            true,
             "GET",
             "/responses",
             "https://chatgpt.com/backend-api/codex/responses"

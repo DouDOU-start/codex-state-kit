@@ -80,9 +80,6 @@ export interface Status {
   mihomo: MihomoStatus;
   logs: LogEntry[];
   vmIdentity: VmIdentityView;
-  wsUpstreamEnabled: boolean;
-  wsUpstreamConnected: boolean;
-  wsUpstreamConnectedAt?: string | null;
   chainSystemProxy?: boolean;
   systemProxy?: SystemProxyView;
   /** Latest downgraded request since Kit started. */
@@ -134,7 +131,6 @@ export interface SettingsPatch {
   outboundMode: OutboundMode;
   mihomoSubscription: string;
   mihomoNode: string;
-  wsUpstreamEnabled?: boolean;
   chainSystemProxy?: boolean;
 }
 
