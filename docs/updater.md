@@ -1,5 +1,7 @@
 # 自动更新发布
 
+[返回首页](../README.md)
+
 应用使用 Tauri updater 下载并验证签名。Windows 使用 NSIS 更新包，macOS 使用 `.app.tar.gz`；下载期间不停止转发，用户确认后才安装重启。Windows 使用 `passive` 安装模式，显示安装进度；系统权限提示仍可能出现。
 
 ## 签名与 Secrets
@@ -47,4 +49,4 @@ cargo check --workspace
 
 签名测试使用无执行能力的固定文本和公开签名，验证应用公钥能验签，并拒绝篡改内容。构建真实签名安装包时，将 `TAURI_SIGNING_PRIVATE_KEY` 设置为私钥路径，`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 设置为密码文件内容，再运行 `corepack pnpm build`；不要将值写进提交、日志或截图。
 
-首次发布后仍需在 Windows 与两种 macOS 安装环境中验证从旧安装包到新安装包的完整升级，包括签名失败、网络中断、安装失败恢复、路由恢复、WARP 退出和重启后的版本号。Tauri updater 签名与操作系统代码签名/公证是不同机制；此配置不改变现有 macOS 公证状态。
+首次发布后仍需在 Windows 与两种 macOS 安装环境中验证从旧安装包到新安装包的完整升级，包括签名失败、网络中断、安装失败恢复、路由与 `auth.json` 恢复、订阅内核退出和重启后的版本号。Tauri updater 签名与操作系统代码签名/公证是不同机制；此配置不改变现有 macOS 公证状态。

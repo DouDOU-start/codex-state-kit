@@ -8,10 +8,10 @@
 
 启动 Kit，添加 ChatGPT 账号并选好出站线路即可。路由只在 Kit 运行期间生效；正常退出后会还原本地原有配置。
 
-![Codex State Kit 主界面（代理地址、账号与工作目录已打码）](docs/images/kit-overview.png)
+![Codex State Kit 概览页（浏览器预览，示例数据）](docs/images/kit-overview.png)
 
-1. 安装并启动 Codex State Kit，确认「Codex 工作目录」与 Codex 客户端使用的配置目录一致，一般为用户目录下的 `.codex`。同一时间只能运行一个 Kit。
-2. 点击「添加账号」，用浏览器回调、授权码、Refresh Token 或 Access Token 登录 ChatGPT。登录请求走该账号自己的出站线路。
+1. 安装并启动 Codex State Kit，在「Codex 接入」页确认「Codex 工作目录」与 Codex 客户端使用的配置目录一致，一般为用户目录下的 `.codex`。同一时间只能运行一个 Kit。
+2. 在「Codex 接入」页点击「添加账号」，用浏览器回调、授权码、Refresh Token 或 Access Token 登录 ChatGPT。登录请求走当前出站线路，新账号随后绑定这条线路。
 3. 在「出站网络」中选择手动代理或订阅节点。只开了 Clash 等软件的系统代理（未开 TUN）时，Kit 会经系统代理连到手动代理。
 4. 界面显示「已接入」后，重启 Codex 客户端以加载本机路由。
 5. 使用期间保持 Kit 运行。正常退出后，再重启 Codex，即可回到退出前的官方账号与本地配置。
@@ -40,13 +40,14 @@ Codex 客户端 ── 本机代理（Kit） ── 出站线路（手动代理 
 
 | 文档 | 内容 |
 | --- | --- |
-| [配置与自动接入](docs/config.md) | 工作目录、文件位置、路由恢复 |
-| [ChatGPT 登录](docs/browser-login.md) | 回调、授权码、Refresh Token 与 Access Token 登录 |
+| [账号与登录](docs/accounts.md) | 添加账号、切换与环境绑定、登录文件 |
 | [出站代理](docs/outbound.md) | 手动代理、订阅节点与系统代理串联 |
-| [网络路由日志](docs/network-logs.md) | 请求字段和数据边界 |
-| [账号计费设计](docs/account-billing-design.md) | 按 ChatGPT 账号持久化用量与估算成本 |
+| [使用记录与降智识别](docs/usage-records.md) | 记录字段、指标口径、降智判定与数据边界 |
+| [计费与模型价格](docs/billing.md) | 价格同步、计费公式、结算与存储 |
+| [配置与自动接入](docs/config.md) | 工作目录、文件位置、路由恢复、高级设置 |
 | [常见问题](docs/troubleshooting.md) | 登录、网络、接入与恢复排查，问题报告 |
 | [开发与打包](docs/development.md) | 环境、命令、版本和安装包 |
+| [自动更新发布](docs/updater.md) | 更新签名、Secrets 与发布流程 |
 | [界面与图标](docs/ui-theme.md) | 布局、配色、图标维护 |
 
 ## 本地开发
@@ -64,4 +65,4 @@ corepack pnpm dev
 
 ## 第三方组件
 
-订阅节点使用第三方开源内核 Mihomo，来源和许可证见[内核来源记录](src-tauri/resources/mihomo/PROVENANCE.md)；内置 WARP 使用 usque，见[来源记录](src-tauri/resources/warp/PROVENANCE.md)。上游许可证与依赖声明保留原文。
+订阅节点使用第三方开源内核 Mihomo，来源和许可证见[内核来源记录](src-tauri/resources/mihomo/PROVENANCE.md)。上游许可证与依赖声明保留原文。

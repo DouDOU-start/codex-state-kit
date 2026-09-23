@@ -338,7 +338,7 @@ svg { flex-shrink: 0; }
 .usage-model div { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; }
 .usage-model span { color: var(--muted); }
 .usage-model i { display: block; height: 6px; border-radius: 99px; background: #7eabd4; }
-@media (max-width: 900px) { .usage-dash__cards, .usage-dash__columns, .usage-dash__bottom { grid-template-columns: 1fr; } }
+@media (max-width: 740px) { .usage-dash__cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-dash__columns, .usage-dash__bottom { grid-template-columns: 1fr; } }
 .boot-screen { display: flex; width: 100%; height: 100%; align-items: center; justify-content: center; gap: 10px; color: var(--muted); font-size: 12px; }
 .boot-screen__error { width: min(430px, calc(100% - 48px)); padding: 28px; border: 1px solid #efd6d3; border-radius: 16px; background: var(--surface); box-shadow: var(--shadow); text-align: center; }
 .boot-screen__error strong { color: var(--text); font-size: 16px; }
