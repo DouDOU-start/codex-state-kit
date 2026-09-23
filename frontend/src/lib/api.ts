@@ -800,6 +800,8 @@ export async function syncPricing(): Promise<PricingView> {
 const mockAccounts: SavedAccount[] = [
   {
     accountId: "mock-account-b",
+    deviceId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    network: "手动代理 · socks5://proxy.example.test:44445",
     email: "mock@example.com",
     label: null,
     authMode: "chatgpt",
@@ -811,6 +813,8 @@ const mockAccounts: SavedAccount[] = [
   },
   {
     accountId: "mock-account-a",
+    deviceId: "5c9d1e02-7a41-4b8e-9f10-2d6e8a7b4c31",
+    network: "订阅节点 · Kit → 香港 01",
     email: "previous@example.com",
     label: "备用号",
     authMode: "chatgpt",

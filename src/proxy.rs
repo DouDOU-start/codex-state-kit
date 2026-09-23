@@ -18,6 +18,7 @@ use tokio::sync::{oneshot, Mutex, Notify};
 use tokio::task::JoinHandle;
 use url::Url;
 
+use crate::accounts::{self, AccountEnvironment, NetworkProfile};
 use crate::attach::{self, is_attached};
 use crate::billing::{BillingStore, RequestStart, UsageOutcome, UsageState};
 use crate::chatgpt_cookies::{self, RoutingCookie};
@@ -1560,6 +1561,8 @@ pub struct ProxyHandle {
     settings_change: Arc<Mutex<()>>,
     managed_routes: Arc<std::sync::Mutex<Option<attach::ManagedRoutes>>>,
     attach_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// Serialises binding the live environment to accounts.
+    account_env: Arc<Mutex<()>>,
 }
 
 impl ProxyHandle {
@@ -1573,6 +1576,7 @@ impl ProxyHandle {
             settings_change: Arc::new(Mutex::new(())),
             managed_routes: Arc::new(std::sync::Mutex::new(None)),
             attach_error: Arc::new(std::sync::Mutex::new(None)),
+            account_env: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1616,6 +1620,7 @@ impl ProxyHandle {
             identity.save()?;
         }
         self.app.ws_upstream.invalidate().await;
+        self.remember_account_environment().await;
         Ok(self.managed_status().await)
     }
 
@@ -1626,6 +1631,7 @@ impl ProxyHandle {
             identity.save()?;
         }
         self.app.ws_upstream.invalidate().await;
+        self.remember_account_environment().await;
         Ok(self.managed_status().await)
     }
 
@@ -1641,6 +1647,7 @@ impl ProxyHandle {
             identity.save()?;
         }
         self.app.ws_upstream.invalidate().await;
+        self.remember_account_environment().await;
         Ok(self.managed_status().await)
     }
 
@@ -1763,7 +1770,118 @@ impl ProxyHandle {
     }
 
     pub async fn apply_settings(&self, patch: SettingsPatch) -> Result<Status> {
-        let next = patch.into_settings()?;
+        let status = self.apply_settings_to(patch.into_settings()?).await?;
+        // Outbound edits belong to the account that is currently live.
+        self.remember_account_environment().await;
+        Ok(status)
+    }
+
+    /// The environment Kit is using right now: virtual device and outbound line.
+    async fn current_environment(&self) -> AccountEnvironment {
+        let settings = self.app.settings.lock().await.clone();
+        let vm = self.app.vm_identity.lock().await.clone();
+        let mihomo = self.app.mihomo.status();
+        let mihomo_selections =
+            if settings.outbound_mode == OutboundMode::Mihomo && mihomo.phase == "connected" {
+                mihomo
+                    .groups
+                    .iter()
+                    .filter(|group| {
+                        matches!(
+                            group.group_type.to_ascii_lowercase().as_str(),
+                            "select" | "selector"
+                        )
+                    })
+                    .filter_map(|group| group.now.clone().map(|node| (group.name.clone(), node)))
+                    .collect()
+            } else {
+                Default::default()
+            };
+        AccountEnvironment {
+            vm,
+            network: NetworkProfile {
+                outbound_mode: settings.outbound_mode,
+                outbound_proxy: settings.outbound_proxy,
+                mihomo_subscription: settings.mihomo_subscription,
+                mihomo_node: settings.mihomo_node,
+                mihomo_selections,
+            },
+        }
+    }
+
+    /// Makes an account's saved environment live.
+    async fn apply_environment(&self, target: &AccountEnvironment) -> Result<()> {
+        {
+            let next = target.vm.clone().with_runtime_ids();
+            next.save()?;
+            *self.app.vm_identity.lock().await = next;
+        }
+        self.app.ws_upstream.invalidate().await;
+        let mut next = self.app.settings.lock().await.clone();
+        let network = &target.network;
+        let network_changed = next.outbound_mode != network.outbound_mode
+            || next.outbound_proxy != network.outbound_proxy
+            || next.mihomo_subscription != network.mihomo_subscription
+            || next.mihomo_node != network.mihomo_node;
+        if network_changed {
+            next.outbound_mode = network.outbound_mode;
+            next.outbound_proxy = network.outbound_proxy.clone();
+            next.mihomo_subscription = network.mihomo_subscription.clone();
+            next.mihomo_node = network.mihomo_node.clone();
+            self.apply_settings_to(next).await?;
+        }
+        if network.outbound_mode == OutboundMode::Mihomo && !network.mihomo_selections.is_empty() {
+            let app = self.app.clone();
+            let selections = network.mihomo_selections.clone();
+            tokio::spawn(async move { restore_mihomo_selections(app, selections).await });
+        }
+        Ok(())
+    }
+
+    /// Binds the live environment to the live account: saves it for the
+    /// account that owned it and, when the live account changed (switch or
+    /// new login), makes that account's own environment live. A newly seen
+    /// account gets a new virtual device and keeps the current line.
+    pub async fn sync_account_environment(&self) -> Result<()> {
+        let _guard = self.account_env.lock().await;
+        let home = std::path::PathBuf::from(self.app.settings.lock().await.codex_home.clone());
+        let current = self.current_environment().await;
+        let Some(plan) = accounts::plan_environment(&home, &current, |env| AccountEnvironment {
+            vm: env.vm.renewed(),
+            network: env.network.clone(),
+        })?
+        else {
+            return Ok(());
+        };
+        let live = match plan.target {
+            Some(target) if !target.same_as(&current) => {
+                self.apply_environment(&target).await?;
+                target
+            }
+            Some(target) => target,
+            None => current,
+        };
+        accounts::commit_environment(&home, &plan.account_id, &live)
+    }
+
+    async fn remember_account_environment(&self) {
+        if let Err(err) = self.sync_account_environment().await {
+            eprintln!("[accounts] 绑定账号环境失败: {err:#}");
+        }
+    }
+
+    /// Switches the live account and its environment together.
+    pub async fn switch_account(
+        &self,
+        home: &Path,
+        account_id: &str,
+    ) -> Result<login::LoginStatus> {
+        let status = accounts::switch(home, account_id)?;
+        self.sync_account_environment().await?;
+        Ok(status)
+    }
+
+    async fn apply_settings_to(&self, next: Settings) -> Result<Status> {
         let _change = self.settings_change.lock().await;
         let old = self.app.settings.lock().await.clone();
         let next_business = resolved_proxy(&next, &self.app.mihomo);
@@ -2552,6 +2670,35 @@ impl Drop for ResponseLogTracker {
                 replace_network_log(&app, entry).await;
             });
         }
+    }
+}
+
+/// Re-selects an account's subscription nodes once the core is running.
+async fn restore_mihomo_selections(
+    app: Arc<App>,
+    selections: std::collections::BTreeMap<String, String>,
+) {
+    for _ in 0..60 {
+        if app.mihomo.status().phase == "connected" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let groups = app.mihomo.status().groups;
+    let mut changed = false;
+    for (group, node) in selections {
+        let current = groups.iter().find(|item| item.name == group);
+        let available = current.is_some_and(|item| item.all.iter().any(|n| n.name == node));
+        if !available || current.and_then(|item| item.now.as_deref()) == Some(node.as_str()) {
+            continue;
+        }
+        match app.mihomo.select_in_group(&group, &node).await {
+            Ok(()) => changed = true,
+            Err(err) => eprintln!("[accounts] 恢复订阅节点 {group} → {node} 失败: {err:#}"),
+        }
+    }
+    if changed {
+        app.ws_upstream.invalidate().await;
     }
 }
 

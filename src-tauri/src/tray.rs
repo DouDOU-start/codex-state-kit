@@ -141,7 +141,8 @@ fn switch_from_tray<R: Runtime>(app: &AppHandle<R>, account_id: String) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let home = codex_home(&app).await;
-        let payload = match accounts::switch(&home, &account_id) {
+        let proxy = app.state::<AppState>().proxy.clone();
+        let payload = match proxy.switch_account(&home, &account_id).await {
             Ok(status) => AccountsChanged {
                 ok: true,
                 message: format!(

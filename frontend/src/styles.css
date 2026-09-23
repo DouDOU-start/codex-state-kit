@@ -498,3 +498,8 @@ input[type="checkbox"]:checked { border-color: var(--accent); background: var(--
 input[type="checkbox"]:checked::before { transform: scale(1); }
 input[type="checkbox"]:focus-visible { outline: 3px solid #89acd4; outline-offset: 2px; }
 input[type="checkbox"]:disabled { opacity: .5; cursor: not-allowed; }
+.accounts-item__env { display: flex; flex-wrap: wrap; gap: 3px 10px; color: var(--text-soft); font-size: 10px; }
+.accounts-item__env span + span::before { margin-right: 10px; color: var(--line-strong); content: "·"; }
+.binding-note { display: flex; align-items: center; gap: 6px; margin: -4px 0 12px; padding: 7px 10px; border: 1px solid #d4e2f2; border-radius: 8px; color: var(--text-soft); background: var(--accent-soft); font-size: 10px; }
+.binding-note svg { color: var(--accent); }
+.binding-note strong { color: var(--accent-strong); font-weight: 650; }

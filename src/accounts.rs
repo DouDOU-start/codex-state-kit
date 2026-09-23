@@ -11,8 +11,12 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+
+use crate::identity::VmIdentity;
+use crate::settings::OutboundMode;
 
 use crate::login::{
     atomic_write, auth_sync_lock, kit_auth_path, overlay_kit_onto_official, read_auth_file,
@@ -33,11 +37,70 @@ fn vault_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Vault {
     #[serde(default)]
     version: u32,
     #[serde(default)]
     accounts: Vec<StoredAccount>,
+    /// The account whose environment is currently live in Kit's settings
+    /// and virtual device. Survives restarts.
+    #[serde(default)]
+    environment_owner: Option<String>,
+}
+
+/// The outbound line an account uses.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkProfile {
+    pub outbound_mode: OutboundMode,
+    #[serde(default)]
+    pub outbound_proxy: String,
+    #[serde(default)]
+    pub mihomo_subscription: String,
+    #[serde(default)]
+    pub mihomo_node: String,
+    /// Selected node per subscription group (select groups only).
+    #[serde(default)]
+    pub mihomo_selections: BTreeMap<String, String>,
+}
+
+/// Everything upstream sees besides the credentials: the virtual device and
+/// the outbound line. Each account keeps its own so switching accounts never
+/// mixes one account's traffic with another's fingerprint or exit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountEnvironment {
+    pub vm: VmIdentity,
+    pub network: NetworkProfile,
+}
+
+impl AccountEnvironment {
+    /// Compares the persisted parts (runtime session ids are ignored).
+    pub fn same_as(&self, other: &Self) -> bool {
+        self.network == other.network
+            && serde_json::to_value(&self.vm).ok() == serde_json::to_value(&other.vm).ok()
+    }
+}
+
+/// Stores `current` for an account. Group selections are only known while
+/// the subscription core runs; keep the saved ones when none are reported.
+fn store_environment(slot: &mut Option<AccountEnvironment>, current: &AccountEnvironment) {
+    let mut next = current.clone();
+    if next.network.mihomo_selections.is_empty() {
+        if let Some(previous) = slot.as_ref() {
+            next.network.mihomo_selections = previous.network.mihomo_selections.clone();
+        }
+    }
+    *slot = Some(next);
+}
+
+/// What [`plan_environment`] decided.
+pub struct EnvironmentPlan {
+    pub account_id: String,
+    /// The environment to make live before [`commit_environment`];
+    /// `None` when the live environment already belongs to this account.
+    pub target: Option<AccountEnvironment>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -53,6 +116,8 @@ struct StoredAccount {
     added_at: String,
     #[serde(default)]
     last_used_at: Option<String>,
+    #[serde(default)]
+    environment: Option<AccountEnvironment>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -69,6 +134,46 @@ pub struct AccountView {
     pub active: bool,
     pub added_at: String,
     pub last_used_at: Option<String>,
+    /// Installation id of the account's virtual device.
+    pub device_id: Option<String>,
+    /// Short description of the account's outbound line.
+    pub network: Option<String>,
+}
+
+fn network_label(network: &NetworkProfile) -> String {
+    match network.outbound_mode {
+        OutboundMode::Manual => {
+            let proxy = network.outbound_proxy.trim();
+            if proxy.is_empty() {
+                return "手动代理 · 未配置".into();
+            }
+            // Never show credentials or session parameters.
+            let shown = url::Url::parse(proxy)
+                .ok()
+                .and_then(|url| {
+                    let host = url.host_str()?.to_string();
+                    Some(match url.port() {
+                        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+                        None => format!("{}://{host}", url.scheme()),
+                    })
+                })
+                .unwrap_or_else(|| "已配置".into());
+            format!("手动代理 · {shown}")
+        }
+        OutboundMode::Mihomo => {
+            let node = network
+                .mihomo_selections
+                .iter()
+                .next()
+                .map(|(group, node)| format!("{group} → {node}"))
+                .or_else(|| {
+                    let node = network.mihomo_node.trim();
+                    (!node.is_empty()).then(|| node.to_string())
+                })
+                .unwrap_or_else(|| "自动".into());
+            format!("订阅节点 · {node}")
+        }
+    }
 }
 
 pub fn vault_path(home: &Path) -> PathBuf {
@@ -147,6 +252,7 @@ fn capture_locked(home: &Path, vault: &mut Vault) -> bool {
                 auth,
                 added_at: at.clone(),
                 last_used_at: Some(at),
+                environment: None,
             });
         }
     }
@@ -193,6 +299,14 @@ pub fn list(home: &Path) -> Result<Vec<AccountView>> {
                 active: active.as_deref() == Some(account.account_id.as_str()),
                 added_at: account.added_at.clone(),
                 last_used_at: account.last_used_at.clone(),
+                device_id: account
+                    .environment
+                    .as_ref()
+                    .map(|env| env.vm.installation_id.clone()),
+                network: account
+                    .environment
+                    .as_ref()
+                    .map(|env| network_label(&env.network)),
             }
         })
         .collect())
@@ -260,6 +374,73 @@ pub fn rename(home: &Path, account_id: &str, label: &str) -> Result<()> {
         bail!("账号不存在");
     };
     account.label = (!label.is_empty()).then_some(label);
+    save(home, &mut vault)
+}
+
+/// First step of keeping each account's environment separate.
+///
+/// Saves the live environment (`current`) into the account that owns it and
+/// decides what the live account should use: its saved environment, the
+/// current one on first use (nothing was bound yet), or `fresh(current)`
+/// (a new virtual device) when another account owned the live environment.
+/// Ownership only moves in [`commit_environment`], after the target is live,
+/// so a failed switch never records the wrong environment for an account.
+pub fn plan_environment(
+    home: &Path,
+    current: &AccountEnvironment,
+    fresh: impl FnOnce(&AccountEnvironment) -> AccountEnvironment,
+) -> Result<Option<EnvironmentPlan>> {
+    let _guard = vault_lock();
+    let mut vault = load(home)?;
+    capture_locked(home, &mut vault);
+    let Some((live, _, _)) = live_account(home) else {
+        return Ok(None);
+    };
+    let owner = vault.environment_owner.clone();
+    if let Some(owner) = owner.as_deref() {
+        if let Some(account) = vault.accounts.iter_mut().find(|a| a.account_id == owner) {
+            store_environment(&mut account.environment, current);
+        }
+    }
+    let target = if owner.as_deref() == Some(live.as_str()) {
+        None
+    } else {
+        let saved = vault
+            .accounts
+            .iter()
+            .find(|account| account.account_id == live)
+            .and_then(|account| account.environment.clone());
+        Some(match saved {
+            Some(saved) => saved,
+            None if owner.is_none() => current.clone(),
+            None => fresh(current),
+        })
+    };
+    save(home, &mut vault)?;
+    Ok(Some(EnvironmentPlan {
+        account_id: live,
+        target,
+    }))
+}
+
+/// Second step: records `environment` as the account's own and marks it as
+/// the owner of the live environment.
+pub fn commit_environment(
+    home: &Path,
+    account_id: &str,
+    environment: &AccountEnvironment,
+) -> Result<()> {
+    let _guard = vault_lock();
+    let mut vault = load(home)?;
+    let Some(account) = vault
+        .accounts
+        .iter_mut()
+        .find(|account| account.account_id == account_id)
+    else {
+        bail!("账号不存在");
+    };
+    store_environment(&mut account.environment, environment);
+    vault.environment_owner = Some(account_id.to_string());
     save(home, &mut vault)
 }
 
@@ -372,6 +553,100 @@ mod tests {
         remove(home, "acct-a").unwrap();
         assert_eq!(list(home).unwrap().len(), 1);
         assert!(switch(home, "acct-a").is_err());
+    }
+
+    fn env(installation: &str, proxy: &str) -> AccountEnvironment {
+        let mut vm = VmIdentity::ephemeral();
+        vm.installation_id = installation.into();
+        AccountEnvironment {
+            vm,
+            network: NetworkProfile {
+                outbound_proxy: proxy.into(),
+                ..NetworkProfile::default()
+            },
+        }
+    }
+
+    fn fresh(current: &AccountEnvironment) -> AccountEnvironment {
+        let mut next = current.clone();
+        next.vm.installation_id = "fresh".into();
+        next
+    }
+
+    /// Runs plan + commit the way ProxyHandle does, returning the new live env.
+    fn sync(home: &Path, live: &AccountEnvironment) -> AccountEnvironment {
+        let plan = plan_environment(home, live, fresh).unwrap().unwrap();
+        let next = plan.target.unwrap_or_else(|| live.clone());
+        commit_environment(home, &plan.account_id, &next).unwrap();
+        next
+    }
+
+    #[test]
+    fn each_account_keeps_its_own_device_and_network() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        login(home, "acct-a", "rt-a");
+        // First binding adopts the environment already in use.
+        let mut live = sync(home, &env("dev-a", "socks5://a:1"));
+        assert_eq!(live.vm.installation_id, "dev-a");
+
+        // A new login gets a new virtual device, not acct-a's.
+        login(home, "acct-b", "rt-b");
+        live = sync(home, &live);
+        assert_eq!(live.vm.installation_id, "fresh");
+        // acct-b changes its own line while active.
+        live.network.outbound_proxy = "socks5://b:2".into();
+        live = sync(home, &live);
+
+        switch(home, "acct-a").unwrap();
+        live = sync(home, &live);
+        assert_eq!(live.vm.installation_id, "dev-a");
+        assert_eq!(live.network.outbound_proxy, "socks5://a:1");
+
+        switch(home, "acct-b").unwrap();
+        live = sync(home, &live);
+        assert_eq!(live.vm.installation_id, "fresh");
+        assert_eq!(live.network.outbound_proxy, "socks5://b:2");
+
+        let accounts = list(home).unwrap();
+        let b = accounts.iter().find(|a| a.account_id == "acct-b").unwrap();
+        assert_eq!(b.device_id.as_deref(), Some("fresh"));
+        assert_eq!(b.network.as_deref(), Some("手动代理 · socks5://b:2"));
+    }
+
+    #[test]
+    fn an_uncommitted_switch_does_not_move_ownership() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        login(home, "acct-a", "rt-a");
+        let live = sync(home, &env("dev-a", "socks5://a:1"));
+        login(home, "acct-b", "rt-b");
+        // Planning without committing (the apply failed) keeps acct-a as owner,
+        // so the unchanged live environment is saved back to acct-a again.
+        plan_environment(home, &live, fresh).unwrap();
+        let plan = plan_environment(home, &live, fresh).unwrap().unwrap();
+        assert_eq!(plan.target.unwrap().vm.installation_id, "fresh");
+        switch(home, "acct-a").unwrap();
+        let back = sync(home, &live);
+        assert_eq!(back.vm.installation_id, "dev-a");
+    }
+
+    #[test]
+    fn subscription_selections_survive_when_the_core_is_stopped() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        login(home, "acct-a", "rt-a");
+        let mut live = env("dev-a", "");
+        live.network.outbound_mode = OutboundMode::Mihomo;
+        live.network
+            .mihomo_selections
+            .insert("Kit".into(), "HK-01".into());
+        live = sync(home, &live);
+        let mut stopped = live.clone();
+        stopped.network.mihomo_selections.clear();
+        sync(home, &stopped);
+        let a = list(home).unwrap().into_iter().next().unwrap();
+        assert_eq!(a.network.as_deref(), Some("订阅节点 · Kit → HK-01"));
     }
 
     #[test]

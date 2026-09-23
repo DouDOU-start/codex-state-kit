@@ -159,6 +159,24 @@ impl VmIdentity {
         Ok(())
     }
 
+    /// The same device profile on a new machine: new installation and
+    /// session ids. Used when an account gets its own virtual device.
+    pub fn renewed(&self) -> Self {
+        let mut next = self.clone();
+        next.installation_id = Uuid::new_v4().to_string();
+        next.fill_runtime();
+        next
+    }
+
+    /// A stored identity (runtime ids are not serialized) ready for use.
+    pub fn with_runtime_ids(mut self) -> Self {
+        if !valid_uuid(&self.installation_id) {
+            self.installation_id = Uuid::new_v4().to_string();
+        }
+        self.fill_runtime();
+        self
+    }
+
     pub fn regenerate_installation_id(&mut self) {
         self.installation_id = Uuid::new_v4().to_string();
     }

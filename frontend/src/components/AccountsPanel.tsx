@@ -108,6 +108,10 @@ export function AccountsPanel({ accounts, busy, onSwitch, onRemove, onRename, on
                     {!account.usable ? <span className="accounts-tag accounts-tag--bad">凭据失效，请重新登录</span> : null}
                     <span>{account.active ? "当前使用中" : relativeTime(account.lastUsedAt)}</span>
                   </span>
+                  <span className="accounts-item__env">
+                    {account.deviceId ? <span title={account.deviceId}>设备 {account.deviceId.slice(0, 8)}</span> : <span>切换后分配独立设备</span>}
+                    {account.network ? <span>{account.network}</span> : null}
+                  </span>
                 </div>
                 <div className="accounts-item__actions">
                   {account.active ? (

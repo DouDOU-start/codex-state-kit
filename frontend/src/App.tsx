@@ -14,6 +14,7 @@ import Waypoints from "lucide-react/dist/esm/icons/waypoints.js";
 import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.js";
 import Settings2 from "lucide-react/dist/esm/icons/settings-2.js";
 import Users from "lucide-react/dist/esm/icons/users.js";
+import Link2 from "lucide-react/dist/esm/icons/link-2.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
 import BadgeDollarSign from "lucide-react/dist/esm/icons/badge-dollar-sign.js";
 import { AppShell } from "@/components/AppShell";
@@ -110,6 +111,32 @@ export default function App() {
       setVmTerminal(identity.terminal);
     }
   }, [fwd.status]);
+
+  // Switching accounts swaps the bound outbound line and virtual device on
+  // the backend; follow those values. Unsaved typing is untouched because
+  // these only change after a save or a switch.
+  useEffect(() => {
+    if (!fwd.status || !hydrated.current) return;
+    setOutboundProxy(fwd.status.outboundProxy ?? "");
+    setMihomoSubscription(fwd.status.mihomoSubscription ?? "");
+    setMihomoNode(fwd.status.mihomoNode ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fwd.status?.outboundProxy, fwd.status?.mihomoSubscription, fwd.status?.mihomoNode]);
+
+  useEffect(() => {
+    const identity = fwd.status?.vmIdentity;
+    if (!identity || !hydrated.current) return;
+    applyVmDraft(identity);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fwd.status?.vmIdentity?.installationId, fwd.status?.vmIdentity?.userAgent]);
+
+  const activeAccount = fwd.accounts.find((account) => account.active);
+  const bindingNote = activeAccount ? (
+    <p className="binding-note">
+      <Link2 size={12} aria-hidden="true" />
+      以下设置绑定到账号 <strong>{accountName(activeAccount)}</strong>，切换账号时会自动换成该账号自己的设置。
+    </p>
+  ) : null;
 
   function selectTab(next: TabId, focus = false) {
     setTab(next);
@@ -338,6 +365,7 @@ export default function App() {
           <header>
             <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站网络</h2><p>获取 Token 与业务发送共用这一条出站线路</p></div></div>
           </header>
+          {bindingNote}
           <div className="proxy-mode" role="group" aria-label="出站代理模式">
             <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "manual")}><Network size={14} />手动代理</button>
             <button type="button" aria-pressed={fwd.status.outboundMode === "mihomo"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveMihomo(mihomoSubscription, mihomoNode)}><Waypoints size={14} />订阅节点</button>
@@ -628,6 +656,7 @@ export default function App() {
             </div>
             <span className="vm-identity__id">Installation {fwd.status.vmIdentity?.installationId ?? "—"}</span>
           </header>
+          {bindingNote}
           <div className="vm-identity__grid">
             <label className="field">
               <span>CLI 版本</span>

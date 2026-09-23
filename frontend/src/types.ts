@@ -386,4 +386,8 @@ export interface SavedAccount {
   active: boolean;
   addedAt: string;
   lastUsedAt?: string | null;
+  /** Installation id of the account's own virtual device. */
+  deviceId?: string | null;
+  /** The account's outbound line, e.g. "手动代理 · socks5://host:port". */
+  network?: string | null;
 }
