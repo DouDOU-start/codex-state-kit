@@ -265,13 +265,6 @@ fn capture_fetched_ticket(
         && !store.needs_refresh(model)
 }
 
-fn degraded_response_model<'a>(
-    request_model: Option<&'a str>,
-    upstream_token: Option<&str>,
-) -> Option<&'a str> {
-    request_model.filter(|_| upstream_token.is_some_and(turn_state::is_degraded_token))
-}
-
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -303,8 +296,6 @@ pub struct Status {
     pub fetch_error: Option<String>,
     pub fetch_ok_at: Option<String>,
     pub turn_state: TurnStateView,
-    pub degraded: bool,
-    pub degraded_at: Option<String>,
     pub logs: Vec<LogEntry>,
     pub account_traffic: AccountTraffic,
     pub current_account_id: Option<String>,
@@ -353,9 +344,6 @@ pub struct App {
     turn_state: Mutex<TurnStateStore>,
     http: Mutex<PooledUpstream>,
     fetch_http: Mutex<Option<PooledUpstream>>,
-    degraded: AtomicBool,
-    degraded_at: Mutex<Option<String>>,
-    pub degrade_notify: Notify,
     pub sidecar_wake: Notify,
     /// 新模型被发现时通知 fetch 循环立即唤醒
     model_notify: Notify,
@@ -438,9 +426,6 @@ impl App {
             turn_state: Mutex::new(turn_state),
             http: Mutex::new(http),
             fetch_http: Mutex::new(None),
-            degraded: AtomicBool::new(false),
-            degraded_at: Mutex::new(None),
-            degrade_notify: Notify::new(),
             sidecar_wake: Notify::new(),
             model_notify: Notify::new(),
             seeds_registered: AtomicBool::new(false),
@@ -562,19 +547,15 @@ impl App {
         let _ = self.sync_request_identity(Path::new(&home)).await;
     }
 
-    /// 业务响应只作观测。292 且模型一致时不续票；312 或完整响应模型不符时，
-    /// 仅作废这次注入、且仍在池里的那张票。后到的旧响应不能删掉更新的票。
-    async fn observe_business_response(
+    /// 完整响应的模型与请求不符时，仅作废这次注入、且仍在池里的那张票。
+    /// 后到的旧响应不能删掉更新的票。
+    async fn drop_mismatched_ticket(
         &self,
         model: &str,
         injected_token: Option<&str>,
-        returned_is_degraded: bool,
-        upstream_model: Option<&str>,
-        completed: bool,
+        upstream_model: &str,
     ) {
-        let model_mismatch =
-            completed && upstream_model.is_some_and(|actual| !actual.is_empty() && actual != model);
-        if !returned_is_degraded && !model_mismatch {
+        if upstream_model.is_empty() || upstream_model == model {
             return;
         }
         let Some(injected_token) = injected_token
@@ -583,25 +564,14 @@ impl App {
         else {
             return;
         };
-        let cleared = {
-            let mut store = self.turn_state.lock().await;
-            if store.peek_for_model(model).as_deref() != Some(injected_token) {
-                false
-            } else {
-                store.invalidate_model(model);
-                true
-            }
-        };
-        if !cleared {
-            return;
+        let mut store = self.turn_state.lock().await;
+        if store.peek_for_model(model).as_deref() == Some(injected_token) {
+            store.invalidate_model(model);
+            drop(store);
+            debug_log(&format!(
+                "[mismatch] [{model}] 上游响应模型为 {upstream_model}，作废当前凭据包并等待重采"
+            ));
         }
-        debug_log(&format!(
-            "[degraded] [{model}] 业务响应不合格，作废当前凭据包并等待重采"
-        ));
-        self.degraded.store(true, Ordering::Relaxed);
-        *self.degraded_at.lock().await =
-            Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-        self.degrade_notify.notify_one();
     }
 
     pub async fn status(&self) -> Status {
@@ -638,8 +608,6 @@ impl App {
             fetch_error: self.fetch_error.lock().await.clone(),
             fetch_ok_at: self.fetch_ok_at.lock().await.clone(),
             turn_state: self.turn_state.lock().await.view(),
-            degraded: self.degraded.load(Ordering::Relaxed),
-            degraded_at: self.degraded_at.lock().await.clone(),
             logs,
             account_traffic,
             current_account_id: account,
@@ -769,7 +737,6 @@ impl App {
         self.fetch_change_notify.notify_waiters();
         drop(_gate);
         drop(_transition);
-        self.degrade_notify.notify_one();
         self.status().await
     }
 
@@ -787,7 +754,6 @@ impl App {
         self.fetch_change_notify.notify_waiters();
         drop(_gate);
         drop(_transition);
-        self.degrade_notify.notify_one();
         self.status().await
     }
 
@@ -1347,13 +1313,6 @@ impl App {
                     eprintln!("[seed] 跨模型复用指定取票模型: {}", model);
                 }
             }
-        }
-
-        // 312 降智信号 → 清池（所有模型的 token，但保留追踪）
-        if self.degraded.swap(false, Ordering::Relaxed) {
-            eprintln!("312 降智 / 服务端拒绝信号，清池重打 292（所有模型）");
-            self.turn_state.lock().await.invalidate_all();
-            *self.degraded_at.lock().await = None;
         }
 
         // 获取所有活跃模型（最近 60 分钟内有请求的），检查哪些需要刷新。
@@ -1942,8 +1901,6 @@ impl ProxyHandle {
             }
             *self.app.fetch_error.lock().await = None;
             *self.app.fetch_ok_at.lock().await = None;
-            self.app.degraded.store(false, Ordering::Relaxed);
-            *self.app.degraded_at.lock().await = None;
             if route_changed && next.outbound_mode != OutboundMode::Mihomo {
                 self.app.mihomo.stop().await;
             }
@@ -2561,13 +2518,7 @@ impl ResponseLogTracker {
         }
         self.mismatch_noted = true;
         self.app
-            .observe_business_response(
-                &requested,
-                self.injected_token.as_deref(),
-                false,
-                Some(&upstream),
-                true,
-            )
+            .drop_mismatched_ticket(&requested, self.injected_token.as_deref(), &upstream)
             .await;
     }
 
@@ -3862,7 +3813,7 @@ mod tests {
                 .as_deref()
                 == Some(current_ticket.as_str())
         );
-        app.observe_business_response("gpt-6-astra", Some(&current_ticket), true, None, false)
+        app.drop_mismatched_ticket("gpt-6-astra", Some(&current_ticket), "gpt-5.6-luna")
             .await;
         assert!(app
             .turn_state
@@ -3975,22 +3926,6 @@ mod tests {
             classify_fetch_failure(&NetworkLogDetails::default()),
             FetchRetryClass::Normal
         );
-    }
-
-    #[test]
-    fn degraded_response_requires_a_model_and_degraded_length_ticket() {
-        let degraded = format!("gAAAAA{}", "x".repeat(turn_state::DEGRADED_TOKEN_LEN - 6));
-        let quality = format!("gAAAAA{}", "x".repeat(turn_state::QUALITY_TOKEN_LEN - 6));
-        assert_eq!(
-            degraded_response_model(Some("gpt-6-astra"), Some(&degraded)),
-            Some("gpt-6-astra")
-        );
-        assert_eq!(
-            degraded_response_model(Some("gpt-6-astra"), Some(&quality)),
-            None
-        );
-        assert_eq!(degraded_response_model(None, Some(&degraded)), None);
-        assert_eq!(degraded_response_model(Some("gpt-6-astra"), None), None);
     }
 
     #[test]

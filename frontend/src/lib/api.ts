@@ -74,8 +74,6 @@ const defaultStatus = (): Status => ({
   fetchError: null,
   fetchOkAt: null,
   turnState: emptyTurnState(),
-  degraded: false,
-  degradedAt: null,
   vmIdentity: {
     installationId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     sessionId: "11111111-2222-4333-8444-555555555555",

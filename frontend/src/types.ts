@@ -129,8 +129,6 @@ export interface Status {
   fetchError?: string | null;
   fetchOkAt?: string | null;
   turnState: TurnStateView;
-  degraded: boolean;
-  degradedAt?: string | null;
   logs: LogEntry[];
   vmIdentity: VmIdentityView;
   wsUpstreamEnabled: boolean;

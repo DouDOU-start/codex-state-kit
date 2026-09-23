@@ -472,9 +472,9 @@ async fn policy_hot_switch_preserves_source_cache_and_survives_restart() {
 }
 
 #[tokio::test]
-async fn degraded_business_response_invalidates_current_shared_ticket() {
+async fn mismatched_business_response_invalidates_current_shared_ticket() {
     if !isolated_child(
-        "proxy::token_reuse_tests::degraded_business_response_invalidates_current_shared_ticket",
+        "proxy::token_reuse_tests::mismatched_business_response_invalidates_current_shared_ticket",
     ) {
         return;
     }
@@ -487,34 +487,31 @@ async fn degraded_business_response_invalidates_current_shared_ticket() {
     .unwrap();
     let fresh = ticket(0);
     app.turn_state.lock().await.capture("a", &fresh, "fetch");
-    app.observe_business_response("a", Some(&fresh), true, None, false)
+    app.drop_mismatched_ticket("a", Some(&fresh), "other-model")
         .await;
     assert!(app.turn_state.lock().await.peek_for_model("a").is_none());
     assert!(app.turn_state.lock().await.needs_refresh("a"));
-    assert!(app.degraded.load(Ordering::Relaxed));
 
+    // A matching model keeps the ticket.
     let echoed = ticket(40);
     app.turn_state.lock().await.capture("a", &echoed, "fetch");
-    app.degraded.store(false, Ordering::Relaxed);
-    app.observe_business_response("a", Some(&echoed), false, Some("a"), true)
-        .await;
+    app.drop_mismatched_ticket("a", Some(&echoed), "a").await;
     assert_eq!(
         app.turn_state.lock().await.peek_for_model("a").as_deref(),
         Some(echoed.as_str())
     );
-    assert!(app.turn_state.lock().await.needs_refresh("a"));
-    assert!(!app.degraded.load(Ordering::Relaxed));
 
+    // A late response for an older ticket does not drop the newer one.
     let newer = ticket(1);
     app.turn_state.lock().await.capture("a", &newer, "fetch");
-    app.observe_business_response("a", Some(&echoed), true, None, false)
+    app.drop_mismatched_ticket("a", Some(&echoed), "other-model")
         .await;
     assert_eq!(
         app.turn_state.lock().await.peek_for_model("a").as_deref(),
         Some(newer.as_str())
     );
 
-    app.observe_business_response("a", Some(&newer), false, Some("other-model"), true)
+    app.drop_mismatched_ticket("a", Some(&newer), "other-model")
         .await;
     assert!(app.turn_state.lock().await.peek_for_model("a").is_none());
     assert!(app.turn_state.lock().await.needs_refresh("a"));

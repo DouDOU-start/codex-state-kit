@@ -40,11 +40,6 @@ function delayText(sample?: LatencySample | null): string | null {
   return sample.error || "超时";
 }
 
-function degradeChip(status: Status) {
-  if (!status.degraded) return null;
-  return { label: "312 降智", className: "runtime-chip runtime-chip--down" };
-}
-
 type TabId = "overview" | "records" | "pricing" | "network" | "account" | "device";
 
 const TABS: { id: TabId; label: string; Icon: typeof Activity }[] = [
@@ -100,12 +95,6 @@ export default function App() {
   useNotice("mihomo-error", mihomoError, () => ({ kind: "error", title: "订阅节点异常", message: mihomoError }));
   const relayError = fwd.status?.outboundMode === "manual" ? fwd.status?.systemProxy?.lastError ?? null : null;
   useNotice("system-proxy-error", relayError, () => ({ kind: "warn", title: "连接代理服务器失败", message: relayError }));
-  const degradedKey = fwd.status?.degraded ? fwd.status.degradedAt ?? "degraded" : null;
-  useNotice("degraded", degradedKey, () => ({
-    kind: "warn",
-    title: "检测到 312 降智信号",
-    message: fwd.status?.degradedAt ? `出现时间：${fwd.status.degradedAt}` : "上游返回了降智信号，Kit 正在重新获取 Token。",
-  }));
   const lastDowngrade = fwd.status?.lastDowngrade ?? null;
   useNotice("downgrade", lastDowngrade?.requestId ?? null, () => {
     const event = lastDowngrade!;
@@ -226,7 +215,6 @@ export default function App() {
   }
 
   const loggedIn = Boolean(fwd.login?.loggedIn);
-  const degrade = degradeChip(fwd.status);
   const tabAlert: Partial<Record<TabId, string>> = {
     network: fwd.status.proxyError || fwd.status.mihomo?.error ? "出站网络异常" : undefined,
     account: loggedIn ? undefined : "尚未登录",
@@ -285,12 +273,6 @@ export default function App() {
               <i />
               {chipLabel(fwd.status)}
             </span>
-            {degrade ? (
-              <span className={degrade.className}>
-                <i />
-                {degrade.label}
-              </span>
-            ) : null}
           </div>
         </div>
 
