@@ -1760,10 +1760,10 @@ impl ProxyHandle {
         let old = self.app.settings.lock().await.clone();
         let next_business = resolved_proxy(&next, &self.app.mihomo);
         let next_http = if resolved_proxy(&old, &self.app.mihomo) != next_business {
-                Some(pooled_upstream(business_proxy_key(&next_business, None)?)?)
-            } else {
-                None
-            };
+            Some(pooled_upstream(business_proxy_key(&next_business, None)?)?)
+        } else {
+            None
+        };
         if old.codex_home != next.codex_home {
             attach::validate_codex_home(Path::new(&next.codex_home))?;
         }
@@ -2727,8 +2727,7 @@ async fn forward_http_tracked(
     };
     let effective_proxy = fetch::outbound_proxy_for_client(&upstream_proxy);
     *details = business_network_details(&request_settings, &upstream, &effective_proxy);
-    if request_settings.outbound_mode == OutboundMode::Mihomo && upstream_proxy.trim().is_empty()
-    {
+    if request_settings.outbound_mode == OutboundMode::Mihomo && upstream_proxy.trim().is_empty() {
         anyhow::bail!(
             "{}",
             app.mihomo
@@ -3007,10 +3006,7 @@ async fn forward_http_tracked(
         .into(),
     );
 
-    eprintln!(
-        "[resp] {} {} → {}",
-        parts.method, path, resp_status_u16
-    );
+    eprintln!("[resp] {} {} → {}", parts.method, path, resp_status_u16);
 
     let status = StatusCode::from_u16(resp_status_u16)?;
     let mut headers = HeaderMap::new();
@@ -3111,10 +3107,7 @@ fn ws_dial(
     ];
     let model = model.trim();
     if !model.is_empty() && !model.chars().any(char::is_control) {
-        extra_headers.push((
-            "x-codex-routing-hint".into(),
-            identity.routing_hint(model),
-        ));
+        extra_headers.push(("x-codex-routing-hint".into(), identity.routing_hint(model)));
     }
     Ok(WsDial {
         url,
@@ -4117,8 +4110,7 @@ mod tests {
 
     #[tokio::test]
     async fn business_forward_replaces_client_identity() {
-        let (sent, mut received) =
-            tokio::sync::mpsc::unbounded_channel::<(HeaderMap, Vec<u8>)>();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<(HeaderMap, Vec<u8>)>();
         let upstream = axum::Router::new().fallback(move |req: Request<Body>| {
             let sent = sent.clone();
             async move {
@@ -4244,7 +4236,10 @@ mod tests {
             identity.installation_id
         );
         assert_eq!(frame["client_metadata"]["session_id"], identity.session_id);
-        assert_eq!(frame["client_metadata"]["x-codex-window-id"], identity.window_id);
+        assert_eq!(
+            frame["client_metadata"]["x-codex-window-id"],
+            identity.window_id
+        );
         assert_eq!(frame["client_metadata"]["thread_id"], "keep");
         assert_eq!(frame["client_metadata"]["turn_id"], "turn");
     }

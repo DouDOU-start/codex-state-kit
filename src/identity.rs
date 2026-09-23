@@ -113,7 +113,12 @@ impl VmIdentity {
     pub fn user_agent(&self) -> String {
         format!(
             "{}/{} ({} {}; {}) {}",
-            self.originator, self.cli_version, self.os_type, self.os_version, self.arch, self.terminal
+            self.originator,
+            self.cli_version,
+            self.os_type,
+            self.os_version,
+            self.arch,
+            self.terminal
         )
     }
 
@@ -298,9 +303,16 @@ fn parse_cli_version(text: &str) -> Option<String> {
     (!version.is_empty()).then_some(version)
 }
 
-fn decode_body(bytes: &[u8], encoding: Option<&str>) -> Result<(Vec<u8>, Option<&'static str>), String> {
+fn decode_body(
+    bytes: &[u8],
+    encoding: Option<&str>,
+) -> Result<(Vec<u8>, Option<&'static str>), String> {
     let hinted = encoding.unwrap_or("").trim().to_ascii_lowercase();
-    if bytes.len() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xB5 && bytes[2] == 0x2F && bytes[3] == 0xFD
+    if bytes.len() >= 4
+        && bytes[0] == 0x28
+        && bytes[1] == 0xB5
+        && bytes[2] == 0x2F
+        && bytes[3] == 0xFD
         || hinted == "zstd"
     {
         let plain = zstd::decode_all(std::io::Cursor::new(bytes))
@@ -335,7 +347,8 @@ fn compress_gzip(bytes: &[u8]) -> Result<Vec<u8>, String> {
 
 fn compress_deflate(bytes: &[u8]) -> Result<Vec<u8>, String> {
     use std::io::Write;
-    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
     encoder
         .write_all(bytes)
         .and_then(|_| encoder.finish())
@@ -379,7 +392,8 @@ fn normalize_arch(raw: &str) -> Result<String> {
 
 fn normalize_token(raw: &str, label: &str, max: usize) -> Result<String> {
     let value = raw.trim();
-    if value.is_empty() || value.len() > max || value.chars().any(|ch| ch.is_control() || ch == ' ') {
+    if value.is_empty() || value.len() > max || value.chars().any(|ch| ch.is_control() || ch == ' ')
+    {
         bail!("{label}无效");
     }
     if !value
@@ -445,7 +459,10 @@ mod tests {
             value["client_metadata"]["x-codex-installation-id"],
             json!(identity.installation_id)
         );
-        assert_eq!(value["client_metadata"]["session_id"], json!(identity.session_id));
+        assert_eq!(
+            value["client_metadata"]["session_id"],
+            json!(identity.session_id)
+        );
         assert_eq!(value["client_metadata"]["thread_id"], json!("thread-1"));
         assert_eq!(value["client_metadata"]["turn_id"], json!("turn-1"));
         assert_eq!(value["model"], json!("m"));
@@ -500,7 +517,10 @@ mod tests {
 
     #[test]
     fn parses_codex_version_output() {
-        assert_eq!(parse_cli_version("codex 0.160.0\n").as_deref(), Some("0.160.0"));
+        assert_eq!(
+            parse_cli_version("codex 0.160.0\n").as_deref(),
+            Some("0.160.0")
+        );
         assert_eq!(parse_cli_version("no version").as_deref(), None);
     }
 }

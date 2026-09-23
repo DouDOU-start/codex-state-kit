@@ -73,9 +73,7 @@ pub fn ensure_turn_state(frame: &mut Value, token: &str) {
     let Some(object) = frame.as_object_mut() else {
         return;
     };
-    let metadata = object
-        .entry("client_metadata")
-        .or_insert_with(|| json!({}));
+    let metadata = object.entry("client_metadata").or_insert_with(|| json!({}));
     let Some(metadata) = metadata.as_object_mut() else {
         return;
     };
@@ -187,7 +185,10 @@ mod tests {
         ensure_turn_state(&mut frame, "ticket");
         ensure_turn_state(&mut frame, "other");
         assert_eq!(frame["model"], json!("forced"));
-        assert_eq!(frame["client_metadata"][turn_state::HEADER_NAME], json!("ticket"));
+        assert_eq!(
+            frame["client_metadata"][turn_state::HEADER_NAME],
+            json!("ticket")
+        );
     }
 
     #[test]
@@ -197,7 +198,9 @@ mod tests {
         assert!(is_terminal_event(r#"{"type":"response.completed"}"#));
         assert!(is_terminal_event(r#"{"type":"response.failed"}"#));
         assert!(is_terminal_event(r#"{"type":"error"}"#));
-        assert!(!is_terminal_event(r#"{"type":"response.output_text.delta"}"#));
+        assert!(!is_terminal_event(
+            r#"{"type":"response.output_text.delta"}"#
+        ));
         assert_eq!(
             ws_error_code(
                 r#"{"type":"error","error":{"code":"websocket_connection_limit_reached"}}"#

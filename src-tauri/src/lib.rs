@@ -33,10 +33,9 @@ pub fn run() {
             }
             mihomo_data.push("mihomo");
             let state = AppState::initialize(MihomoPaths {
-                    bundled_binary: mihomo_binary,
-                    data_dir: mihomo_data,
-                },
-            )
+                bundled_binary: mihomo_binary,
+                data_dir: mihomo_data,
+            })
             .map_err(|err| err.to_string())?;
             state.start_runtime();
             app.manage(state);
