@@ -273,43 +273,56 @@ async fn codex_home(state: &AppState, home: Option<String>) -> PathBuf {
 /// Saved ChatGPT accounts; the live Kit login is imported on first call.
 #[tauri::command(async)]
 pub async fn list_accounts(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     home: Option<String>,
 ) -> CommandResult<Vec<AccountView>> {
     let home = codex_home(&state, home).await;
-    command(accounts::list(&home))
+    let list = command(accounts::list(&home))?;
+    // A new login may have just been saved: keep the tray menu in sync.
+    crate::tray::update(&app, &list);
+    Ok(list)
 }
 
 /// Switches Kit to a saved account. Forwarded requests use it right away.
 #[tauri::command(async)]
 pub async fn switch_account(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     home: Option<String>,
     account_id: String,
 ) -> CommandResult<LoginStatus> {
     let home = codex_home(&state, home).await;
-    command(accounts::switch(&home, &account_id))
+    let status = command(accounts::switch(&home, &account_id))?;
+    crate::tray::refresh(&app).await;
+    Ok(status)
 }
 
 #[tauri::command(async)]
 pub async fn remove_account(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     home: Option<String>,
     account_id: String,
 ) -> CommandResult<()> {
     let home = codex_home(&state, home).await;
-    command(accounts::remove(&home, &account_id))
+    command(accounts::remove(&home, &account_id))?;
+    crate::tray::refresh(&app).await;
+    Ok(())
 }
 
 #[tauri::command(async)]
 pub async fn rename_account(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     home: Option<String>,
     account_id: String,
     label: String,
 ) -> CommandResult<()> {
     let home = codex_home(&state, home).await;
-    command(accounts::rename(&home, &account_id, &label))
+    command(accounts::rename(&home, &account_id, &label))?;
+    crate::tray::refresh(&app).await;
+    Ok(())
 }
 
 #[tauri::command(async)]

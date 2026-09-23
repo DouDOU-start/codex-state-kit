@@ -20,6 +20,7 @@ import {
   regenerateVmInstallationId,
   detectVmCliVersion,
   listAccounts,
+  onAccountsChanged,
   removeAccount,
   renameAccount,
   switchAccount,
@@ -135,6 +136,25 @@ export function useCodexStateKit() {
     if (!codexHome) return;
     void loadAccounts();
   }, [loadAccounts, codexHome, login?.accountId]);
+
+  // The tray menu can switch accounts while the window is open.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void onAccountsChanged((payload) => {
+      setBanner({ kind: payload.ok ? "ok" : "error", text: payload.message });
+      void loadAccounts();
+      if (codexHome) void loadLogin(codexHome);
+      void loadStatus(true);
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [codexHome, loadAccounts, loadLogin, loadStatus]);
 
   const switchToAccount = useCallback(async (accountId: string) => {
     setBusy("login");

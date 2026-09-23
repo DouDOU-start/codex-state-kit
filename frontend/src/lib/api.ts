@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   ActionResult,
   CodexConfigView,
@@ -600,6 +601,7 @@ const mockBillingRecords: BillingRecord[] = [
     outputCostNanos: 10_240_000,
     costNanos: 17_612_800,
     firstTokenMs: 1_840,
+    transport: "http_sse",
     currency: "USD",
   },
   {
@@ -632,6 +634,7 @@ const mockBillingRecords: BillingRecord[] = [
     requestedModel: "gpt-6-astra",
     sentModel: "gpt-6-astra",
     responseModel: "gpt-6-astra",
+    transport: "http_to_ws",
     inputTokens: 1_420,
     cachedInputTokens: 0,
     cacheWriteTokens: 0,
@@ -668,7 +671,8 @@ for (let index = 0; index < 70; index += 1) {
     httpStatus: 200,
     requestedModel: "gpt-5.1-codex",
     sentModel: "gpt-5.1-codex",
-    responseModel: "gpt-5.1-codex",
+    responseModel: index % 5 === 3 ? "gpt-5.1-codex-mini" : "gpt-5.1-codex-2025-11-13",
+    transport: index % 2 ? "ws_to_ws" : "http_sse",
     inputTokens: 12_000,
     cachedInputTokens: 10_000,
     cacheWriteTokens: 0,
@@ -865,4 +869,15 @@ export async function renameAccount(accountId: string, label: string, home?: str
   const account = mockAccounts.find((item) => item.accountId === accountId);
   if (!account) throw new Error("账号不存在");
   account.label = label.trim() || null;
+}
+
+export interface AccountsChanged {
+  ok: boolean;
+  message: string;
+}
+
+/** Fired when the tray menu switched accounts. Returns an unsubscribe function. */
+export async function onAccountsChanged(handler: (payload: AccountsChanged) => void): Promise<() => void> {
+  if (!isTauri) return () => {};
+  return listen<AccountsChanged>("accounts-changed", (event) => handler(event.payload));
 }
