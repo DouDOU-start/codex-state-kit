@@ -2,6 +2,7 @@ mod commands;
 mod error;
 mod state;
 mod tray;
+mod window_shape;
 
 use tauri::{Manager, RunEvent};
 
@@ -50,6 +51,9 @@ pub fn run() {
             .map_err(|err| err.to_string())?;
             state.start_runtime();
             app.manage(state);
+            if let Some(window) = app.get_webview_window("main") {
+                window_shape::round_corners(&window);
+            }
             if let Err(error) = tray::create(app.handle()) {
                 // The tray is a convenience: never block startup on it.
                 eprintln!("[tray] 创建托盘失败: {error}");
