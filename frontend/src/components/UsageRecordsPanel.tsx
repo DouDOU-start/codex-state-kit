@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Check from "lucide-react/dist/esm/icons/check.js";
+import ChevronLeft from "lucide-react/dist/esm/icons/chevron-left.js";
+import ChevronRight from "lucide-react/dist/esm/icons/chevron-right.js";
 import Copy from "lucide-react/dist/esm/icons/copy.js";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import Route from "lucide-react/dist/esm/icons/route.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
-import { getBillingRecords, isTauri } from "@/lib/api";
+import { getBillingRecords, getBillingSummary, isTauri } from "@/lib/api";
 import type { BillingRecord, LogEntry, Status } from "@/types";
 
 interface UsageRecordsPanelProps {
@@ -12,6 +14,8 @@ interface UsageRecordsPanelProps {
   active: boolean;
   status: Status;
 }
+
+const PAGE_SIZE = 50;
 
 function formatMoney(costNanos: number | null | undefined): string {
   if (costNanos == null) return "未定价";
@@ -88,32 +92,67 @@ function latencyClass(ms: number | null | undefined): string {
 export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
   const [loading, setLoading] = useState(false);
   const [records, setRecords] = useState<BillingRecord[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
+  const [accounts, setAccounts] = useState<[string, string][]>([]);
+  /** 空字符串表示全部账号。 */
   const [accountId, setAccountId] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
+  const accountChosen = useRef(false);
+  const requestSeq = useRef(0);
+  const tableRef = useRef<HTMLDivElement>(null);
 
-  const load = useCallback(async () => {
+  const loadPage = useCallback(async (account: string, pageIndex: number) => {
+    const seq = ++requestSeq.current;
     setLoading(true);
     try {
-      const page = await getBillingRecords({ limit: 200, offset: 0 });
-      setRecords(page.records);
-      setError(null);
-      setAccountId((current) => {
-        if (current && page.records.some((record) => record.accountId === current)) return current;
-        return status.currentAccountId && page.records.some((record) => record.accountId === status.currentAccountId)
-          ? status.currentAccountId
-          : page.records[0]?.accountId ?? "";
+      const result = await getBillingRecords({
+        accountId: account || null,
+        limit: PAGE_SIZE,
+        offset: pageIndex * PAGE_SIZE,
       });
+      if (seq !== requestSeq.current) return;
+      const lastPage = Math.max(0, Math.ceil(result.total / PAGE_SIZE) - 1);
+      if (pageIndex > lastPage) {
+        // 记录变少（例如切换账号）后当前页已不存在，回到最后一页。
+        setPage(lastPage);
+        return;
+      }
+      setRecords(result.records);
+      setTotal(result.total);
+      tableRef.current?.scrollTo({ top: 0 });
+      setError(null);
+    } catch (cause) {
+      if (seq === requestSeq.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (seq === requestSeq.current) setLoading(false);
+    }
+  }, []);
+
+  const loadAccounts = useCallback(async () => {
+    try {
+      const summary = await getBillingSummary();
+      const list = summary.accounts.map((account): [string, string] => [account.accountId, account.email || account.accountId]);
+      setAccounts(list);
+      if (!accountChosen.current) {
+        accountChosen.current = true;
+        // 默认看当前登录账号；它还没有记录时看全部账号。
+        const current = status.currentAccountId;
+        if (current && list.some(([id]) => id === current)) setAccountId(current);
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setLoading(false);
     }
   }, [status.currentAccountId]);
 
   useEffect(() => {
-    if (active) void load();
-  }, [active, load]);
+    if (active) void loadAccounts();
+  }, [active, loadAccounts]);
+
+  useEffect(() => {
+    if (active) void loadPage(accountId, page);
+  }, [active, accountId, page, loadPage]);
 
   useEffect(() => {
     if (copyState === "idle") return;
@@ -121,13 +160,13 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
     return () => window.clearTimeout(timer);
   }, [copyState]);
 
-  const accounts = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const record of records) map.set(record.accountId, record.email || record.accountId);
-    return [...map.entries()];
-  }, [records]);
+  const refresh = () => {
+    void loadAccounts();
+    void loadPage(accountId, page);
+  };
 
-  const visible = records.filter((record) => !accountId || record.accountId === accountId);
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const visible = records;
 
   const copyRows = async () => {
     const text = visible.map((record) => {
@@ -164,30 +203,38 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
           <span className="section-icon"><ScrollText size={19} /></span>
           <div>
             <h2>使用记录</h2>
-            <p>{visible.length} 条{!isTauri ? " · 浏览器示例" : ""}</p>
+            <p>共 {total} 条{!isTauri ? " · 浏览器示例" : ""}</p>
           </div>
         </div>
         <div className="usage-records__actions">
-          <button className="billing-panel__refresh" type="button" disabled={loading} onClick={() => void load()}>
+          <button className="billing-panel__refresh" type="button" disabled={loading} onClick={refresh}>
             <RefreshCw size={13} className={loading ? "is-spinning" : undefined} />
             {loading ? "读取中" : "刷新"}
           </button>
           <button className="billing-panel__refresh" type="button" disabled={!visible.length} onClick={() => void copyRows()}>
             {copyState === "done" ? <Check size={13} /> : <Copy size={13} />}
-            {copyState === "done" ? "已复制" : copyState === "error" ? "复制失败" : "复制记录"}
+            {copyState === "done" ? "已复制" : copyState === "error" ? "复制失败" : "复制本页"}
           </button>
         </div>
       </header>
       <div className="usage-record-filter">
         <label>账号
-          <select aria-label="筛选账号" value={accountId} onChange={(event) => setAccountId(event.target.value)}>
-            {!accounts.length ? <option value="">暂无账号</option> : null}
+          <select
+            aria-label="筛选账号"
+            value={accountId}
+            onChange={(event) => {
+              accountChosen.current = true;
+              setAccountId(event.target.value);
+              setPage(0);
+            }}
+          >
+            <option value="">全部账号</option>
             {accounts.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
           </select>
         </label>
         {error ? <span className="usage-record-error">{error}</span> : <span>按请求开始时间排列</span>}
       </div>
-      <div className="usage-records__table">
+      <div className="usage-records__table" ref={tableRef}>
         {visible.length ? (
           <table className="usage-table">
             <thead>
@@ -253,6 +300,19 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
           </div>
         )}
       </div>
+      {total > PAGE_SIZE ? (
+        <nav className="usage-records__pager" aria-label="使用记录分页">
+          <span>第 {page + 1} / {pageCount} 页 · 共 {total} 条</span>
+          <div>
+            <button className="billing-panel__refresh" type="button" disabled={loading || page === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}>
+              <ChevronLeft size={13} />上一页
+            </button>
+            <button className="billing-panel__refresh" type="button" disabled={loading || page + 1 >= pageCount} onClick={() => setPage((current) => current + 1)}>
+              下一页<ChevronRight size={13} />
+            </button>
+          </div>
+        </nav>
+      ) : null}
     </div>
   );
 }

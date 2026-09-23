@@ -649,6 +649,41 @@ const mockBillingRecords: BillingRecord[] = [
   },
 ];
 
+// 旧账号的历史记录，用于在浏览器预览里演示分页。
+for (let index = 0; index < 70; index += 1) {
+  const startedAt = Date.now() - 86_400_000 * 2 - index * 3_600_000;
+  mockBillingRecords.push({
+    requestId: `mock-history-${index}`,
+    provider: "chatgpt",
+    accountId: "mock-account-a",
+    email: "previous@example.com",
+    source: "business",
+    startedAt: new Date(startedAt).toISOString(),
+    finishedAt: new Date(startedAt + 8_000).toISOString(),
+    state: "measured",
+    httpStatus: 200,
+    requestedModel: "gpt-5.1-codex",
+    sentModel: "gpt-5.1-codex",
+    responseModel: "gpt-5.1-codex",
+    inputTokens: 12_000,
+    cachedInputTokens: 10_000,
+    cacheWriteTokens: 0,
+    outputTokens: 800,
+    reasoningTokens: 300,
+    usageSource: "provider_response",
+    pricingRuleId: null,
+    pricingModel: "gpt-5.1-codex",
+    serviceTier: "standard",
+    longContext: false,
+    inputCostNanos: 2_500_000,
+    cacheReadCostNanos: 1_250_000,
+    cacheWriteCostNanos: 0,
+    outputCostNanos: 8_000_000,
+    costNanos: 11_750_000,
+    currency: "USD",
+  });
+}
+
 function cloneBillingSummary(summary: BillingSummary): BillingSummary {
   return {
     ...summary,

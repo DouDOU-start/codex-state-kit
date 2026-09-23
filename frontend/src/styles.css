@@ -286,6 +286,8 @@ svg { flex-shrink: 0; }
 .usage-records__header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 16px 16px 14px; border-bottom: 1px solid var(--line); }
 .usage-records__actions { display: flex; align-items: center; gap: 7px; }
 .usage-records__table { max-height: max(320px, calc(100vh - 330px)); overflow: auto; background: #fff; }
+.usage-records__pager { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; }
+.usage-records__pager > div { display: flex; gap: 7px; }
 .usage-records__empty { display: grid; min-height: 250px; place-content: center; justify-items: center; gap: 7px; color: #8ca0b4; text-align: center; }
 .usage-records__empty strong { color: var(--text-soft); font-size: 12px; font-weight: 600; }
 .usage-records__empty p { margin: 0; color: var(--muted); font-size: 10px; }
