@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use crate::settings::Settings;
 
-const GROUP: &str = "Kit";
+/// The select group Kit writes into the core config; its choice is `mihomo_node`.
+pub const GROUP: &str = "Kit";
 const MAX_PROXIES: usize = 256;
 const MAX_BODY: usize = 2 * 1024 * 1024;
 

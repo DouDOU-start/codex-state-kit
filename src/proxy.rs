@@ -587,15 +587,22 @@ impl ProxyHandle {
         self.app.ws_upstream.invalidate().await;
         let mut next = self.app.settings.lock().await.clone();
         let network = &target.network;
+        // The Kit group's saved choice is the node to start on; older saved
+        // lines may still carry a stale `mihomo_node`.
+        let mihomo_node = network
+            .mihomo_selections
+            .get(crate::mihomo::GROUP)
+            .cloned()
+            .unwrap_or_else(|| network.mihomo_node.clone());
         let network_changed = next.outbound_mode != network.outbound_mode
             || next.outbound_proxy != network.outbound_proxy
             || next.mihomo_subscription != network.mihomo_subscription
-            || next.mihomo_node != network.mihomo_node;
+            || next.mihomo_node != mihomo_node;
         if network_changed {
             next.outbound_mode = network.outbound_mode;
             next.outbound_proxy = network.outbound_proxy.clone();
             next.mihomo_subscription = network.mihomo_subscription.clone();
-            next.mihomo_node = network.mihomo_node.clone();
+            next.mihomo_node = mihomo_node;
             self.apply_settings_to(next).await?;
         }
         if network.outbound_mode == OutboundMode::Mihomo && !network.mihomo_selections.is_empty() {
@@ -636,6 +643,29 @@ impl ProxyHandle {
         if let Err(err) = self.sync_account_environment().await {
             eprintln!("[accounts] 绑定账号环境失败: {err:#}");
         }
+    }
+
+    /// Selects a subscription node and remembers it. The Kit group's choice
+    /// is saved as `mihomo_node`, which the core starts on after a restart;
+    /// before, only the running core changed and a restart fell back to the
+    /// first node.
+    pub async fn select_mihomo_node(&self, group: &str, node: &str) -> Result<()> {
+        self.app.mihomo.select_in_group(group, node).await?;
+        if group == crate::mihomo::GROUP {
+            let _change = self.settings_change.lock().await;
+            let mut settings = self.app.settings.lock().await;
+            if settings.mihomo_node != node {
+                let mut next = settings.clone();
+                next.mihomo_node = node.to_string();
+                save_settings(&next)?;
+                *settings = next;
+            }
+        }
+        // Connections opened through the previous node use the old exit.
+        self.app.ws_upstream.invalidate().await;
+        // The selected node is part of the live account's outbound line.
+        self.remember_account_environment().await;
+        Ok(())
     }
 
     /// Switches the live account and its environment together.
