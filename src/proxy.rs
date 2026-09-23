@@ -140,6 +140,15 @@ fn fetch_failure_escalates(details: &NetworkLogDetails) -> bool {
     !matches!(details.response_status, Some(401 | 429 | 503))
 }
 
+/// 目标长度连续未命中并已打到最大并发时，返回静置时长。429/401/403 不走这条。
+fn length_miss_rest(concurrency: usize, class: FetchRetryClass, escalate: bool) -> Option<Duration> {
+    if escalate && class == FetchRetryClass::Normal && concurrency >= fetch::MAX_FETCH_BURST {
+        Some(fetch::BURST_EXHAUSTED_BACKOFF)
+    } else {
+        None
+    }
+}
+
 impl std::fmt::Display for FetchOnceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
@@ -1032,13 +1041,23 @@ impl App {
                 .await
                 .record_distribution(model, distribution);
         }
-        let err = first_err.unwrap_or_else(|| {
+        let mut err = first_err.unwrap_or_else(|| {
             FetchOnceError::new(format!("[{model}] 本波探测未返回结果"), FetchRetryClass::Normal)
         });
-        if escalate && err.retry != FetchRetryClass::Auth {
-            self.note_burst_miss(&burst_key).await;
+        if let Some(rest) = length_miss_rest(concurrency, err.retry, escalate) {
+            self.fetch_burst_misses.lock().await.remove(&burst_key);
+            self.defer_next_fetch(rest).await;
+            err.message.push_str(&format!(
+                "；已达最大并发 {} 仍未命中，静置 {} 秒后从 1 路重试",
+                fetch::MAX_FETCH_BURST,
+                rest.as_secs()
+            ));
+        } else {
+            if escalate && err.retry != FetchRetryClass::Auth {
+                self.note_burst_miss(&burst_key).await;
+            }
+            self.defer_fetch_failure(model, err.retry).await;
         }
-        self.defer_fetch_failure(model, err.retry).await;
         *self.fetch_error.lock().await = Some(err.message.clone());
         Err(err)
     }
@@ -2978,9 +2997,16 @@ mod tests {
         );
         assert_eq!(fetch_retry_delay(FetchRetryClass::Stale), fetch::RETRY_INTERVAL);
         assert!(fetch::RETRY_INTERVAL >= Duration::from_secs(6));
-        assert_eq!(fetch::MAX_FETCH_BURST, 16);
+        assert_eq!(fetch::MAX_FETCH_BURST, 4);
         assert_eq!(fetch::fetch_burst_concurrency(0), 1);
-        assert_eq!(fetch::fetch_burst_concurrency(4), 16);
+        assert_eq!(fetch::fetch_burst_concurrency(2), 4);
+        assert_eq!(
+            length_miss_rest(4, FetchRetryClass::Normal, true),
+            Some(fetch::BURST_EXHAUSTED_BACKOFF)
+        );
+        assert_eq!(length_miss_rest(2, FetchRetryClass::Normal, true), None);
+        assert_eq!(length_miss_rest(4, FetchRetryClass::Backoff, true), None);
+        assert_eq!(length_miss_rest(4, FetchRetryClass::Normal, false), None);
     }
 
     #[tokio::test]

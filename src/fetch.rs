@@ -24,8 +24,10 @@ pub const FORBIDDEN_BACKOFF: Duration = Duration::from_secs(30);
 pub const AUTH_BACKOFF: Duration = Duration::from_secs(300);
 pub const CONNECT_ATTEMPTS: usize = 4;
 pub const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(6);
-/// 连续打不到时，下一波并发按 1→2→4→8→16 加倍。
-pub const MAX_FETCH_BURST: usize = 16;
+/// 连续打不到时，下一波并发按 1→2→4 加倍。
+pub const MAX_FETCH_BURST: usize = 4;
+/// 已经打到最大并发仍未命中目标长度时，静置后再从 1 路开始。
+pub const BURST_EXHAUSTED_BACKOFF: Duration = Duration::from_secs(60);
 
 pub fn fetch_burst_concurrency(miss_streak: u32) -> usize {
     1usize << miss_streak.min(MAX_FETCH_BURST.ilog2())
@@ -1268,13 +1270,13 @@ mod tests {
     }
 
     #[test]
-    fn burst_doubles_after_each_miss_until_16() {
+    fn burst_doubles_after_each_miss_until_4() {
         assert_eq!(fetch_burst_concurrency(0), 1);
         assert_eq!(fetch_burst_concurrency(1), 2);
         assert_eq!(fetch_burst_concurrency(2), 4);
-        assert_eq!(fetch_burst_concurrency(3), 8);
-        assert_eq!(fetch_burst_concurrency(4), 16);
-        assert_eq!(fetch_burst_concurrency(9), 16);
-        assert_eq!(MAX_FETCH_BURST, 16);
+        assert_eq!(fetch_burst_concurrency(3), 4);
+        assert_eq!(fetch_burst_concurrency(9), 4);
+        assert_eq!(MAX_FETCH_BURST, 4);
+        assert_eq!(BURST_EXHAUSTED_BACKOFF, Duration::from_secs(60));
     }
 }

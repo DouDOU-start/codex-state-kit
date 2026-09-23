@@ -637,3 +637,69 @@ async fn miss_streak_doubles_probe_concurrency_then_resets() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn max_burst_miss_rests_then_restarts_at_one() {
+    if !isolated_child(
+        "proxy::token_reuse_tests::max_burst_miss_rests_then_restarts_at_one",
+    ) {
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let home = tempfile::tempdir().unwrap();
+        write_login(home.path());
+        let probes = Arc::new(AtomicU32::new(0));
+        let probes_seen = probes.clone();
+        let router = axum::Router::new().fallback(move |_headers: HeaderMap, Json(body): Json<Value>| {
+            let probes = probes_seen.clone();
+            async move {
+                probes.fetch_add(1, Ordering::Relaxed);
+                Response::builder()
+                    .header(turn_state::HEADER_NAME, "x".repeat(312))
+                    .body(completed_probe_body(&body))
+                    .unwrap()
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let app = Arc::new(
+            App::new(Settings {
+                upstream: endpoint.clone(),
+                outbound_proxy: endpoint,
+                outbound_mode: OutboundMode::Manual,
+                codex_home: home.path().display().to_string(),
+                models: vec!["a".into()],
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        let _ = app.refresh_if_needed().await;
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+        app.reset_fetch_schedule().await;
+        let _ = app.refresh_if_needed().await;
+        assert_eq!(probes.load(Ordering::Relaxed), 3);
+        app.reset_fetch_schedule().await;
+        let wait = app.refresh_if_needed().await;
+        assert_eq!(probes.load(Ordering::Relaxed), 7);
+        assert!(
+            wait >= Duration::from_secs(50),
+            "打满 4 路后应静置约 60 秒，实际 {wait:?}"
+        );
+        assert!(wait <= fetch::BURST_EXHAUSTED_BACKOFF);
+        let message = app.fetch_error.lock().await.clone().unwrap_or_default();
+        assert!(message.contains("静置 60 秒"), "{message}");
+        app.reset_fetch_schedule().await;
+        let _ = app.refresh_if_needed().await;
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            8,
+            "静置结束后应从 1 路重来，而不是继续 4 路"
+        );
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
