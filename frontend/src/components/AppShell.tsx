@@ -32,7 +32,7 @@ export function AppShell({ children }: PropsWithChildren) {
       message: updates.phase === "ready"
         ? `v${update?.latestVersion} 已下载并通过签名校验。安装将关闭应用，请先结束当前会话。`
         : updates.phase === "installing"
-          ? "正在恢复路由、停止 WARP 并等待在途请求结束，请勿关闭应用…"
+          ? "正在恢复路由、停止订阅内核并等待在途请求结束，请勿关闭应用…"
           : updates.phase === "downloading"
             ? `正在下载 v${update?.latestVersion}${updates.progress === null ? "" : ` · ${updates.progress}%`}，下载期间可继续使用。`
             : `v${update?.latestVersion} 已发布（当前 v${update?.currentVersion}）。`,

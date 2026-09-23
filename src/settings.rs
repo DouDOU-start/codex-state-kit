@@ -18,6 +18,7 @@ where
     let value = Option::<String>::deserialize(deserializer)?;
     match value.as_deref() {
         Some("mihomo") => Ok(OutboundMode::Mihomo),
+        // `warp` is the removed built-in WARP line.
         Some("manual") | Some("warp") | None | Some("") => Ok(OutboundMode::Manual),
         Some(other) => Err(serde::de::Error::unknown_variant(
             other,
@@ -414,7 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn warp_selection_preserves_manual_url_and_round_trips() {
+    /// WARP was removed; settings saved with it load as the manual proxy.
+    fn legacy_warp_mode_loads_as_manual_and_keeps_the_proxy() {
         let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
             "proxyListen": "127.0.0.1:8787", "upstream": "https://example.com",
             "codexHome": "test", "outboundProxy": "socks5://localhost:1080", "outboundMode": "warp"

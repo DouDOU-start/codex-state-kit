@@ -43,6 +43,8 @@ pub fn run() {
             if cfg!(debug_assertions) {
                 mihomo_data.push("dev");
             }
+            // The built-in WARP line is gone; drop its device key and logs.
+            let _ = std::fs::remove_dir_all(mihomo_data.join("warp"));
             mihomo_data.push("mihomo");
             let state = AppState::initialize(MihomoPaths {
                 bundled_binary: mihomo_binary,

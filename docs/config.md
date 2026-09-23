@@ -45,7 +45,7 @@ openai_base_url = "http://127.0.0.1:8787"
 | 虚拟设备 | `~/.codex-state-kit-vm.json` | `~/.codex-state-kit-dev-vm.json` |
 | 本机代理端口 | `8787` | `8788` |
 
-账号相关文件保存在所选工作目录中，见[账号与登录](accounts.md#登录文件)。订阅内核的数据位于系统应用数据目录下的 `mihomo/`（开发版为 `dev/mihomo/`）。旧版的 Turn-State 缓存文件 `~/.codex-state-kit-token.json` 已不再使用，启动时会自动删除。
+账号相关文件保存在所选工作目录中，见[账号与登录](accounts.md#登录文件)。订阅内核的数据位于系统应用数据目录下的 `mihomo/`（开发版为 `dev/mihomo/`）。旧版的 Turn-State 缓存文件 `~/.codex-state-kit-token.json` 和内置 WARP 的数据目录（应用数据目录下的 `warp/`）已不再使用，启动时会自动删除。
 
 同一版本只能运行一个 Kit：再次启动时会直接切到已打开的窗口。开发版与正式版的应用数据分开保存，但默认 Codex 工作目录相同，不要让两者同时管理同一个工作目录。
 
