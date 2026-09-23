@@ -1,9 +1,11 @@
+use codex_state_kit::accounts::{self, AccountView};
 use codex_state_kit::billing::{BillingSummary, PricingRuleSpec, UsageFilter, UsageRecordsPage};
+use codex_state_kit::pricing::{CatalogInfo, ModelPriceRow};
 use codex_state_kit::{
     exchange_refresh_token, import_access_token as persist_access_token, inspect_codex_config,
-    login_status, persist_refresh_token_import, poll_device_login, start_device_login,
-    token_import_http_client, CodexConfigView, LoginEndpoints, LoginStart, LoginStatus,
-    SettingsPatch, Status,
+    login_http_client_via, login_status, persist_refresh_token_import, poll_device_login,
+    start_device_login, token_import_http_client_via, CodexConfigView, LoginEndpoints, LoginStart,
+    LoginStatus, SettingsPatch, Status,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -58,7 +60,12 @@ pub async fn mihomo_select(
             .mihomo
             .select_in_group(&group, &node)
             .await,
-    )
+    )?;
+    // The selected node is part of the live account's outbound line.
+    if let Err(error) = state.proxy.sync_account_environment().await {
+        eprintln!("[accounts] 绑定账号环境失败: {error:#}");
+    }
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -195,6 +202,35 @@ pub async fn set_billing_pricing(
     command(state.core().billing.add_pricing_rule(rule))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingView {
+    pub info: CatalogInfo,
+    pub models: Vec<ModelPriceRow>,
+}
+
+fn pricing_view(state: &AppState) -> PricingView {
+    let core = state.core();
+    let pricing = core.billing.pricing();
+    PricingView {
+        info: pricing.info(),
+        models: pricing.rows(),
+    }
+}
+
+/// The live model price catalog (bundled, cached or synced from remote).
+#[tauri::command(async)]
+pub async fn get_pricing(state: State<'_, AppState>) -> CommandResult<PricingView> {
+    Ok(pricing_view(&state))
+}
+
+/// Checks the remote price catalog now instead of waiting for the next tick.
+#[tauri::command(async)]
+pub async fn sync_pricing(state: State<'_, AppState>) -> CommandResult<PricingView> {
+    command(state.proxy.sync_pricing().await)?;
+    Ok(pricing_view(&state))
+}
+
 #[tauri::command(async)]
 pub async fn set_config(
     state: State<'_, AppState>,
@@ -235,6 +271,69 @@ pub async fn get_login_status(
     Ok(login_status(std::path::Path::new(&home)))
 }
 
+async fn codex_home(state: &AppState, home: Option<String>) -> PathBuf {
+    PathBuf::from(home.unwrap_or(state.core().settings.lock().await.codex_home.clone()))
+}
+
+/// Saved ChatGPT accounts; the live Kit login is imported on first call.
+#[tauri::command(async)]
+pub async fn list_accounts(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    home: Option<String>,
+) -> CommandResult<Vec<AccountView>> {
+    let home = codex_home(&state, home).await;
+    // Also catches logins that happened outside the login commands.
+    if let Err(error) = state.proxy.sync_account_environment().await {
+        eprintln!("[accounts] 绑定账号环境失败: {error:#}");
+    }
+    let list = command(accounts::list(&home))?;
+    // A new login may have just been saved: keep the tray menu in sync.
+    crate::tray::update(&app, &list);
+    Ok(list)
+}
+
+/// Switches Kit to a saved account. Forwarded requests use it right away.
+#[tauri::command(async)]
+pub async fn switch_account(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    home: Option<String>,
+    account_id: String,
+) -> CommandResult<LoginStatus> {
+    let home = codex_home(&state, home).await;
+    let status = command(state.proxy.switch_account(&home, &account_id).await)?;
+    crate::tray::refresh(&app).await;
+    Ok(status)
+}
+
+#[tauri::command(async)]
+pub async fn remove_account(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    home: Option<String>,
+    account_id: String,
+) -> CommandResult<()> {
+    let home = codex_home(&state, home).await;
+    command(accounts::remove(&home, &account_id))?;
+    crate::tray::refresh(&app).await;
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub async fn rename_account(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    home: Option<String>,
+    account_id: String,
+    label: String,
+) -> CommandResult<()> {
+    let home = codex_home(&state, home).await;
+    command(accounts::rename(&home, &account_id, &label))?;
+    crate::tray::refresh(&app).await;
+    Ok(())
+}
+
 #[tauri::command(async)]
 pub async fn import_chatgpt_refresh_token(
     state: State<'_, AppState>,
@@ -251,13 +350,26 @@ pub async fn import_chatgpt_refresh_token(
         slot.cancel();
         slot.generation
     };
-    let client = command(token_import_http_client())?;
+    let client = command(token_import_http_client_via(
+        &state.core().login_proxy().await,
+    ))?;
     let tokens = command(exchange_refresh_token(&client, &refresh_token).await)?;
-    let slot = state.pending_login.lock().expect("pending login");
-    if slot.generation != generation || slot.closed {
-        return Err("登录已取消".into());
+    let status = {
+        let slot = state.pending_login.lock().expect("pending login");
+        if slot.generation != generation || slot.closed {
+            return Err("登录已取消".into());
+        }
+        command(persist_refresh_token_import(&home, &refresh_token, &tokens))?
+    };
+    bind_new_login(&state).await;
+    Ok(status)
+}
+
+/// A new login becomes the live account: give it its own environment.
+async fn bind_new_login(state: &AppState) {
+    if let Err(error) = state.proxy.sync_account_environment().await {
+        eprintln!("[accounts] 绑定账号环境失败: {error:#}");
     }
-    command(persist_refresh_token_import(&home, &refresh_token, &tokens))
 }
 
 #[tauri::command(async)]
@@ -268,12 +380,16 @@ pub async fn import_chatgpt_access_token(
 ) -> CommandResult<LoginStatus> {
     let settings = state.core().settings.lock().await.clone();
     let home = PathBuf::from(home.unwrap_or(settings.codex_home));
-    let mut slot = state.pending_login.lock().expect("pending login");
-    if slot.closed {
-        return Err("应用正在退出".into());
-    }
-    slot.cancel();
-    command(persist_access_token(&home, &access_token))
+    let status = {
+        let mut slot = state.pending_login.lock().expect("pending login");
+        if slot.closed {
+            return Err("应用正在退出".into());
+        }
+        slot.cancel();
+        command(persist_access_token(&home, &access_token))?
+    };
+    bind_new_login(&state).await;
+    Ok(status)
 }
 
 #[tauri::command(async)]
@@ -284,6 +400,8 @@ pub async fn start_chatgpt_login(
 ) -> CommandResult<LoginStart> {
     let settings = state.core().settings.lock().await.clone();
     let home = PathBuf::from(home.unwrap_or(settings.codex_home));
+    // Sign in over the line this account will be bound to.
+    let proxy = state.core().login_proxy().await;
     let generation = {
         let mut slot = state.pending_login.lock().expect("pending login");
         if slot.closed {
@@ -291,13 +409,15 @@ pub async fn start_chatgpt_login(
         }
         slot.cancel();
         if matches!(method.unwrap_or_default(), LoginMethod::Browser) {
-            let (start, pending) = BrowserLogin::start(home).map_err(|err| err.to_string())?;
+            let (start, pending) =
+                BrowserLogin::start(home, &proxy).map_err(|err| err.to_string())?;
             slot.pending = Some(LoginSession::Browser(Arc::new(pending)));
             return Ok(start);
         }
         slot.generation
     };
-    match start_device_login(&state.core().login_http, &LoginEndpoints::default(), home).await {
+    let client = command(login_http_client_via(&proxy))?;
+    match start_device_login(&client, &LoginEndpoints::default(), home).await {
         Ok((start, pending)) => {
             let mut slot = state.pending_login.lock().expect("pending login");
             if slot.generation != generation || slot.closed {
@@ -327,34 +447,36 @@ pub async fn poll_chatgpt_login(state: State<'_, AppState>) -> CommandResult<Log
     let result = match pending {
         LoginSession::Browser(pending) => Ok(pending.poll()),
         LoginSession::Device(pending) => {
-            poll_device_login(
-                &state.core().login_http,
-                &LoginEndpoints::default(),
-                &pending,
-            )
-            .await
+            let client = command(login_http_client_via(&state.core().login_proxy().await))?;
+            poll_device_login(&client, &LoginEndpoints::default(), &pending).await
         }
     };
-    let mut slot = state.pending_login.lock().expect("pending login");
-    if slot.generation != generation {
-        return Err("登录已取消".into());
-    }
-    match result {
-        Ok(result) => {
-            if result.status != codex_state_kit::PollStatus::Pending {
-                slot.cancel();
+    let poll = {
+        let mut slot = state.pending_login.lock().expect("pending login");
+        if slot.generation != generation {
+            return Err("登录已取消".into());
+        }
+        match result {
+            Ok(result) => {
+                if result.status != codex_state_kit::PollStatus::Pending {
+                    slot.cancel();
+                }
+                LoginPoll {
+                    status: result.status.as_str().to_string(),
+                    message: result.message,
+                    login: result.login,
+                }
             }
-            Ok(LoginPoll {
-                status: result.status.as_str().to_string(),
-                message: result.message,
-                login: result.login,
-            })
+            Err(err) => {
+                slot.cancel();
+                return Err(err.to_string());
+            }
         }
-        Err(err) => {
-            slot.cancel();
-            Err(err.to_string())
-        }
+    };
+    if poll.login.as_ref().is_some_and(|login| login.logged_in) {
+        bind_new_login(&state).await;
     }
+    Ok(poll)
 }
 
 #[tauri::command(async)]

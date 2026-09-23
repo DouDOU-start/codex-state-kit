@@ -36,6 +36,14 @@ const DEFAULT_EXPIRES_IN: u64 = 900;
 const DEFAULT_INTERVAL: u64 = 5;
 static AUTH_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// Serialises writes of the Kit login file (token adoption, account switches).
+pub(crate) fn auth_sync_lock() -> std::sync::MutexGuard<'static, ()> {
+    AUTH_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 #[derive(Clone, Debug)]
 pub struct LoginEndpoints {
     pub usercode_url: String,
@@ -151,21 +159,40 @@ enum ResolvedAuthMode {
     Other,
 }
 
-pub fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+/// Auth requests go out on the account's outbound line (`outbound_proxy`,
+/// the same exit as its business traffic). With no line configured they
+/// follow the system proxy, like a browser.
+fn auth_client_builder(outbound_proxy: &str) -> Result<reqwest::ClientBuilder> {
+    let proxy = crate::fetch::dial_proxy_for_client(outbound_proxy.trim());
+    let builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+    Ok(if proxy.is_empty() {
+        builder.proxy(crate::system_proxy::reqwest_proxy())
+    } else {
+        builder.proxy(reqwest::Proxy::all(&proxy).context("出站代理地址无效")?)
+    })
+}
+
+pub fn http_client_via(outbound_proxy: &str) -> Result<reqwest::Client> {
+    auth_client_builder(outbound_proxy)?
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .context("build login http client")
 }
 
 /// RT 换票请求携带长期凭据，禁止跟随重定向，避免请求体被转发到其他来源。
-pub fn token_import_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+pub fn token_import_http_client_via(outbound_proxy: &str) -> Result<reqwest::Client> {
+    auth_client_builder(outbound_proxy)?
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build token import http client")
+}
+
+pub fn http_client() -> Result<reqwest::Client> {
+    http_client_via("")
+}
+
+pub fn token_import_http_client() -> Result<reqwest::Client> {
+    token_import_http_client_via("")
 }
 
 pub fn kit_auth_path(home: &Path) -> PathBuf {
@@ -892,15 +919,17 @@ fn write_session_auth(
     refresh_token: &str,
     account_id: &str,
 ) -> Result<()> {
-    write_auth_json(
-        &kit_auth_path(home),
-        id_token,
-        access_token,
-        refresh_token,
-        account_id,
-        StoredAuthMode::Managed,
-        false,
-    )
+    remember_accounts_around(home, || {
+        write_auth_json(
+            &kit_auth_path(home),
+            id_token,
+            access_token,
+            refresh_token,
+            account_id,
+            StoredAuthMode::Managed,
+            false,
+        )
+    })
 }
 
 fn write_imported_refresh_auth(
@@ -910,29 +939,42 @@ fn write_imported_refresh_auth(
     refresh_token: &str,
     account_id: &str,
 ) -> Result<()> {
-    write_auth_json(
-        &kit_auth_path(home),
-        id_token,
-        access_token,
-        refresh_token,
-        account_id,
-        StoredAuthMode::Managed,
-        true,
-    )
+    remember_accounts_around(home, || {
+        write_auth_json(
+            &kit_auth_path(home),
+            id_token,
+            access_token,
+            refresh_token,
+            account_id,
+            StoredAuthMode::Managed,
+            true,
+        )
+    })
 }
 
 fn write_access_token_auth(home: &Path, access_token: &str, account_id: &str) -> Result<()> {
     // 与 Codex 的 external access token 结构一致：AT 同时提供 JWT 身份声明，
     // refresh_token 保留为空字符串，auth_mode 标记为 chatgptAuthTokens。
-    write_auth_json(
-        &kit_auth_path(home),
-        access_token,
-        access_token,
-        "",
-        account_id,
-        StoredAuthMode::ExternalAccessToken,
-        true,
-    )
+    remember_accounts_around(home, || {
+        write_auth_json(
+            &kit_auth_path(home),
+            access_token,
+            access_token,
+            "",
+            account_id,
+            StoredAuthMode::ExternalAccessToken,
+            true,
+        )
+    })
+}
+
+/// Saves the outgoing Kit login into the account vault before a new login
+/// replaces it, and the new login afterwards, so no account is lost.
+fn remember_accounts_around(home: &Path, write: impl FnOnce() -> Result<()>) -> Result<()> {
+    crate::accounts::capture_quietly(home);
+    write()?;
+    crate::accounts::capture_quietly(home);
+    Ok(())
 }
 
 fn write_auth_json(
@@ -997,7 +1039,7 @@ fn write_auth_json(
     atomic_write(path, &serde_json::to_vec_pretty(&auth)?)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_file_name(format!(
         "{}.tmp",
         path.file_name()
@@ -1009,7 +1051,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_auth_file(path: &Path) -> Result<Option<Value>> {
+pub(crate) fn read_auth_file(path: &Path) -> Result<Option<Value>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -1018,7 +1060,7 @@ fn read_auth_file(path: &Path) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
-fn status_from_auth(auth: &Value) -> LoginStatus {
+pub(crate) fn status_from_auth(auth: &Value) -> LoginStatus {
     let tokens = auth.get("tokens").and_then(Value::as_object);
     let access = tokens
         .and_then(|map| map.get("access_token"))
@@ -1758,6 +1800,34 @@ mod tests {
             r#"{{"chatgpt_account_id":"{account}","email":"user@example.com"}}"#
         ));
         format!("hdr.{payload}.sig")
+    }
+
+    #[tokio::test]
+    async fn auth_requests_use_the_accounts_outbound_line() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let seen = tokio::spawn(async move {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let mut buffer = vec![0u8; 1024];
+            let read = socket.read(&mut buffer).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buffer[..read]).to_string()
+        });
+        let client = http_client_via(&format!("http://127.0.0.1:{port}")).unwrap();
+        client
+            .get("http://auth.example.test/oauth/token")
+            .send()
+            .await
+            .unwrap();
+        let request = seen.await.unwrap();
+        assert!(
+            request.starts_with("GET http://auth.example.test/oauth/token HTTP/1.1"),
+            "{request}"
+        );
     }
 
     #[test]

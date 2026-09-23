@@ -115,7 +115,8 @@ pub fn sample_from_result(name: &str, result: Result<u64>) -> LatencySample {
 }
 
 pub async fn probe_through_proxy(proxy: &str, target: &str) -> Result<u64> {
-    let proxy = proxy_for_probe(proxy)?;
+    // Measure the same path business traffic takes (system-proxy relay).
+    let proxy = crate::system_proxy::route(&proxy_for_probe(proxy)?);
     let client = reqwest::Client::builder()
         .proxy(reqwest::Proxy::all(&proxy).context("代理地址无效")?)
         .connect_timeout(PROBE_TIMEOUT)

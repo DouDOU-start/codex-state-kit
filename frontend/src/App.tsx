@@ -1,23 +1,28 @@
-import { useEffect, useRef, useState } from "react";
-import Copy from "lucide-react/dist/esm/icons/copy.js";
-import ExternalLink from "lucide-react/dist/esm/icons/external-link.js";
-import LogIn from "lucide-react/dist/esm/icons/log-in.js";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import Shield from "lucide-react/dist/esm/icons/shield.js";
 import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import Activity from "lucide-react/dist/esm/icons/activity.js";
 import Monitor from "lucide-react/dist/esm/icons/monitor.js";
 import Network from "lucide-react/dist/esm/icons/network.js";
 import Terminal from "lucide-react/dist/esm/icons/terminal.js";
-import CircleCheck from "lucide-react/dist/esm/icons/circle-check.js";
-import Radio from "lucide-react/dist/esm/icons/radio.js";
 import Waypoints from "lucide-react/dist/esm/icons/waypoints.js";
+import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.js";
+import Settings2 from "lucide-react/dist/esm/icons/settings-2.js";
+import Users from "lucide-react/dist/esm/icons/users.js";
+import Link2 from "lucide-react/dist/esm/icons/link-2.js";
+import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
+import BadgeDollarSign from "lucide-react/dist/esm/icons/badge-dollar-sign.js";
 import { AppShell } from "@/components/AppShell";
 import { BillingPanel } from "@/components/BillingPanel";
 import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
-import { NetworkLogDialog } from "@/components/NetworkLogDialog";
+import { UsageRecordsPanel } from "@/components/UsageRecordsPanel";
+import { PricingPanel } from "@/components/PricingPanel";
+import { AccountsPanel, accountName } from "@/components/AccountsPanel";
+import { AddAccountDialog } from "@/components/AddAccountDialog";
+import { Select } from "@/components/Select";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { LoginMode, Status, LatencySample, VmIdentityView } from "@/types";
+import type { Status, LatencySample, VmIdentityView } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -40,6 +45,29 @@ function degradeChip(status: Status) {
   return { label: "312 降智", className: "runtime-chip runtime-chip--down" };
 }
 
+type TabId = "overview" | "records" | "pricing" | "network" | "account" | "device";
+
+const TABS: { id: TabId; label: string; Icon: typeof Activity }[] = [
+  { id: "overview", label: "概览", Icon: LayoutDashboard },
+  { id: "records", label: "使用记录", Icon: ScrollText },
+  { id: "pricing", label: "模型价格", Icon: BadgeDollarSign },
+  { id: "network", label: "出站网络", Icon: Network },
+  { id: "account", label: "Codex 接入", Icon: Terminal },
+  { id: "device", label: "虚拟设备", Icon: Monitor },
+];
+
+const TAB_STORAGE_KEY = "codex-state-kit.tab";
+
+function initialTab(): TabId {
+  try {
+    const saved = window.localStorage.getItem(TAB_STORAGE_KEY);
+    if (TABS.some((tab) => tab.id === saved)) return saved as TabId;
+  } catch {
+    // ignore
+  }
+  return "overview";
+}
+
 export default function App() {
   const fwd = useCodexStateKit();
   const [codexHome, setCodexHome] = useState("");
@@ -53,11 +81,9 @@ export default function App() {
   const [osVersion, setOsVersion] = useState("15.5.0");
   const [vmArch, setVmArch] = useState("arm64");
   const [vmTerminal, setVmTerminal] = useState("xterm-256color");
-  const [loginMode, setLoginMode] = useState<LoginMode>("browser");
-  const [refreshTokenInput, setRefreshTokenInput] = useState("");
-  const [accessTokenInput, setAccessTokenInput] = useState("");
-  const [networkLogsOpen, setNetworkLogsOpen] = useState(false);
-  const networkLogTriggerRef = useRef<HTMLButtonElement>(null);
+  const [addAccountOpen, setAddAccountOpen] = useState(false);
+  const [tab, setTab] = useState<TabId>(initialTab);
+  const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
   const hydrated = useRef(false);
 
   useEffect(() => {
@@ -78,6 +104,57 @@ export default function App() {
       setVmTerminal(identity.terminal);
     }
   }, [fwd.status]);
+
+  // Switching accounts swaps the bound outbound line and virtual device on
+  // the backend; follow those values. Unsaved typing is untouched because
+  // these only change after a save or a switch.
+  useEffect(() => {
+    if (!fwd.status || !hydrated.current) return;
+    setOutboundProxy(fwd.status.outboundProxy ?? "");
+    setMihomoSubscription(fwd.status.mihomoSubscription ?? "");
+    setMihomoNode(fwd.status.mihomoNode ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fwd.status?.outboundProxy, fwd.status?.mihomoSubscription, fwd.status?.mihomoNode]);
+
+  useEffect(() => {
+    const identity = fwd.status?.vmIdentity;
+    if (!identity || !hydrated.current) return;
+    applyVmDraft(identity);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fwd.status?.vmIdentity?.installationId, fwd.status?.vmIdentity?.userAgent]);
+
+  const activeAccount = fwd.accounts.find((account) => account.active);
+  const bindingNote = activeAccount ? (
+    <p className="binding-note">
+      <Link2 size={12} aria-hidden="true" />
+      以下设置绑定到账号 <strong>{accountName(activeAccount)}</strong>，切换账号时会自动换成该账号自己的设置。
+    </p>
+  ) : null;
+
+  function selectTab(next: TabId, focus = false) {
+    setTab(next);
+    if (focus) tabRefs.current[next]?.focus();
+    try {
+      window.localStorage.setItem(TAB_STORAGE_KEY, next);
+    } catch {
+      // ignore
+    }
+  }
+
+  function onTabKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    const focused = TABS.findIndex((item) => tabRefs.current[item.id] === document.activeElement);
+    const index = focused === -1 ? TABS.findIndex((item) => item.id === tab) : focused;
+    const last = TABS.length - 1;
+    const next =
+      event.key === "ArrowRight" ? (index === last ? 0 : index + 1)
+        : event.key === "ArrowLeft" ? (index === 0 ? last : index - 1)
+          : event.key === "Home" ? 0
+            : event.key === "End" ? last
+              : null;
+    if (next === null) return;
+    event.preventDefault();
+    selectTab(TABS[next].id, true);
+  }
 
   function applyVmDraft(identity: VmIdentityView) {
     setCliVersion(identity.cliVersion);
@@ -112,16 +189,11 @@ export default function App() {
   }
 
   const loggedIn = Boolean(fwd.login?.loggedIn);
-  const loginLabel = fwd.login?.email || "ChatGPT";
-  const loginMeta = [
-    fwd.login?.accountId,
-    fwd.login?.refreshable
-      ? "含 Refresh Token"
-      : fwd.login?.authMode === "chatgptAuthTokens"
-        ? "Access Token · 不可自动刷新"
-        : null,
-  ].filter(Boolean).join(" · ");
   const degrade = degradeChip(fwd.status);
+  const tabAlert: Partial<Record<TabId, string>> = {
+    network: fwd.status.proxyError || fwd.status.mihomo?.error ? "出站网络异常" : undefined,
+    account: loggedIn ? undefined : "尚未登录",
+  };
   const selectedNode = mihomoNode || fwd.status.mihomo?.selected || "";
   const selectedNodeDelay = fwd.latency.mihomo?.samples.find((item) => item.name === selectedNode);
   const mihomoGroups = fwd.status?.mihomo.groups ?? [];
@@ -130,40 +202,48 @@ export default function App() {
     ? kitGroups
     : mihomoGroups.filter((group) => group.groupType === "select");
 
-  const copyCode = async () => {
-    if (!fwd.device?.userCode) return;
-    try {
-      await navigator.clipboard.writeText(fwd.device.userCode);
-    } catch {
-      // ignore
-    }
-  };
-
-  const submitRefreshToken = async () => {
-    const refreshToken = refreshTokenInput.trim();
-    if (!refreshToken) return;
-    if (await fwd.importRefreshLogin(codexHome, refreshToken)) {
-      setRefreshTokenInput("");
-    }
-  };
-
-  const submitAccessToken = async () => {
-    const accessToken = accessTokenInput.trim();
-    if (!accessToken) return;
-    if (await fwd.importAccessLogin(codexHome, accessToken)) {
-      setAccessTokenInput("");
-    }
-  };
-
   return (
     <AppShell>
       <div className="dash-page">
-        <div className="page-heading">
-          <div>
-            <h1>Codex 稳定助手</h1>
-            <p>自动维护 Token，缓解负载与降智问题。</p>
+        <div className="page-nav">
+          <div className="page-tabs" role="tablist" aria-label="页面分区" onKeyDown={onTabKeyDown}>
+            {TABS.map(({ id, label, Icon }) => (
+              <button
+                key={id}
+                ref={(node) => { tabRefs.current[id] = node; }}
+                id={`tab-${id}`}
+                type="button"
+                role="tab"
+                aria-selected={tab === id}
+                aria-controls={`tabpanel-${id}`}
+                tabIndex={tab === id ? 0 : -1}
+                onClick={() => selectTab(id)}
+              >
+                <Icon size={14} aria-hidden="true" />
+                {label}
+                {tabAlert[id] ? <i className="page-tabs__alert" title={tabAlert[id]} aria-label={tabAlert[id]} /> : null}
+              </button>
+            ))}
           </div>
           <div className="page-actions">
+            {fwd.accounts.length > 1 ? (
+              <Select
+                variant="compact"
+                className="account-switcher"
+                ariaLabel="切换账号"
+                placeholder="未使用已保存账号"
+                icon={<Users size={13} />}
+                disabled={fwd.busy !== null || Boolean(fwd.device)}
+                value={fwd.accounts.find((account) => account.active)?.accountId ?? ""}
+                options={fwd.accounts.map((account) => ({
+                  value: account.accountId,
+                  label: accountName(account),
+                  hint: account.label && account.email ? account.email : undefined,
+                  disabled: !account.usable,
+                }))}
+                onChange={(accountId) => void fwd.switchToAccount(accountId)}
+              />
+            ) : null}
             <span className={chipClass(fwd.status)}>
               <i />
               {chipLabel(fwd.status)}
@@ -174,15 +254,6 @@ export default function App() {
                 {degrade.label}
               </span>
             ) : null}
-            <button
-              ref={networkLogTriggerRef}
-              className="network-log-trigger"
-              type="button"
-              onClick={() => setNetworkLogsOpen(true)}
-            >
-              <Activity size={13} />
-              使用记录
-            </button>
           </div>
         </div>
 
@@ -203,6 +274,17 @@ export default function App() {
           </div>
         ) : null}
 
+        {fwd.status.degraded ? (
+          <div className="banner banner--error" role="alert">
+            <span>
+              <TriangleAlert size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
+              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}。
+            </span>
+          </div>
+        ) : null}
+
+
+        <div className="tab-panel" role="tabpanel" id="tabpanel-overview" aria-labelledby="tab-overview" hidden={tab !== "overview"}>
         <section className="account-traffic" aria-label="当前账号请求统计">
           <div className="account-traffic__heading">
             <Activity size={19} aria-hidden="true" />
@@ -227,22 +309,22 @@ export default function App() {
           currentAccountId={fwd.status.currentAccountId}
           currentAccountEmail={fwd.status.currentAccountEmail}
         />
+        </div>
 
-        {fwd.status.degraded ? (
-          <div className="banner banner--error" role="alert">
-            <span>
-              <TriangleAlert size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
-              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}。
-            </span>
-          </div>
-        ) : null}
 
-        <div className="panel dash-grid">
-        <section className="connection-section panel--proxy">
+        <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-records" aria-labelledby="tab-records" hidden={tab !== "records"}>
+          <UsageRecordsPanel active={tab === "records"} status={fwd.status} />
+        </section>
+
+        <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-pricing" aria-labelledby="tab-pricing" hidden={tab !== "pricing"}>
+          <PricingPanel active={tab === "pricing"} />
+        </section>
+
+        <section className="panel tab-panel" role="tabpanel" id="tabpanel-network" aria-labelledby="tab-network" hidden={tab !== "network"}>
           <header>
             <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站网络</h2><p>获取 Token 与业务发送共用这一条出站线路</p></div></div>
-            <span className="section-step">01</span>
           </header>
+          {bindingNote}
           <div className="proxy-mode" role="group" aria-label="出站代理模式">
             <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "manual")}><Network size={14} />手动代理</button>
             <button type="button" aria-pressed={fwd.status.outboundMode === "mihomo"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveMihomo(mihomoSubscription, mihomoNode)}><Waypoints size={14} />订阅节点</button>
@@ -278,6 +360,26 @@ export default function App() {
             />
           </label>
           <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。可把出口写成 {'{session}'}，打票时自动轮换；拿到稳定 292 后绑定该 session，业务也走同一条线路。</p>
+          <div className="system-proxy">
+            <label className="system-proxy__toggle">
+              <input
+                type="checkbox"
+                checked={fwd.status.chainSystemProxy !== false}
+                disabled={fwd.busy !== null}
+                onChange={(event) => void fwd.setChainSystemProxy(event.target.checked)}
+              />
+              经系统代理连接代理服务器
+            </label>
+            <span className={fwd.status.systemProxy?.detected ? "system-proxy__state system-proxy__state--on" : "system-proxy__state"}>
+              {fwd.status.chainSystemProxy === false
+                ? "已关闭，直连代理服务器"
+                : fwd.status.systemProxy?.detected
+                  ? `检测到系统代理 ${fwd.status.systemProxy.detected}`
+                  : "未检测到系统代理，直连代理服务器"}
+            </span>
+            <p>适用于 Clash Verge 等只开了系统代理、没开 TUN 的情况：代理服务器需要翻墙才能连上时，Kit 会先经系统代理再连到它。开关 Clash 的系统代理后自动跟随，无需重启。</p>
+            {fwd.status.systemProxy?.lastError ? <p className="system-proxy__error">{fwd.status.systemProxy.lastError}</p> : null}
+          </div>
           <div className="latency-row">
             <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null} onClick={() => void fwd.probeLatency("manual", outboundProxy)}>
               {fwd.probing === "manual" ? "测试中" : "测延迟"}
@@ -313,24 +415,27 @@ export default function App() {
             ))}
             {shownMihomoGroups.length > 0 ? null : (
               <>
-                <label className="field">
+                <div className="field">
                   <span>当前节点</span>
-                  <select
+                  <Select
+                    ariaLabel="当前节点"
+                    placeholder="连接后列出节点"
                     disabled={fwd.busy !== null || (fwd.status.mihomo?.nodes.length ?? 0) === 0}
                     value={mihomoNode || fwd.status.mihomo?.selected || ""}
-                    onChange={(event) => {
-                      setMihomoNode(event.target.value);
-                      void fwd.saveMihomo(mihomoSubscription, event.target.value);
-                    }}
-                  >
-                    {(fwd.status.mihomo?.nodes.length ?? 0) === 0 ? <option value="">连接后列出节点</option> : null}
-                    {(fwd.status.mihomo?.nodes ?? []).map((node) => {
+                    options={(fwd.status.mihomo?.nodes ?? []).map((node) => {
                       const sample = fwd.latency.mihomo?.samples.find((item) => item.name === node);
-                      const mark = sample ? (sample.delayMs != null ? ` · ${sample.delayMs} ms` : " · 超时") : "";
-                      return <option key={node} value={node}>{node}{mark}</option>;
+                      return {
+                        value: node,
+                        label: node,
+                        hint: sample ? (sample.delayMs != null ? `${sample.delayMs} ms` : "超时") : undefined,
+                      };
                     })}
-                  </select>
-                </label>
+                    onChange={(node) => {
+                      setMihomoNode(node);
+                      void fwd.saveMihomo(mihomoSubscription, node);
+                    }}
+                  />
+                </div>
                 <div className="latency-row">
                   <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null || (isTauri && fwd.status.mihomo?.phase !== "connected")} onClick={() => void fwd.probeLatency("mihomo")}>
                     {fwd.probing === "mihomo" ? "测试中" : "测延迟"}
@@ -353,139 +458,26 @@ export default function App() {
           )}
         </section>
 
-        <section className="connection-section">
+        <div className="tab-panel" role="tabpanel" id="tabpanel-account" aria-labelledby="tab-account" hidden={tab !== "account"}>
+        <AccountsPanel
+          accounts={fwd.accounts}
+          busy={fwd.busy !== null || Boolean(fwd.device)}
+          onSwitch={(accountId) => void fwd.switchToAccount(accountId)}
+          onRemove={(accountId) => void fwd.removeSavedAccount(accountId)}
+          onRename={(accountId, label) => void fwd.renameSavedAccount(accountId, label)}
+          onAdd={() => setAddAccountOpen(true)}
+        />
+        <section className="panel">
           <header>
-            <div className="section-heading"><span className="section-icon section-icon--warm"><Terminal size={19} /></span><div><h2>Codex 接入</h2><p>登录账号，连接你的客户端</p></div></div>
-            <span className="section-step">02</span>
+            <div className="section-heading"><span className="section-icon"><Settings2 size={19} /></span><div><h2>转发设置</h2><p>本机 Codex 目录与上游模型</p></div></div>
           </header>
-          <div className="proxy-mode login-methods" role="group" aria-label="登录方式">
-            <button type="button" aria-pressed={loginMode === "browser"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMode("browser")}><ExternalLink size={14} />浏览器回调</button>
-            <button type="button" aria-pressed={loginMode === "device"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMode("device")}><Copy size={14} />授权码登录</button>
-            <button type="button" aria-pressed={loginMode === "refresh"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMode("refresh")}><Radio size={14} />Refresh Token</button>
-            <button type="button" aria-pressed={loginMode === "access"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMode("access")}><Shield size={14} />Access Token</button>
-          </div>
-          <div className="login-box">
-            <span className="field-label">ChatGPT 账号 {loggedIn && !fwd.device ? <span className="account-status"><CircleCheck size={12} /> 已登录</span> : null}</span>
-            {fwd.device ? (
-              <div className="login-pending">
-                <p>{fwd.device.method === "browser" ? "请在浏览器完成授权，登录结果将自动同步。" : "在浏览器打开验证页并输入代码"}</p>
-                {fwd.device.method === "device" ? <div className="user-code">{fwd.device.userCode}</div> : null}
-                <div className="panel__actions">
-                  {fwd.device.method === "device" ? <button className="button button--secondary" type="button" onClick={() => void copyCode()}>
-                    <Copy size={14} />
-                    复制
-                  </button> : null}
-                  <button className="button button--secondary" type="button" onClick={() => void fwd.openLoginPage()}>
-                    <ExternalLink size={14} />
-                    打开页面
-                  </button>
-                  <button className="button button--ghost" type="button" onClick={() => void fwd.cancelLogin()}>
-                    取消
-                  </button>
-                </div>
-              </div>
-            ) : loginMode === "refresh" ? (
-              <div className="credential-import">
-                <label className="field">
-                  <span>Refresh Token</span>
-                  <input
-                    type="password"
-                    spellCheck={false}
-                    autoComplete="off"
-                    disabled={fwd.busy !== null}
-                    value={refreshTokenInput}
-                    placeholder="粘贴 Refresh Token"
-                    onChange={(event) => setRefreshTokenInput(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") void submitRefreshToken();
-                    }}
-                  />
-                </label>
-                <p>会先向官方授权服务换取新凭据，并保存服务端返回的轮换 Refresh Token。</p>
-                <div className="panel__actions">
-                  <button
-                    className="button button--primary"
-                    type="button"
-                    disabled={fwd.busy !== null || !refreshTokenInput.trim()}
-                    onClick={() => void submitRefreshToken()}
-                  >
-                    {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
-                    导入并登录
-                  </button>
-                </div>
-              </div>
-            ) : loginMode === "access" ? (
-              <div className="credential-import">
-                <label className="field">
-                  <span>Access Token</span>
-                  <input
-                    type="password"
-                    spellCheck={false}
-                    autoComplete="off"
-                    disabled={fwd.busy !== null}
-                    value={accessTokenInput}
-                    placeholder="粘贴 Codex Access Token（JWT）"
-                    onChange={(event) => setAccessTokenInput(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") void submitAccessToken();
-                    }}
-                  />
-                </label>
-                <p className="credential-warning">Access Token 不可自动刷新；过期后需要重新导入。</p>
-                <div className="panel__actions">
-                  <button
-                    className="button button--primary"
-                    type="button"
-                    disabled={fwd.busy !== null || !accessTokenInput.trim()}
-                    onClick={() => void submitAccessToken()}
-                  >
-                    {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
-                    导入并登录
-                  </button>
-                </div>
-              </div>
-            ) : loggedIn ? (
-              <div className="login-current">
-                <div>
-                  <strong>{loginLabel}</strong>
-                  {loginMeta ? <span className="login-meta">{loginMeta}</span> : null}
-                </div>
-                <button
-                  className="button button--ghost"
-                  type="button"
-                  disabled={fwd.busy !== null}
-                  onClick={() => void fwd.startLogin(codexHome, loginMode)}
-                >
-                  {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
-                  重新登录
-                </button>
-              </div>
-            ) : (
-              <div className="login-current">
-                <span>尚未登录 ChatGPT</span>
-                <button
-                  className="button button--primary"
-                  type="button"
-                  disabled={fwd.busy !== null}
-                  onClick={() => void fwd.startLogin(codexHome, loginMode)}
-                >
-                  {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
-                  登录 ChatGPT
-                </button>
-              </div>
-            )}
-          </div>
-          <p className="panel__hint">
-            浏览器与授权码走官方 OAuth；Refresh Token 会换票并保存轮换凭据；Access Token 以 Codex 外部 Token 模式接入，过期后需重新导入。凭据提交后不回显、不写日志。 启动后自动接入，关闭时还原原来的官方账号、路由和本地模型配置。
-          </p>
-        </section>
-          <label className="field connection-directory">
+          <label className="field">
             <span>Codex 工作目录</span>
             <input spellCheck={false} disabled={fwd.busy !== null} value={codexHome} onChange={(event) => setCodexHome(event.target.value)}
               onBlur={() => void fwd.saveSettings(codexHome, outboundProxy)}
               onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} />
           </label>
-          <label className="field connection-directory">
+          <label className="field">
             <span>强制绑定模型</span>
             <input
               spellCheck={false}
@@ -501,9 +493,10 @@ export default function App() {
             />
           </label>
           <p className="panel__hint">填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游，Token 也按该模型获取和复用。</p>
+        </section>
         </div>
 
-        <section className="panel vm-panel">
+        <section className="panel vm-panel tab-panel" role="tabpanel" id="tabpanel-device" aria-labelledby="tab-device" hidden={tab !== "device"}>
           <header>
             <div className="section-heading">
               <span className="section-icon"><Monitor size={19} /></span>
@@ -514,6 +507,7 @@ export default function App() {
             </div>
             <span className="vm-identity__id">Installation {fwd.status.vmIdentity?.installationId ?? "—"}</span>
           </header>
+          {bindingNote}
           <div className="vm-identity__grid">
             <label className="field">
               <span>CLI 版本</span>
@@ -523,25 +517,30 @@ export default function App() {
               <span>Originator</span>
               <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmOriginator} onChange={(event) => setVmOriginator(event.target.value)} />
             </label>
-            <label className="field">
+            <div className="field">
               <span>系统</span>
-              <select disabled={fwd.busy !== null} value={osType} onChange={(event) => setOsType(event.target.value)}>
-                <option value="Mac OS">Mac OS</option>
-                <option value="Linux">Linux</option>
-                <option value="Windows">Windows</option>
-              </select>
-            </label>
+              <Select
+                ariaLabel="系统"
+                disabled={fwd.busy !== null}
+                value={osType}
+                options={["Mac OS", "Linux", "Windows"].map((value) => ({ value, label: value }))}
+                onChange={setOsType}
+              />
+            </div>
             <label className="field">
               <span>系统版本</span>
               <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={osVersion} onChange={(event) => setOsVersion(event.target.value)} />
             </label>
-            <label className="field">
+            <div className="field">
               <span>架构</span>
-              <select disabled={fwd.busy !== null} value={vmArch} onChange={(event) => setVmArch(event.target.value)}>
-                <option value="arm64">arm64</option>
-                <option value="x86_64">x86_64</option>
-              </select>
-            </label>
+              <Select
+                ariaLabel="架构"
+                disabled={fwd.busy !== null}
+                value={vmArch}
+                options={["arm64", "x86_64"].map((value) => ({ value, label: value }))}
+                onChange={setVmArch}
+              />
+            </div>
             <label className="field">
               <span>终端</span>
               <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmTerminal} onChange={(event) => setVmTerminal(event.target.value)} />
@@ -582,16 +581,17 @@ export default function App() {
           </div>
         </section>
 
+        <AddAccountDialog
+          open={addAccountOpen}
+          onClose={() => setAddAccountOpen(false)}
+          fwd={fwd}
+          codexHome={codexHome}
+        />
+
         <footer className="page-footer">
           <span><Shield size={13} /> 本地运行 · 配置尽在掌握</span>
           <span>CODEX STATE KIT</span>
         </footer>
-        <NetworkLogDialog
-          open={networkLogsOpen}
-          status={fwd.status}
-          triggerRef={networkLogTriggerRef}
-          onClose={() => setNetworkLogsOpen(false)}
-        />
       </div>
     </AppShell>
   );

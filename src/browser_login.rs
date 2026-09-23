@@ -57,10 +57,13 @@ pub struct BrowserLogin {
 }
 
 impl BrowserLogin {
-    pub fn start(home: PathBuf) -> Result<(LoginStart, Self)> {
+    /// `outbound_proxy` carries the code-for-token exchange; the authorize
+    /// page itself opens in the user's browser.
+    pub fn start(home: PathBuf, outbound_proxy: &str) -> Result<(LoginStart, Self)> {
         // Both ports are registered by Codex. Never terminate a different app's listener.
         let listener = bind_ports(&[1455, 1457])?;
-        Self::with_listener(home, listener, AUTHORIZE_URL, TOKEN_URL, LIFETIME)
+        let client = crate::login::token_import_http_client_via(outbound_proxy)?;
+        Self::with_listener(home, listener, AUTHORIZE_URL, TOKEN_URL, LIFETIME, client)
     }
 
     fn with_listener(
@@ -69,6 +72,7 @@ impl BrowserLogin {
         authorize_url: &str,
         token_url: &str,
         lifetime: Duration,
+        client: reqwest::Client,
     ) -> Result<(LoginStart, Self)> {
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
@@ -108,10 +112,7 @@ impl BrowserLogin {
             token_url: token_url.into(),
             port,
             home,
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            client,
             progress: Mutex::new(Progress {
                 claimed: false,
                 result: None,
@@ -331,6 +332,7 @@ mod tests {
                 AUTHORIZE_URL,
                 &token_url,
                 lifetime,
+                crate::login::token_import_http_client().unwrap(),
             )
             .unwrap();
             Self {

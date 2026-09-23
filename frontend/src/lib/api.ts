@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   ActionResult,
   CodexConfigView,
@@ -17,6 +18,9 @@ import type {
   BillingRecordsPage,
   BillingSummary,
   BillingUsageTotals,
+  ModelPriceRow,
+  PricingView,
+  SavedAccount,
 } from "@/types";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
@@ -87,6 +91,8 @@ const defaultStatus = (): Status => ({
   wsUpstreamEnabled: true,
   wsUpstreamConnected: false,
   wsUpstreamConnectedAt: null,
+  chainSystemProxy: true,
+  systemProxy: { enabled: true, detected: "HTTP 127.0.0.1:7897", lastError: null },
   logs: [{
     id: 1,
     accountId: "mock-account-a",
@@ -282,6 +288,8 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
     forcedModel: settings.forcedModel,
     configuredModels: settings.models,
     wsUpstreamEnabled: settings.wsUpstreamEnabled !== false,
+    chainSystemProxy: settings.chainSystemProxy !== false,
+    systemProxy: { ...(mockStatus.systemProxy ?? { detected: null, lastError: null }), enabled: settings.chainSystemProxy !== false },
     proxyOk: true,
   };
   mockConfig.codexHome = settings.codexHome;
@@ -529,7 +537,7 @@ const mockBillingSummary = (): BillingSummary => {
   previous.measuredRequestCount = 1;
   previous.inputTokens = 1_420;
   previous.outputTokens = 684;
-  previous.costNanos = 1_240_000;
+  previous.costNanos = 96_800_000;
   const current = emptyBillingTotals();
   current.requestCount = 3;
   current.measuredRequestCount = 2;
@@ -537,7 +545,7 @@ const mockBillingSummary = (): BillingSummary => {
   current.inputTokens = 12_480;
   current.cachedInputTokens = 2_048;
   current.outputTokens = 2_316;
-  current.costNanos = 8_460_000;
+  current.costNanos = 17_612_800;
   return {
     generatedAt: new Date().toISOString(),
     from: null,
@@ -583,10 +591,21 @@ const mockBillingRecords: BillingRecord[] = [
     responseModel: "gpt-6-sol",
     inputTokens: 4_608,
     cachedInputTokens: 1_024,
+    cacheWriteTokens: 0,
     outputTokens: 1_024,
+    reasoningTokens: 512,
     usageSource: "provider_response",
-    pricingRuleId: 1,
-    costNanos: 4_220_000,
+    pricingRuleId: null,
+    pricingModel: "gpt-6-sol",
+    serviceTier: "standard",
+    longContext: false,
+    inputCostNanos: 7_168_000,
+    cacheReadCostNanos: 204_800,
+    cacheWriteCostNanos: 0,
+    outputCostNanos: 10_240_000,
+    costNanos: 17_612_800,
+    firstTokenMs: 1_840,
+    transport: "http_sse",
     currency: "USD",
   },
   {
@@ -619,15 +638,63 @@ const mockBillingRecords: BillingRecord[] = [
     requestedModel: "gpt-6-astra",
     sentModel: "gpt-6-astra",
     responseModel: "gpt-6-astra",
+    transport: "http_to_ws",
     inputTokens: 1_420,
     cachedInputTokens: 0,
+    cacheWriteTokens: 0,
     outputTokens: 684,
+    reasoningTokens: 256,
     usageSource: "provider_response",
-    pricingRuleId: 1,
-    costNanos: 1_240_000,
+    pricingRuleId: null,
+    pricingModel: "gpt-6-astra",
+    serviceTier: "priority",
+    longContext: false,
+    inputCostNanos: 28_400_000,
+    cacheReadCostNanos: 0,
+    cacheWriteCostNanos: 0,
+    outputCostNanos: 68_400_000,
+    costNanos: 96_800_000,
     currency: "USD",
   },
 ];
+
+// 旧账号的历史记录，用于在浏览器预览里演示分页。
+for (let index = 0; index < 70; index += 1) {
+  const startedAt = Date.now() - 86_400_000 * 2 - index * 3_600_000;
+  const [firstTokenMs, totalMs] = [[944, 1_900], [1_500, 3_700], [7_350, 21_260], [16_620, 27_160]][index % 4];
+  mockBillingRecords.push({
+    requestId: `mock-history-${index}`,
+    provider: "chatgpt",
+    accountId: "mock-account-a",
+    email: "previous@example.com",
+    source: "business",
+    startedAt: new Date(startedAt).toISOString(),
+    finishedAt: new Date(startedAt + totalMs).toISOString(),
+    firstTokenMs,
+    state: "measured",
+    httpStatus: 200,
+    requestedModel: "gpt-5.1-codex",
+    sentModel: "gpt-5.1-codex",
+    responseModel: index % 5 === 3 ? "gpt-5.1-codex-mini" : "gpt-5.1-codex-2025-11-13",
+    transport: index % 2 ? "ws_to_ws" : "http_sse",
+    inputTokens: 12_000,
+    cachedInputTokens: 10_000,
+    cacheWriteTokens: 0,
+    outputTokens: 800,
+    reasoningTokens: 300,
+    usageSource: "provider_response",
+    pricingRuleId: null,
+    pricingModel: "gpt-5.1-codex",
+    serviceTier: "standard",
+    longContext: false,
+    inputCostNanos: 2_500_000,
+    cacheReadCostNanos: 1_250_000,
+    cacheWriteCostNanos: 0,
+    outputCostNanos: 8_000_000,
+    costNanos: 11_750_000,
+    currency: "USD",
+  });
+}
 
 function cloneBillingSummary(summary: BillingSummary): BillingSummary {
   return {
@@ -681,4 +748,144 @@ export async function getBillingRecords(query: BillingQuery = {}): Promise<Billi
     limit,
     offset,
   };
+}
+
+const perToken = (perMillion: number) => perMillion / 1_000_000;
+
+function mockPrice(model: string, input: number, cacheRead: number, output: number, cacheWrite = input, longContext = false): ModelPriceRow {
+  const standard = { input: perToken(input), cacheRead: perToken(cacheRead), cacheWrite: perToken(cacheWrite), output: perToken(output) };
+  const scale = (factor: number) => ({
+    input: standard.input * factor,
+    cacheRead: standard.cacheRead * factor,
+    cacheWrite: standard.cacheWrite * factor,
+    output: standard.output * factor,
+  });
+  return {
+    model,
+    standard,
+    priority: scale(2),
+    flex: scale(0.5),
+    longContext: longContext ? { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 } : null,
+  };
+}
+
+const mockPricing = (): PricingView => ({
+  info: {
+    source: "bundled",
+    sha256: "b746b9d7c04703f4ddeed8a8ba606d358b60e152398578936e17672d3059722b",
+    modelCount: 6,
+    remoteUrl: "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.json",
+    lastCheckedAt: null,
+    lastUpdatedAt: null,
+    lastError: null,
+  },
+  models: [
+    mockPrice("gpt-5.1-codex", 1.25, 0.125, 10),
+    mockPrice("gpt-5.1-codex-mini", 0.25, 0.025, 2),
+    mockPrice("gpt-5.3-codex", 1.75, 0.175, 14),
+    mockPrice("gpt-5.4", 2.5, 0.25, 15, 2.5, true),
+    mockPrice("gpt-6-astra", 10, 1, 50, 12.5, true),
+    mockPrice("gpt-6-sol", 2, 0.2, 10, 2.5, true),
+  ],
+});
+
+export async function getPricing(): Promise<PricingView> {
+  if (isTauri) return invoke<PricingView>("get_pricing");
+  return mockPricing();
+}
+
+export async function syncPricing(): Promise<PricingView> {
+  if (isTauri) return invoke<PricingView>("sync_pricing");
+  const view = mockPricing();
+  view.info.lastCheckedAt = new Date().toISOString();
+  return view;
+}
+
+const mockAccounts: SavedAccount[] = [
+  {
+    accountId: "mock-account-b",
+    deviceId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    network: "手动代理 · socks5://proxy.example.test:44445",
+    email: "mock@example.com",
+    label: null,
+    authMode: "chatgpt",
+    refreshable: true,
+    usable: true,
+    active: true,
+    addedAt: new Date(Date.now() - 86_400_000 * 3).toISOString(),
+    lastUsedAt: new Date(Date.now() - 3_600_000).toISOString(),
+  },
+  {
+    accountId: "mock-account-a",
+    deviceId: "5c9d1e02-7a41-4b8e-9f10-2d6e8a7b4c31",
+    network: "订阅节点 · Kit → 香港 01",
+    email: "previous@example.com",
+    label: "备用号",
+    authMode: "chatgpt",
+    refreshable: true,
+    usable: true,
+    active: false,
+    addedAt: new Date(Date.now() - 86_400_000 * 9).toISOString(),
+    lastUsedAt: new Date(Date.now() - 86_400_000).toISOString(),
+  },
+  {
+    accountId: "mock-account-c",
+    email: "team@example.com",
+    label: null,
+    authMode: "chatgptAuthTokens",
+    refreshable: false,
+    usable: true,
+    active: false,
+    addedAt: new Date(Date.now() - 86_400_000 * 12).toISOString(),
+    lastUsedAt: null,
+  },
+];
+
+export async function listAccounts(home?: string): Promise<SavedAccount[]> {
+  if (isTauri) return invoke<SavedAccount[]>("list_accounts", { home: home ?? null });
+  return mockAccounts.map((account) => ({ ...account }));
+}
+
+export async function switchAccount(accountId: string, home?: string): Promise<LoginStatus> {
+  if (isTauri) return invoke<LoginStatus>("switch_account", { home: home ?? null, accountId });
+  const target = mockAccounts.find((account) => account.accountId === accountId);
+  if (!target) throw new Error("账号不存在");
+  for (const account of mockAccounts) account.active = account === target;
+  target.lastUsedAt = new Date().toISOString();
+  mockLogin = {
+    loggedIn: true,
+    authMode: target.authMode ?? "chatgpt",
+    email: target.email ?? null,
+    accountId: target.accountId,
+    refreshable: target.refreshable,
+  };
+  mockStatus.currentAccountId = target.accountId;
+  mockStatus.currentAccountEmail = target.email ?? null;
+  return { ...mockLogin };
+}
+
+export async function removeAccount(accountId: string, home?: string): Promise<void> {
+  if (isTauri) return invoke<void>("remove_account", { home: home ?? null, accountId });
+  const index = mockAccounts.findIndex((account) => account.accountId === accountId);
+  if (index < 0) throw new Error("账号不存在");
+  if (mockAccounts[index].active) throw new Error("不能删除正在使用的账号，请先切换到其他账号");
+  mockAccounts.splice(index, 1);
+}
+
+export async function renameAccount(accountId: string, label: string, home?: string): Promise<void> {
+  if (isTauri) return invoke<void>("rename_account", { home: home ?? null, accountId, label });
+  const account = mockAccounts.find((item) => item.accountId === accountId);
+  if (!account) throw new Error("账号不存在");
+  account.label = label.trim() || null;
+}
+
+export interface AccountsChanged {
+  ok: boolean;
+  message: string;
+}
+
+/** Fired when the tray menu switched accounts. Returns an unsubscribe function. */
+export async function onAccountsChanged(handler: (payload: AccountsChanged) => void): Promise<() => void> {
+  if (!isTauri) return () => {};
+  return listen<AccountsChanged>("accounts-changed", (event) => handler(event.payload));
 }

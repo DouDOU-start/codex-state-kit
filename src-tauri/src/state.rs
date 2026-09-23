@@ -77,6 +77,17 @@ impl AppState {
         tasks.push(tauri::async_runtime::spawn(async move {
             proxy.run_sidecar_supervisor().await;
         }));
+        let proxy = self.proxy.clone();
+        tasks.push(tauri::async_runtime::spawn(async move {
+            proxy.run_pricing_supervisor().await;
+        }));
+        let proxy = self.proxy.clone();
+        tasks.push(tauri::async_runtime::spawn(async move {
+            // Bind the live environment to the live account once at startup.
+            if let Err(error) = proxy.sync_account_environment().await {
+                eprintln!("[accounts] 绑定账号环境失败: {error:#}");
+            }
+        }));
     }
 
     fn stop_supervisors(&self) {

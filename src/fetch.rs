@@ -1,13 +1,13 @@
-use anyhow::{bail, Context, Result};
-use serde_json::json;
-use std::path::Path;
-use std::time::{Duration, Instant};
 use crate::chatgpt_cookies::{self, RoutingCookie};
 use crate::identity::VmIdentity;
 use crate::login::ChatGptCredentials;
 use crate::logs::{self, NetworkLogDetails};
 use crate::settings::{OutboundMode, Settings};
 use crate::turn_state::{self, HEADER_NAME, MAX_FUTURE_SKEW_SECS};
+use anyhow::{bail, Context, Result};
+use serde_json::json;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 fn responses_url(upstream: &str) -> String {
     format!("{}/responses", upstream.trim().trim_end_matches('/'))
@@ -50,6 +50,13 @@ pub fn outbound_proxy_for_client(raw: &str) -> String {
     } else {
         raw.to_string()
     }
+}
+
+/// The proxy URL to actually connect with: [`outbound_proxy_for_client`],
+/// then routed through the system-proxy relay (see [`crate::system_proxy`]).
+/// Use [`outbound_proxy_for_client`] for display and logs.
+pub fn dial_proxy_for_client(raw: &str) -> String {
+    crate::system_proxy::route(&outbound_proxy_for_client(raw))
 }
 
 pub fn has_session_placeholder(raw: &str) -> bool {
@@ -174,7 +181,7 @@ pub fn http_client(outbound_proxy: &str) -> Result<reqwest::Client> {
         .redirect(reqwest::redirect::Policy::none())
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(4);
-    let proxy = outbound_proxy_for_client(outbound_proxy);
+    let proxy = dial_proxy_for_client(outbound_proxy);
     if !proxy.is_empty() {
         builder = builder.proxy(reqwest::Proxy::all(&proxy).context("出站代理")?);
     }
@@ -295,12 +302,7 @@ pub(crate) async fn fetch_turn_state_with_cookies(
         OutboundMode::Mihomo => logs::ROUTE_EMBEDDED_MIHOMO,
         OutboundMode::Manual => logs::ROUTE_MANUAL_PROXY,
     };
-    *details = logs::token_network_details(
-        &settings.upstream,
-        &effective_proxy,
-        route_kind,
-        model,
-    );
+    *details = logs::token_network_details(&settings.upstream, &effective_proxy, route_kind, model);
     let probe = probe_body(model);
     details.account_id = Some(logs::safe_text(&creds.account_id, 128));
     details.account_email = creds
@@ -855,10 +857,7 @@ mod tests {
             identity.installation_id
         );
         assert_eq!(request.headers["x-codex-window-id"], identity.window_id);
-        assert_eq!(
-            request.headers["x-codex-routing-hint"],
-            "model=gpt-6-astra"
-        );
+        assert_eq!(request.headers["x-codex-routing-hint"], "model=gpt-6-astra");
         assert!(request.headers.get("connection").is_none());
         assert_eq!(request.headers["content-encoding"], "zstd");
         assert_eq!(request.headers["openai-beta"], "responses=experimental");

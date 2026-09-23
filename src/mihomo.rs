@@ -854,13 +854,7 @@ pub fn render_config(
     map.insert(yaml_str("secret"), yaml_str(secret));
     map.insert(
         yaml_str("proxies"),
-        serde_yaml::Value::Sequence(
-            config
-                .nodes
-                .iter()
-                .map(|node| node.spec.clone())
-                .collect(),
-        ),
+        serde_yaml::Value::Sequence(config.nodes.iter().map(|node| node.spec.clone()).collect()),
     );
     let names: Vec<serde_yaml::Value> = config
         .nodes
@@ -886,11 +880,7 @@ fn apply_groups(view: &mut MihomoStatus, groups: &[ProxyGroup]) {
     view.groups = groups.to_vec();
     if let Some(primary) = groups.iter().find(|group| group.group_type == "select") {
         view.selected = primary.now.clone();
-        view.nodes = primary
-            .all
-            .iter()
-            .map(|node| node.name.clone())
-            .collect();
+        view.nodes = primary.all.iter().map(|node| node.name.clone()).collect();
     }
 }
 

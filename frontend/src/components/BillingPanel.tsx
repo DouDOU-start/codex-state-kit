@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
+import { Select } from "@/components/Select";
 import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import { getBillingRecords, getBillingSummary, isTauri } from "@/lib/api";
 import type { BillingRecord, BillingSummary } from "@/types";
@@ -155,9 +156,13 @@ export function BillingPanel({ currentAccountId, currentAccountEmail }: BillingP
         </div>
         <div className="usage-dash__tools">
           {accounts.length > 1 ? (
-            <select aria-label="统计账号" value={selected?.accountId ?? ""} onChange={(event) => setSelectedAccountId(event.target.value)}>
-              {accounts.map((account) => <option key={account.accountId} value={account.accountId}>{account.email || account.accountId}</option>)}
-            </select>
+            <Select
+              variant="compact"
+              ariaLabel="统计账号"
+              value={selected?.accountId ?? ""}
+              options={accounts.map((account) => ({ value: account.accountId, label: account.email || account.accountId }))}
+              onChange={setSelectedAccountId}
+            />
           ) : null}
           <button type="button" onClick={() => void reload()} disabled={loading}>
             <RefreshCw size={13} className={loading ? "is-spinning" : undefined} />

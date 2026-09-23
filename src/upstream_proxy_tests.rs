@@ -79,6 +79,7 @@ fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
         mihomo_subscription: String::new(),
         mihomo_node: String::new(),
         ws_upstream_enabled: settings.ws_upstream_enabled,
+        chain_system_proxy: settings.chain_system_proxy,
     }
 }
 
@@ -191,7 +192,8 @@ async fn upstream_proxy_hot_update_and_failures() {
             .peek_for_model("test-model")
             .is_none());
         assert!(handle.task.lock().await.is_none());
-        assert!(handle.fetch_task.lock().await.is_some());
+        // 换线路会停掉旧的后台取票循环，且不再启动新的。
+        assert!(handle.fetch_task.lock().await.is_none());
         let response = forward_http(
             &app,
             Request::builder().uri("/new").body(Body::empty()).unwrap(),

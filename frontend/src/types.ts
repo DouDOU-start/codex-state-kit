@@ -136,6 +136,15 @@ export interface Status {
   wsUpstreamEnabled: boolean;
   wsUpstreamConnected: boolean;
   wsUpstreamConnectedAt?: string | null;
+  chainSystemProxy?: boolean;
+  systemProxy?: SystemProxyView;
+}
+
+export interface SystemProxyView {
+  enabled: boolean;
+  /** e.g. "HTTP 127.0.0.1:7897" */
+  detected?: string | null;
+  lastError?: string | null;
 }
 
 export interface SettingsPatch {
@@ -155,6 +164,7 @@ export interface SettingsPatch {
   mihomoSubscription: string;
   mihomoNode: string;
   wsUpstreamEnabled?: boolean;
+  chainSystemProxy?: boolean;
 }
 
 export type TokenReusePolicy = "shared_292" | "per_model";
@@ -258,7 +268,10 @@ export interface BillingUsageTotals {
   unknownUsageCount: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheWriteTokens?: number;
   outputTokens: number;
+  /** Already included in outputTokens. */
+  reasoningTokens?: number;
   costNanos: number | null;
 }
 
@@ -298,9 +311,24 @@ export interface BillingRecord {
   responseModel?: string | null;
   inputTokens?: number | null;
   cachedInputTokens?: number | null;
+  cacheWriteTokens?: number | null;
   outputTokens?: number | null;
+  /** Already included in outputTokens. */
+  reasoningTokens?: number | null;
   usageSource?: string | null;
   pricingRuleId?: number | null;
+  /** Catalog key (or manual rule model) the cost was priced with. */
+  pricingModel?: string | null;
+  serviceTier?: ServiceTier | null;
+  longContext?: boolean;
+  inputCostNanos?: number | null;
+  cacheReadCostNanos?: number | null;
+  cacheWriteCostNanos?: number | null;
+  outputCostNanos?: number | null;
+  /** Persisted time to first visible output. */
+  firstTokenMs?: number | null;
+  /** http | http_sse | http_to_ws | ws_to_ws */
+  transport?: string | null;
   costNanos?: number | null;
   currency?: string | null;
   errorKind?: string | null;
@@ -321,4 +349,55 @@ export interface BillingRecordsPage {
   total: number;
   limit: number;
   offset: number;
+}
+
+export type ServiceTier = "standard" | "priority" | "flex";
+
+/** USD per token. */
+export interface PriceRates {
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+  output: number;
+}
+
+export interface ModelPriceRow {
+  model: string;
+  standard: PriceRates;
+  priority: PriceRates;
+  flex: PriceRates;
+  longContext: { threshold: number; inputMultiplier: number; outputMultiplier: number } | null;
+}
+
+export interface PricingCatalogInfo {
+  source: "bundled" | "cache" | "remote";
+  sha256: string;
+  modelCount: number;
+  remoteUrl: string;
+  lastCheckedAt?: string | null;
+  lastUpdatedAt?: string | null;
+  lastError?: string | null;
+}
+
+export interface PricingView {
+  info: PricingCatalogInfo;
+  models: ModelPriceRow[];
+}
+
+export interface SavedAccount {
+  accountId: string;
+  email?: string | null;
+  label?: string | null;
+  authMode?: string | null;
+  /** Access-token imports cannot refresh and must be re-imported on expiry. */
+  refreshable: boolean;
+  /** The saved credentials still look usable. */
+  usable: boolean;
+  active: boolean;
+  addedAt: string;
+  lastUsedAt?: string | null;
+  /** Installation id of the account's own virtual device. */
+  deviceId?: string | null;
+  /** The account's outbound line, e.g. "手动代理 · socks5://host:port". */
+  network?: string | null;
 }

@@ -80,9 +80,10 @@ impl WsUpstreamPool {
 
     pub async fn snapshot(&self) -> WsSnapshot {
         let guard = self.inner.lock().await;
-        let connected = guard.live.as_ref().is_some_and(|live| {
-            live.connected_at.elapsed() < MAX_AGE
-        });
+        let connected = guard
+            .live
+            .as_ref()
+            .is_some_and(|live| live.connected_at.elapsed() < MAX_AGE);
         WsSnapshot {
             connected,
             connected_at: connected.then(|| guard.connected_at.clone()).flatten(),
@@ -100,22 +101,20 @@ impl WsUpstreamPool {
     pub async fn resolve_proxy(&self, template: &str, bound: Option<&str>) -> Result<String> {
         let template = template.trim();
         if !fetch::has_session_placeholder(template) {
-            return Ok(fetch::outbound_proxy_for_client(template));
+            return Ok(fetch::dial_proxy_for_client(template));
         }
         if let Some(session) = bound.map(str::trim).filter(|value| !value.is_empty()) {
-            return Ok(fetch::outbound_proxy_for_client(
-                &fetch::apply_bound_session(template, Some(session))?,
-            ));
+            return Ok(fetch::dial_proxy_for_client(&fetch::apply_bound_session(
+                template,
+                Some(session),
+            )?));
         }
         let mut guard = self.inner.lock().await;
         if guard.sticky_session.is_none() {
             guard.sticky_session = Some(fetch::generate_proxy_session());
         }
-        let session = guard
-            .sticky_session
-            .clone()
-            .context("缺少代理 session")?;
-        Ok(fetch::outbound_proxy_for_client(
+        let session = guard.sticky_session.clone().context("缺少代理 session")?;
+        Ok(fetch::dial_proxy_for_client(
             &fetch::replace_session_placeholder(template, &session),
         ))
     }
@@ -160,19 +159,20 @@ fn idle_timeout(saw_event: bool) -> Duration {
 
 async fn ensure(inner: &mut Inner, dial: &WsDial) -> Result<()> {
     let key = dial.key();
-    let fresh = inner.live.as_ref().is_some_and(|live| {
-        live.key == key && connection_fresh(live.connected_at.elapsed())
-    });
+    let fresh = inner
+        .live
+        .as_ref()
+        .is_some_and(|live| live.key == key && connection_fresh(live.connected_at.elapsed()));
     if fresh {
         return Ok(());
     }
-        let replacing = inner.live.is_some();
-        inner.live = None;
-        inner.connected_at = None;
-        if replacing {
-            inner.sticky_session = None;
-        }
-        let ws = connect_upstream(dial).await?;
+    let replacing = inner.live.is_some();
+    inner.live = None;
+    inner.connected_at = None;
+    if replacing {
+        inner.sticky_session = None;
+    }
+    let ws = connect_upstream(dial).await?;
     inner.connected_at = Some(chrono::Utc::now().to_rfc3339());
     inner.live = Some(Live {
         ws,
@@ -183,10 +183,7 @@ async fn ensure(inner: &mut Inner, dial: &WsDial) -> Result<()> {
 }
 
 async fn send_frame(inner: &mut Inner, payload: &Value) -> Result<()> {
-    let live = inner
-        .live
-        .as_mut()
-        .context("上游 WebSocket 未连接")?;
+    let live = inner.live.as_mut().context("上游 WebSocket 未连接")?;
     let text = serde_json::to_string(payload).context("无法序列化 WebSocket 请求")?;
     live.ws
         .send(Message::text(text))
@@ -236,9 +233,7 @@ async fn drive(
                     if send_frame(&mut guard, &payload).await.is_err() {
                         guard.live = None;
                         guard.connected_at = None;
-                        let _ = tx
-                            .send(Err("链式响应已失效，重发失败".into()))
-                            .await;
+                        let _ = tx.send(Err("链式响应已失效，重发失败".into())).await;
                         break;
                     }
                     continue;
@@ -386,9 +381,7 @@ async fn connect_via_proxy(proxy: &str, host: &str, port: u16) -> Result<BoxIo> 
         "http" => connect_via_http_proxy(&url, host, port).await,
         "socks5" | "socks5h" => connect_via_socks5(&url, host, port).await,
         "socks4" | "socks4a" => connect_via_socks4(&url, host, port).await,
-        "https" => Err(anyhow!(
-            "HTTPS 代理暂不支持 WebSocket 隧道，将回退 HTTP"
-        )),
+        "https" => Err(anyhow!("HTTPS 代理暂不支持 WebSocket 隧道，将回退 HTTP")),
         other => Err(anyhow!("不支持的 WebSocket 代理协议: {other}")),
     }
 }

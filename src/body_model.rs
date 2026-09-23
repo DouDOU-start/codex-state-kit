@@ -74,6 +74,53 @@ pub fn rewrite_model_in_body(
     }
 }
 
+/// 读取请求体顶层的字符串字段（如 `service_tier`），支持 zstd / gzip / deflate。
+pub fn extract_str_field(bytes: &[u8], encoding: Option<&str>, key: &str) -> Option<String> {
+    let plain = match detect_body_compression(bytes, encoding) {
+        None => bytes.to_vec(),
+        Some("zstd") => zstd::decode_all(std::io::Cursor::new(bytes)).ok()?,
+        Some("gzip") => decompress_named(bytes, "gzip")?,
+        Some("deflate") => {
+            decompress_named(bytes, "deflate").or_else(|| decompress_named(bytes, "raw_deflate"))?
+        }
+        Some(_) => return None,
+    };
+    serde_json::from_slice::<Value>(&plain)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Codex HTTP `/responses` 不接受 `previous_response_id`（只有 WebSocket 链式续跑会用），
+/// 走 HTTP 转发前去掉它，否则上游返回 `Invalid previous_response_id`。
+/// 字段不存在、正文无法解析或无法重新压缩时原样返回。
+pub fn strip_previous_response_id(bytes: &[u8], encoding: Option<&str>) -> Vec<u8> {
+    let stripped = match detect_body_compression(bytes, encoding) {
+        None => strip_previous_response_id_json(bytes),
+        Some("zstd") => zstd::decode_all(std::io::Cursor::new(bytes))
+            .ok()
+            .and_then(|plain| strip_previous_response_id_json(&plain))
+            .and_then(|plain| zstd::encode_all(plain.as_slice(), 0).ok()),
+        Some("gzip") => decompress_named(bytes, "gzip")
+            .and_then(|plain| strip_previous_response_id_json(&plain))
+            .and_then(|plain| compress_gzip(&plain).ok()),
+        Some("deflate") => decompress_named(bytes, "deflate")
+            .or_else(|| decompress_named(bytes, "raw_deflate"))
+            .and_then(|plain| strip_previous_response_id_json(&plain))
+            .and_then(|plain| compress_deflate(&plain).ok()),
+        Some(_) => None,
+    };
+    stripped.unwrap_or_else(|| bytes.to_vec())
+}
+
+/// 字段不存在或正文不是 JSON 对象时返回 `None`，表示无需改写。
+fn strip_previous_response_id_json(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(bytes).ok()?;
+    value.as_object_mut()?.remove("previous_response_id")?;
+    serde_json::to_vec(&value).ok()
+}
+
 fn detect_body_compression(bytes: &[u8], encoding: Option<&str>) -> Option<&'static str> {
     let encoding = encoding.unwrap_or("").to_ascii_lowercase();
     if encoding.contains("zstd")
@@ -166,4 +213,69 @@ fn extract_model_from_json(bytes: &[u8]) -> Option<String> {
 
 fn try_decompress_and_extract(bytes: &[u8], method: &str) -> Option<String> {
     decompress_named(bytes, method).and_then(|plain| extract_model_from_json(&plain))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_str_field_reads_plain_and_compressed_bodies() {
+        let plain = br#"{"model":"gpt-5.1-codex","service_tier":"priority"}"#;
+        assert_eq!(
+            extract_str_field(plain, None, "service_tier").as_deref(),
+            Some("priority")
+        );
+        let compressed = zstd::encode_all(plain.as_slice(), 3).unwrap();
+        assert_eq!(
+            extract_str_field(&compressed, Some("zstd"), "service_tier").as_deref(),
+            Some("priority")
+        );
+        assert_eq!(extract_str_field(plain, None, "missing"), None);
+    }
+
+    #[test]
+    fn strip_previous_response_id_removes_only_that_field() {
+        let input = br#"{"model":"gpt-6-astra","previous_response_id":"resp_1","input":[]}"#;
+        let value: Value =
+            serde_json::from_slice(&strip_previous_response_id(input, None)).unwrap();
+        assert!(value.get("previous_response_id").is_none());
+        assert_eq!(
+            value.get("model").and_then(Value::as_str),
+            Some("gpt-6-astra")
+        );
+        assert!(value.get("input").is_some());
+    }
+
+    #[test]
+    fn strip_previous_response_id_keeps_bytes_when_absent_or_invalid() {
+        let absent = br#"{"model":"gpt-6-astra","input":[]}"#;
+        assert_eq!(strip_previous_response_id(absent, None), absent);
+        let invalid = b"not-json-at-all";
+        assert_eq!(strip_previous_response_id(invalid, None), invalid);
+    }
+
+    #[test]
+    fn strip_previous_response_id_handles_compressed_bodies() {
+        let plain = br#"{"model":"gpt-6-astra","previous_response_id":"resp_z","input":[]}"#;
+        let cases = [
+            ("zstd", zstd::encode_all(plain.as_slice(), 3).unwrap()),
+            ("gzip", compress_gzip(plain).unwrap()),
+            ("deflate", compress_deflate(plain).unwrap()),
+        ];
+        for (encoding, compressed) in cases {
+            let result = strip_previous_response_id(&compressed, Some(encoding));
+            let decompressed = match encoding {
+                "zstd" => zstd::decode_all(std::io::Cursor::new(&result)).unwrap(),
+                other => decompress_named(&result, other).unwrap(),
+            };
+            let value: Value = serde_json::from_slice(&decompressed).unwrap();
+            assert!(value.get("previous_response_id").is_none(), "{encoding}");
+            assert_eq!(
+                value.get("model").and_then(Value::as_str),
+                Some("gpt-6-astra"),
+                "{encoding}"
+            );
+        }
+    }
 }

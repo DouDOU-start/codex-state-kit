@@ -18,8 +18,9 @@ use tokio::sync::{oneshot, Mutex, Notify};
 use tokio::task::JoinHandle;
 use url::Url;
 
+use crate::accounts::{self, AccountEnvironment, NetworkProfile};
 use crate::attach::{self, is_attached};
-use crate::billing::{BillingStore, RequestStart, TokenUsage, UsageOutcome, UsageState};
+use crate::billing::{BillingStore, RequestStart, UsageOutcome, UsageState};
 use crate::chatgpt_cookies::{self, RoutingCookie};
 use crate::diag;
 use crate::fetch;
@@ -318,6 +319,9 @@ pub struct Status {
     pub diag_log_path: String,
     pub vm_identity: identity::VmIdentityView,
     pub ws_upstream_enabled: bool,
+    pub chain_system_proxy: bool,
+    /// Detected OS system proxy and the relay's last error.
+    pub system_proxy: crate::system_proxy::SystemProxyView,
     pub ws_upstream_connected: bool,
     pub ws_upstream_connected_at: Option<String>,
 }
@@ -385,6 +389,7 @@ impl App {
     }
 
     pub fn with_mihomo(settings: Settings, mihomo: MihomoRuntime) -> Result<Self> {
+        crate::system_proxy::set_enabled(settings.chain_system_proxy);
         let business_proxy = resolved_proxy(&settings, &mihomo);
         let http = pooled_upstream(business_proxy_key(&business_proxy, None)?)?;
         let billing_path = crate::home_dir().join(if cfg!(debug_assertions) {
@@ -395,7 +400,14 @@ impl App {
         let billing = if cfg!(test) {
             BillingStore::open_in_memory()?
         } else {
-            BillingStore::open(billing_path)?
+            let pricing = crate::pricing::PriceBook::load(crate::home_dir().join(
+                if cfg!(debug_assertions) {
+                    ".codex-state-kit-dev-pricing.json"
+                } else {
+                    ".codex-state-kit-pricing.json"
+                },
+            ));
+            BillingStore::open(billing_path, Arc::new(pricing))?
         };
         let mut turn_state = TurnStateStore::load();
         turn_state.set_reuse_policy(settings.token_reuse_policy);
@@ -640,9 +652,23 @@ impl App {
             diag_log_path: diag::path().display().to_string(),
             vm_identity: self.vm_identity.lock().await.view(),
             ws_upstream_enabled: settings.ws_upstream_enabled,
+            chain_system_proxy: settings.chain_system_proxy,
+            system_proxy: tokio::task::spawn_blocking(crate::system_proxy::view)
+                .await
+                .unwrap_or_else(|_| crate::system_proxy::view()),
             ws_upstream_connected: ws.connected,
             ws_upstream_connected_at: ws.connected_at,
         }
+    }
+
+    /// The outbound line for ChatGPT login and token import: the same exit
+    /// (and `{session}`) business requests use, so a new account signs in
+    /// from the line it is then bound to. Empty when no line is configured.
+    pub async fn login_proxy(&self) -> String {
+        let settings = self.settings.lock().await.clone();
+        let template = resolved_proxy(&settings, &self.mihomo);
+        let session = self.turn_state.lock().await.bound_proxy_session();
+        business_proxy_key(&template, session.as_deref()).unwrap_or_default()
     }
 
     pub async fn refresh_turn_state(&self) -> Result<Status> {
@@ -1473,6 +1499,7 @@ impl App {
             started_at,
             requested_model: Some(model.to_owned()),
             sent_model: Some(model.to_owned()),
+            service_tier: None,
         }) {
             Ok(_) => Some(BillingRequest::new(self.billing.clone(), request_id)),
             Err(error) => {
@@ -1552,6 +1579,8 @@ pub struct ProxyHandle {
     settings_change: Arc<Mutex<()>>,
     managed_routes: Arc<std::sync::Mutex<Option<attach::ManagedRoutes>>>,
     attach_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// Serialises binding the live environment to accounts.
+    account_env: Arc<Mutex<()>>,
 }
 
 impl ProxyHandle {
@@ -1565,6 +1594,7 @@ impl ProxyHandle {
             settings_change: Arc::new(Mutex::new(())),
             managed_routes: Arc::new(std::sync::Mutex::new(None)),
             attach_error: Arc::new(std::sync::Mutex::new(None)),
+            account_env: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1608,6 +1638,7 @@ impl ProxyHandle {
             identity.save()?;
         }
         self.app.ws_upstream.invalidate().await;
+        self.remember_account_environment().await;
         Ok(self.managed_status().await)
     }
 
@@ -1618,6 +1649,7 @@ impl ProxyHandle {
             identity.save()?;
         }
         self.app.ws_upstream.invalidate().await;
+        self.remember_account_environment().await;
         Ok(self.managed_status().await)
     }
 
@@ -1633,6 +1665,7 @@ impl ProxyHandle {
             identity.save()?;
         }
         self.app.ws_upstream.invalidate().await;
+        self.remember_account_environment().await;
         Ok(self.managed_status().await)
     }
 
@@ -1755,15 +1788,126 @@ impl ProxyHandle {
     }
 
     pub async fn apply_settings(&self, patch: SettingsPatch) -> Result<Status> {
-        let next = patch.into_settings()?;
+        let status = self.apply_settings_to(patch.into_settings()?).await?;
+        // Outbound edits belong to the account that is currently live.
+        self.remember_account_environment().await;
+        Ok(status)
+    }
+
+    /// The environment Kit is using right now: virtual device and outbound line.
+    async fn current_environment(&self) -> AccountEnvironment {
+        let settings = self.app.settings.lock().await.clone();
+        let vm = self.app.vm_identity.lock().await.clone();
+        let mihomo = self.app.mihomo.status();
+        let mihomo_selections =
+            if settings.outbound_mode == OutboundMode::Mihomo && mihomo.phase == "connected" {
+                mihomo
+                    .groups
+                    .iter()
+                    .filter(|group| {
+                        matches!(
+                            group.group_type.to_ascii_lowercase().as_str(),
+                            "select" | "selector"
+                        )
+                    })
+                    .filter_map(|group| group.now.clone().map(|node| (group.name.clone(), node)))
+                    .collect()
+            } else {
+                Default::default()
+            };
+        AccountEnvironment {
+            vm,
+            network: NetworkProfile {
+                outbound_mode: settings.outbound_mode,
+                outbound_proxy: settings.outbound_proxy,
+                mihomo_subscription: settings.mihomo_subscription,
+                mihomo_node: settings.mihomo_node,
+                mihomo_selections,
+            },
+        }
+    }
+
+    /// Makes an account's saved environment live.
+    async fn apply_environment(&self, target: &AccountEnvironment) -> Result<()> {
+        {
+            let next = target.vm.clone().with_runtime_ids();
+            next.save()?;
+            *self.app.vm_identity.lock().await = next;
+        }
+        self.app.ws_upstream.invalidate().await;
+        let mut next = self.app.settings.lock().await.clone();
+        let network = &target.network;
+        let network_changed = next.outbound_mode != network.outbound_mode
+            || next.outbound_proxy != network.outbound_proxy
+            || next.mihomo_subscription != network.mihomo_subscription
+            || next.mihomo_node != network.mihomo_node;
+        if network_changed {
+            next.outbound_mode = network.outbound_mode;
+            next.outbound_proxy = network.outbound_proxy.clone();
+            next.mihomo_subscription = network.mihomo_subscription.clone();
+            next.mihomo_node = network.mihomo_node.clone();
+            self.apply_settings_to(next).await?;
+        }
+        if network.outbound_mode == OutboundMode::Mihomo && !network.mihomo_selections.is_empty() {
+            let app = self.app.clone();
+            let selections = network.mihomo_selections.clone();
+            tokio::spawn(async move { restore_mihomo_selections(app, selections).await });
+        }
+        Ok(())
+    }
+
+    /// Binds the live environment to the live account: saves it for the
+    /// account that owned it and, when the live account changed (switch or
+    /// new login), makes that account's own environment live. A newly seen
+    /// account gets a new virtual device and keeps the current line.
+    pub async fn sync_account_environment(&self) -> Result<()> {
+        let _guard = self.account_env.lock().await;
+        let home = std::path::PathBuf::from(self.app.settings.lock().await.codex_home.clone());
+        let current = self.current_environment().await;
+        let Some(plan) = accounts::plan_environment(&home, &current, |env| AccountEnvironment {
+            vm: env.vm.renewed(),
+            network: env.network.clone(),
+        })?
+        else {
+            return Ok(());
+        };
+        let live = match plan.target {
+            Some(target) if !target.same_as(&current) => {
+                self.apply_environment(&target).await?;
+                target
+            }
+            Some(target) => target,
+            None => current,
+        };
+        accounts::commit_environment(&home, &plan.account_id, &live)
+    }
+
+    async fn remember_account_environment(&self) {
+        if let Err(err) = self.sync_account_environment().await {
+            eprintln!("[accounts] 绑定账号环境失败: {err:#}");
+        }
+    }
+
+    /// Switches the live account and its environment together.
+    pub async fn switch_account(
+        &self,
+        home: &Path,
+        account_id: &str,
+    ) -> Result<login::LoginStatus> {
+        let status = accounts::switch(home, account_id)?;
+        self.sync_account_environment().await?;
+        Ok(status)
+    }
+
+    async fn apply_settings_to(&self, next: Settings) -> Result<Status> {
         let _change = self.settings_change.lock().await;
         let old = self.app.settings.lock().await.clone();
         let next_business = resolved_proxy(&next, &self.app.mihomo);
         let next_http = if resolved_proxy(&old, &self.app.mihomo) != next_business {
-                Some(pooled_upstream(business_proxy_key(&next_business, None)?)?)
-            } else {
-                None
-            };
+            Some(pooled_upstream(business_proxy_key(&next_business, None)?)?)
+        } else {
+            None
+        };
         if old.codex_home != next.codex_home {
             attach::validate_codex_home(Path::new(&next.codex_home))?;
         }
@@ -1800,6 +1944,7 @@ impl ProxyHandle {
                 self.app.mihomo.stop().await;
             }
         }
+        crate::system_proxy::set_enabled(next.chain_system_proxy);
         {
             let mut settings = self.app.settings.lock().await;
             *settings = next.clone();
@@ -1886,6 +2031,39 @@ impl ProxyHandle {
         }
         self.app.sidecar_wake.notify_one();
         Ok(self.managed_status().await)
+    }
+
+    /// Keeps model prices in sync with sub2api's price repo: checks the
+    /// published sha256 every 10 minutes and swaps in a newer catalog.
+    /// Retries after a minute when the outbound line is not ready yet.
+    pub async fn run_pricing_supervisor(&self) {
+        loop {
+            let wait = match self.sync_pricing().await {
+                Ok(_) => crate::pricing::SYNC_INTERVAL,
+                Err(err) => {
+                    eprintln!("[pricing] 同步模型价格失败: {err:#}");
+                    Duration::from_secs(60)
+                }
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// Fetches the price catalog through the configured outbound line.
+    pub async fn sync_pricing(&self) -> Result<crate::pricing::CatalogInfo> {
+        let settings = self.app.settings.lock().await.clone();
+        let (proxy, _) = fetch::resolve_probe_proxy(&resolved_proxy(&settings, &self.app.mihomo));
+        let client = fetch::http_client(&proxy)?;
+        let pricing = self.app.billing.pricing();
+        if pricing.sync(&client).await? {
+            let info = pricing.info();
+            eprintln!(
+                "[pricing] 已更新模型价格：{} 个模型，sha256 {}",
+                info.model_count,
+                &info.sha256[..info.sha256.len().min(12)]
+            );
+        }
+        Ok(pricing.info())
     }
 
     pub async fn run_sidecar_supervisor(&self) {
@@ -2349,16 +2527,15 @@ impl ResponseLogTracker {
             finished_at: Some(chrono::Utc::now().to_rfc3339()),
             http_status: Some(self.entry.status),
             response_model: self.metrics.upstream_response_model().map(str::to_owned),
-            usage: TokenUsage {
-                input_tokens: self.metrics.input_tokens(),
-                cached_input_tokens: self.metrics.cached_input_tokens(),
-                output_tokens: self.metrics.output_tokens(),
-            },
+            usage: self.metrics.token_usage(),
             usage_source: self
                 .metrics
                 .usage_seen()
                 .then(|| "provider_response".into()),
             error_kind: self.entry.error_kind.clone(),
+            service_tier: self.metrics.service_tier().map(str::to_owned),
+            first_token_ms: self.metrics.first_token_ms().map(|ms| ms as u64),
+            transport: Some(self.entry.transport.clone()),
         });
         self.billing_settled = true;
     }
@@ -2481,11 +2658,10 @@ impl Drop for ResponseLogTracker {
                     state: UsageState::Interrupted,
                     finished_at: Some(chrono::Utc::now().to_rfc3339()),
                     http_status: Some(self.entry.status),
-                    usage: TokenUsage {
-                        input_tokens: self.metrics.input_tokens(),
-                        cached_input_tokens: self.metrics.cached_input_tokens(),
-                        output_tokens: self.metrics.output_tokens(),
-                    },
+                    usage: self.metrics.token_usage(),
+                    service_tier: self.metrics.service_tier().map(str::to_owned),
+                    first_token_ms: self.metrics.first_token_ms().map(|ms| ms as u64),
+                    transport: Some(self.entry.transport.clone()),
                     usage_source: self
                         .metrics
                         .usage_seen()
@@ -2513,6 +2689,35 @@ impl Drop for ResponseLogTracker {
                 replace_network_log(&app, entry).await;
             });
         }
+    }
+}
+
+/// Re-selects an account's subscription nodes once the core is running.
+async fn restore_mihomo_selections(
+    app: Arc<App>,
+    selections: std::collections::BTreeMap<String, String>,
+) {
+    for _ in 0..60 {
+        if app.mihomo.status().phase == "connected" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let groups = app.mihomo.status().groups;
+    let mut changed = false;
+    for (group, node) in selections {
+        let current = groups.iter().find(|item| item.name == group);
+        let available = current.is_some_and(|item| item.all.iter().any(|n| n.name == node));
+        if !available || current.and_then(|item| item.now.as_deref()) == Some(node.as_str()) {
+            continue;
+        }
+        match app.mihomo.select_in_group(&group, &node).await {
+            Ok(()) => changed = true,
+            Err(err) => eprintln!("[accounts] 恢复订阅节点 {group} → {node} 失败: {err:#}"),
+        }
+    }
+    if changed {
+        app.ws_upstream.invalidate().await;
     }
 }
 
@@ -2570,7 +2775,7 @@ fn upstream_http_client(proxy: &str) -> Result<reqwest::Client> {
         .no_gzip()
         .no_zstd();
     if !proxy.is_empty() {
-        let proxy = reqwest::Proxy::all(fetch::outbound_proxy_for_client(&proxy))
+        let proxy = reqwest::Proxy::all(fetch::dial_proxy_for_client(&proxy))
             .map_err(|_| anyhow::anyhow!("上游转发代理地址无效"))?;
         builder = builder.proxy(proxy);
     }
@@ -2727,8 +2932,7 @@ async fn forward_http_tracked(
     };
     let effective_proxy = fetch::outbound_proxy_for_client(&upstream_proxy);
     *details = business_network_details(&request_settings, &upstream, &effective_proxy);
-    if request_settings.outbound_mode == OutboundMode::Mihomo && upstream_proxy.trim().is_empty()
-    {
+    if request_settings.outbound_mode == OutboundMode::Mihomo && upstream_proxy.trim().is_empty() {
         anyhow::bail!(
             "{}",
             app.mihomo
@@ -2875,6 +3079,11 @@ async fn forward_http_tracked(
                 started_at: chrono::Utc::now().to_rfc3339(),
                 requested_model: request_model.clone(),
                 sent_model,
+                service_tier: crate::body_model::extract_str_field(
+                    &bytes,
+                    content_encoding.as_deref(),
+                    "service_tier",
+                ),
             })
             .context("begin durable billing record")?;
         *billing_request = Some(BillingRequest::new(app.billing.clone(), request_id));
@@ -2927,6 +3136,16 @@ async fn forward_http_tracked(
             Err(err) => {
                 eprintln!("[ws] 上游 WebSocket 失败: {err:#}，回退到 HTTP");
             }
+        }
+    }
+    // WebSocket 链式续跑才认 previous_response_id；走 HTTP 时必须去掉，
+    // 否则上游返回 "Invalid previous_response_id"。
+    if parts.method == http::Method::POST && path.contains("/responses") {
+        let stripped =
+            crate::body_model::strip_previous_response_id(&bytes, content_encoding.as_deref());
+        if stripped.as_slice() != bytes.as_ref() {
+            bytes = stripped.into();
+            details.body_bytes = bytes.len();
         }
     }
     let http = app.business_client(&resolved_proxy).await?;
@@ -2997,10 +3216,7 @@ async fn forward_http_tracked(
         .into(),
     );
 
-    eprintln!(
-        "[resp] {} {} → {}",
-        parts.method, path, resp_status_u16
-    );
+    eprintln!("[resp] {} {} → {}", parts.method, path, resp_status_u16);
 
     let status = StatusCode::from_u16(resp_status_u16)?;
     let mut headers = HeaderMap::new();
@@ -3101,14 +3317,11 @@ fn ws_dial(
     ];
     let model = model.trim();
     if !model.is_empty() && !model.chars().any(char::is_control) {
-        extra_headers.push((
-            "x-codex-routing-hint".into(),
-            identity.routing_hint(model),
-        ));
+        extra_headers.push(("x-codex-routing-hint".into(), identity.routing_hint(model)));
     }
     Ok(WsDial {
         url,
-        proxy: fetch::outbound_proxy_for_client(proxy),
+        proxy: fetch::dial_proxy_for_client(proxy),
         authorization: header_string(headers, "authorization"),
         account_id: header_string(headers, "chatgpt-account-id"),
         extra_headers,
@@ -3312,13 +3525,12 @@ async fn finish_client_ws_turn(
             finished_at: Some(chrono::Utc::now().to_rfc3339()),
             http_status: Some(if failed { 502 } else { 200 }),
             response_model: metrics.upstream_response_model().map(str::to_owned),
-            usage: TokenUsage {
-                input_tokens: metrics.input_tokens(),
-                cached_input_tokens: metrics.cached_input_tokens(),
-                output_tokens: metrics.output_tokens(),
-            },
+            usage: metrics.token_usage(),
             usage_source: metrics.usage_seen().then(|| "provider_response".into()),
             error_kind: failed.then(|| "ws_upstream".into()),
+            service_tier: metrics.service_tier().map(str::to_owned),
+            first_token_ms: metrics.first_token_ms().map(|ms| ms as u64),
+            transport: Some("ws_to_ws".into()),
         });
     }
     let settings = app.settings.lock().await.clone();
@@ -3444,6 +3656,7 @@ mod tests {
                 started_at: chrono::Utc::now().to_rfc3339(),
                 requested_model: Some("gpt-test".into()),
                 sent_model: Some("gpt-test".into()),
+                service_tier: None,
             })
             .unwrap();
         {
@@ -4107,8 +4320,7 @@ mod tests {
 
     #[tokio::test]
     async fn business_forward_replaces_client_identity() {
-        let (sent, mut received) =
-            tokio::sync::mpsc::unbounded_channel::<(HeaderMap, Vec<u8>)>();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<(HeaderMap, Vec<u8>)>();
         let upstream = axum::Router::new().fallback(move |req: Request<Body>| {
             let sent = sent.clone();
             async move {
@@ -4147,7 +4359,7 @@ mod tests {
                 .header("x-codex-turn-metadata", "client-turn")
                 .header(header::COOKIE, "__cf_bm=client")
                 .body(Body::from(
-                    r#"{"model":"gpt-test","client_metadata":{"x-codex-installation-id":"client-install","session_id":"client-session","x-codex-window-id":"client-window","thread_id":"thread-keep","turn_id":"turn-keep"}}"#,
+                    r#"{"model":"gpt-test","previous_response_id":"resp_1","client_metadata":{"x-codex-installation-id":"client-install","session_id":"client-session","x-codex-window-id":"client-window","thread_id":"thread-keep","turn_id":"turn-keep"}}"#,
                 ))
                 .unwrap(),
         )
@@ -4167,6 +4379,7 @@ mod tests {
         assert!(headers.get("x-codex-turn-metadata").is_none());
         assert!(headers.get(header::COOKIE).is_none());
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.get("previous_response_id").is_none());
         let metadata = value["client_metadata"].as_object().unwrap();
         assert_eq!(
             metadata["x-codex-installation-id"],
@@ -4233,7 +4446,10 @@ mod tests {
             identity.installation_id
         );
         assert_eq!(frame["client_metadata"]["session_id"], identity.session_id);
-        assert_eq!(frame["client_metadata"]["x-codex-window-id"], identity.window_id);
+        assert_eq!(
+            frame["client_metadata"]["x-codex-window-id"],
+            identity.window_id
+        );
         assert_eq!(frame["client_metadata"]["thread_id"], "keep");
         assert_eq!(frame["client_metadata"]["turn_id"], "turn");
     }
