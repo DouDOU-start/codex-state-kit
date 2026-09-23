@@ -2929,6 +2929,16 @@ async fn forward_http_tracked(
             }
         }
     }
+    // WebSocket 链式续跑才认 previous_response_id；走 HTTP 时必须去掉，
+    // 否则上游返回 "Invalid previous_response_id"。
+    if parts.method == http::Method::POST && path.contains("/responses") {
+        let stripped =
+            crate::body_model::strip_previous_response_id(&bytes, content_encoding.as_deref());
+        if stripped.as_slice() != bytes.as_ref() {
+            bytes = stripped.into();
+            details.body_bytes = bytes.len();
+        }
+    }
     let http = app.business_client(&resolved_proxy).await?;
     let mut builder = http
         .request(
@@ -4147,7 +4157,7 @@ mod tests {
                 .header("x-codex-turn-metadata", "client-turn")
                 .header(header::COOKIE, "__cf_bm=client")
                 .body(Body::from(
-                    r#"{"model":"gpt-test","client_metadata":{"x-codex-installation-id":"client-install","session_id":"client-session","x-codex-window-id":"client-window","thread_id":"thread-keep","turn_id":"turn-keep"}}"#,
+                    r#"{"model":"gpt-test","previous_response_id":"resp_1","client_metadata":{"x-codex-installation-id":"client-install","session_id":"client-session","x-codex-window-id":"client-window","thread_id":"thread-keep","turn_id":"turn-keep"}}"#,
                 ))
                 .unwrap(),
         )
@@ -4167,6 +4177,7 @@ mod tests {
         assert!(headers.get("x-codex-turn-metadata").is_none());
         assert!(headers.get(header::COOKIE).is_none());
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.get("previous_response_id").is_none());
         let metadata = value["client_metadata"].as_object().unwrap();
         assert_eq!(
             metadata["x-codex-installation-id"],
