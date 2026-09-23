@@ -101,6 +101,17 @@ svg { flex-shrink: 0; }
 .latency-row { display: flex; align-items: center; gap: 8px; margin: 8px 0 2px; }
 .latency-row__ok { color: var(--green); font-size: 12px; font-weight: 650; }
 .latency-row__bad { color: var(--red); font-size: 11px; }
+.page-tabs { position: sticky; top: 0; z-index: 5; display: flex; align-self: flex-start; max-width: 100%; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: #f0f3f7; box-shadow: 0 6px 14px -12px rgba(48, 66, 88, .35); }
+.page-tabs button { position: relative; display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; gap: 7px; min-height: 32px; padding: 0 16px; border: 1px solid transparent; border-radius: 8px; color: var(--muted); background: transparent; font-size: 11px; white-space: nowrap; cursor: pointer; transition: color .15s, background .15s, border-color .15s; }
+.page-tabs button:hover { color: var(--text-soft); background: #f7f9fb; }
+.page-tabs button[aria-selected="true"] { color: var(--accent-strong); background: var(--surface); border-color: #dbe4ef; box-shadow: 0 2px 4px #273d5408; font-weight: 600; }
+.page-tabs button:focus-visible { outline: 3px solid #89acd4; outline-offset: 1px; }
+.page-tabs__alert { width: 6px; height: 6px; border-radius: 50%; background: var(--red); }
+.tab-panel { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.tab-panel.panel { display: block; }
+.tab-panel[hidden] { display: none !important; }
+.tab-panel--split { display: grid; grid-template-columns: 1.15fr .85fr; align-items: start; }
+.tab-panel--split > .panel > :last-child { margin-bottom: 0; }
 .account-traffic { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 18px; padding: 15px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .account-traffic__heading { display: flex; align-items: center; gap: 10px; color: var(--accent); }
 .account-traffic__heading h2 { margin: 0; color: var(--text); font-size: 12px; font-weight: 600; }
@@ -379,7 +390,7 @@ svg { flex-shrink: 0; }
 .spinner--blue { color: var(--accent); }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 900px) { .dash-page { width: calc(100% - 40px); padding-top: 16px; gap: 12px; } .panel { padding: 15px; } .dash-grid { gap: 14px; } .token-card { padding: 15px; } .token-card__badge { display: none; } }
-@media (max-width: 740px) { .dash-grid { grid-template-columns: 1fr; } .connection-section + .connection-section { padding-left: 0; padding-top: 20px; border-left: 0; border-top: 1px solid var(--line); } .field.connection-directory { align-items: stretch; flex-direction: column; gap: 8px; } .page-heading { align-items: flex-start; flex-direction: column; gap: 10px; } .page-actions { justify-content: flex-start; } .titlebar { padding-left: 16px; } .dash-page { width: calc(100% - 32px); } .page-footer > span:last-child { display: none; } .network-log-dialog { width: calc(100vw - 20px); height: calc(100vh - 24px); } .network-route-line { grid-template-columns: 1fr; gap: 4px; } }
+@media (max-width: 740px) { .tab-panel--split { grid-template-columns: 1fr; } .page-tabs { overflow-x: auto; } .dash-grid { grid-template-columns: 1fr; } .connection-section + .connection-section { padding-left: 0; padding-top: 20px; border-left: 0; border-top: 1px solid var(--line); } .field.connection-directory { align-items: stretch; flex-direction: column; gap: 8px; } .page-heading { align-items: flex-start; flex-direction: column; gap: 10px; } .page-actions { justify-content: flex-start; } .titlebar { padding-left: 16px; } .dash-page { width: calc(100% - 32px); } .page-footer > span:last-child { display: none; } .network-log-dialog { width: calc(100vw - 20px); height: calc(100vh - 24px); } .network-route-line { grid-template-columns: 1fr; gap: 4px; } }
 @media (max-width: 440px) { .logo__word { font-size: 12px; } .window-controls button { width: 31px; } .token-card { padding: 17px; } .token-card__icon { display: none; } .network-log-dialog__header { align-items: flex-start; padding: 13px; } .network-log-dialog__title p { display: none; } .network-route-overview { padding: 9px 13px; } }
 .token-models { display: flex; flex-direction: column; gap: 8px; width: 100%; padding-top: 10px; border-top: 1px solid #e4ecf4; }
 .token-model-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }

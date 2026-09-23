@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import Copy from "lucide-react/dist/esm/icons/copy.js";
 import ExternalLink from "lucide-react/dist/esm/icons/external-link.js";
 import LogIn from "lucide-react/dist/esm/icons/log-in.js";
@@ -11,6 +11,8 @@ import Terminal from "lucide-react/dist/esm/icons/terminal.js";
 import CircleCheck from "lucide-react/dist/esm/icons/circle-check.js";
 import Radio from "lucide-react/dist/esm/icons/radio.js";
 import Waypoints from "lucide-react/dist/esm/icons/waypoints.js";
+import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.js";
+import Settings2 from "lucide-react/dist/esm/icons/settings-2.js";
 import { AppShell } from "@/components/AppShell";
 import { BillingPanel } from "@/components/BillingPanel";
 import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
@@ -40,6 +42,27 @@ function degradeChip(status: Status) {
   return { label: "312 降智", className: "runtime-chip runtime-chip--down" };
 }
 
+type TabId = "overview" | "network" | "account" | "device";
+
+const TABS: { id: TabId; label: string; Icon: typeof Activity }[] = [
+  { id: "overview", label: "概览", Icon: LayoutDashboard },
+  { id: "network", label: "出站网络", Icon: Network },
+  { id: "account", label: "Codex 接入", Icon: Terminal },
+  { id: "device", label: "虚拟设备", Icon: Monitor },
+];
+
+const TAB_STORAGE_KEY = "codex-state-kit.tab";
+
+function initialTab(): TabId {
+  try {
+    const saved = window.localStorage.getItem(TAB_STORAGE_KEY);
+    if (TABS.some((tab) => tab.id === saved)) return saved as TabId;
+  } catch {
+    // ignore
+  }
+  return "overview";
+}
+
 export default function App() {
   const fwd = useCodexStateKit();
   const [codexHome, setCodexHome] = useState("");
@@ -57,6 +80,8 @@ export default function App() {
   const [refreshTokenInput, setRefreshTokenInput] = useState("");
   const [accessTokenInput, setAccessTokenInput] = useState("");
   const [networkLogsOpen, setNetworkLogsOpen] = useState(false);
+  const [tab, setTab] = useState<TabId>(initialTab);
+  const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
   const networkLogTriggerRef = useRef<HTMLButtonElement>(null);
   const hydrated = useRef(false);
 
@@ -78,6 +103,31 @@ export default function App() {
       setVmTerminal(identity.terminal);
     }
   }, [fwd.status]);
+
+  function selectTab(next: TabId, focus = false) {
+    setTab(next);
+    if (focus) tabRefs.current[next]?.focus();
+    try {
+      window.localStorage.setItem(TAB_STORAGE_KEY, next);
+    } catch {
+      // ignore
+    }
+  }
+
+  function onTabKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    const focused = TABS.findIndex((item) => tabRefs.current[item.id] === document.activeElement);
+    const index = focused === -1 ? TABS.findIndex((item) => item.id === tab) : focused;
+    const last = TABS.length - 1;
+    const next =
+      event.key === "ArrowRight" ? (index === last ? 0 : index + 1)
+        : event.key === "ArrowLeft" ? (index === 0 ? last : index - 1)
+          : event.key === "Home" ? 0
+            : event.key === "End" ? last
+              : null;
+    if (next === null) return;
+    event.preventDefault();
+    selectTab(TABS[next].id, true);
+  }
 
   function applyVmDraft(identity: VmIdentityView) {
     setCliVersion(identity.cliVersion);
@@ -122,6 +172,10 @@ export default function App() {
         : null,
   ].filter(Boolean).join(" · ");
   const degrade = degradeChip(fwd.status);
+  const tabAlert: Partial<Record<TabId, string>> = {
+    network: fwd.status.proxyError || fwd.status.mihomo?.error ? "出站网络异常" : undefined,
+    account: loggedIn ? undefined : "尚未登录",
+  };
   const selectedNode = mihomoNode || fwd.status.mihomo?.selected || "";
   const selectedNodeDelay = fwd.latency.mihomo?.samples.find((item) => item.name === selectedNode);
   const mihomoGroups = fwd.status?.mihomo.groups ?? [];
@@ -203,6 +257,36 @@ export default function App() {
           </div>
         ) : null}
 
+        {fwd.status.degraded ? (
+          <div className="banner banner--error" role="alert">
+            <span>
+              <TriangleAlert size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
+              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}。
+            </span>
+          </div>
+        ) : null}
+
+        <div className="page-tabs" role="tablist" aria-label="页面分区" onKeyDown={onTabKeyDown}>
+          {TABS.map(({ id, label, Icon }) => (
+            <button
+              key={id}
+              ref={(node) => { tabRefs.current[id] = node; }}
+              id={`tab-${id}`}
+              type="button"
+              role="tab"
+              aria-selected={tab === id}
+              aria-controls={`tabpanel-${id}`}
+              tabIndex={tab === id ? 0 : -1}
+              onClick={() => selectTab(id)}
+            >
+              <Icon size={14} aria-hidden="true" />
+              {label}
+              {tabAlert[id] ? <i className="page-tabs__alert" title={tabAlert[id]} aria-label={tabAlert[id]} /> : null}
+            </button>
+          ))}
+        </div>
+
+        <div className="tab-panel" role="tabpanel" id="tabpanel-overview" aria-labelledby="tab-overview" hidden={tab !== "overview"}>
         <section className="account-traffic" aria-label="当前账号请求统计">
           <div className="account-traffic__heading">
             <Activity size={19} aria-hidden="true" />
@@ -227,21 +311,12 @@ export default function App() {
           currentAccountId={fwd.status.currentAccountId}
           currentAccountEmail={fwd.status.currentAccountEmail}
         />
+        </div>
 
-        {fwd.status.degraded ? (
-          <div className="banner banner--error" role="alert">
-            <span>
-              <TriangleAlert size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
-              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}。
-            </span>
-          </div>
-        ) : null}
 
-        <div className="panel dash-grid">
-        <section className="connection-section panel--proxy">
+        <section className="panel tab-panel" role="tabpanel" id="tabpanel-network" aria-labelledby="tab-network" hidden={tab !== "network"}>
           <header>
             <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站网络</h2><p>获取 Token 与业务发送共用这一条出站线路</p></div></div>
-            <span className="section-step">01</span>
           </header>
           <div className="proxy-mode" role="group" aria-label="出站代理模式">
             <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "manual")}><Network size={14} />手动代理</button>
@@ -353,10 +428,10 @@ export default function App() {
           )}
         </section>
 
-        <section className="connection-section">
+        <div className="tab-panel tab-panel--split" role="tabpanel" id="tabpanel-account" aria-labelledby="tab-account" hidden={tab !== "account"}>
+        <section className="panel">
           <header>
             <div className="section-heading"><span className="section-icon section-icon--warm"><Terminal size={19} /></span><div><h2>Codex 接入</h2><p>登录账号，连接你的客户端</p></div></div>
-            <span className="section-step">02</span>
           </header>
           <div className="proxy-mode login-methods" role="group" aria-label="登录方式">
             <button type="button" aria-pressed={loginMode === "browser"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMode("browser")}><ExternalLink size={14} />浏览器回调</button>
@@ -479,13 +554,17 @@ export default function App() {
             浏览器与授权码走官方 OAuth；Refresh Token 会换票并保存轮换凭据；Access Token 以 Codex 外部 Token 模式接入，过期后需重新导入。凭据提交后不回显、不写日志。 启动后自动接入，关闭时还原原来的官方账号、路由和本地模型配置。
           </p>
         </section>
-          <label className="field connection-directory">
+        <section className="panel">
+          <header>
+            <div className="section-heading"><span className="section-icon"><Settings2 size={19} /></span><div><h2>转发设置</h2><p>本机 Codex 目录与上游模型</p></div></div>
+          </header>
+          <label className="field">
             <span>Codex 工作目录</span>
             <input spellCheck={false} disabled={fwd.busy !== null} value={codexHome} onChange={(event) => setCodexHome(event.target.value)}
               onBlur={() => void fwd.saveSettings(codexHome, outboundProxy)}
               onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} />
           </label>
-          <label className="field connection-directory">
+          <label className="field">
             <span>强制绑定模型</span>
             <input
               spellCheck={false}
@@ -501,9 +580,10 @@ export default function App() {
             />
           </label>
           <p className="panel__hint">填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游，Token 也按该模型获取和复用。</p>
+        </section>
         </div>
 
-        <section className="panel vm-panel">
+        <section className="panel vm-panel tab-panel" role="tabpanel" id="tabpanel-device" aria-labelledby="tab-device" hidden={tab !== "device"}>
           <header>
             <div className="section-heading">
               <span className="section-icon"><Monitor size={19} /></span>
