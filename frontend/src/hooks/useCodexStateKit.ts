@@ -18,7 +18,6 @@ import {
   listAccounts,
   onAccountsChanged,
   removeAccount,
-  renameAccount,
   switchAccount,
 } from "@/lib/api";
 import type { SavedAccount, Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, SettingsPatch, ProbeKind, LatencyReport, VmProfile } from "@/types";
@@ -45,6 +44,15 @@ function errorMessage(cause: unknown): string {
     return String((cause as { message: unknown }).message);
   }
   return String(cause);
+}
+
+/** Success notice; warns when a re-authorization signed in to another account. */
+function loginBanner(login: LoginStatus | null, expected: string | undefined, text: string): Banner {
+  if (expected && login?.accountId && login.accountId !== expected) {
+    return { kind: "warn", text: `登录的是 ${login.email ?? login.accountId}，不是要重新授权的账号，已作为另一个账号保存` };
+  }
+  if (expected) return { kind: "ok", text: `已重新授权 ${login?.email ?? expected}` };
+  return { kind: "ok", text };
 }
 
 export function useCodexStateKit() {
@@ -163,15 +171,6 @@ export function useCodexStateKit() {
   const removeSavedAccount = useCallback(async (accountId: string) => {
     try {
       await removeAccount(accountId, codexHome);
-      await loadAccounts();
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-    }
-  }, [codexHome, loadAccounts]);
-
-  const renameSavedAccount = useCallback(async (accountId: string, label: string) => {
-    try {
-      await renameAccount(accountId, label, codexHome);
       await loadAccounts();
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
@@ -298,12 +297,13 @@ export function useCodexStateKit() {
     }
   }, [status]);
 
-  const startLogin = useCallback(async (home: string, method: LoginMethod) => {
+  /** `accountId`: the saved account being re-authorized, if any. */
+  const startLogin = useCallback(async (home: string, method: LoginMethod, accountId?: string) => {
     setBusy("login");
     stopPolling();
     const generation = loginGeneration.current;
     try {
-      const started = await startChatgptLogin(home, method);
+      const started = await startChatgptLogin(home, method, accountId);
       if (generation !== loginGeneration.current) return;
       setBanner(null);
       setDevice(started);
@@ -327,7 +327,7 @@ export function useCodexStateKit() {
           setDevice(null);
           if (poll.status === "ok") {
             setLogin(loggedIn);
-            setBanner({ kind: "ok", text: poll.message || "已登录 ChatGPT" });
+            setBanner(loginBanner(loggedIn, accountId, poll.message || "已登录 ChatGPT"));
           } else {
             setBanner({ kind: "error", text: poll.message || "登录失败" });
           }
@@ -348,14 +348,14 @@ export function useCodexStateKit() {
     }
   }, [stopPolling]);
 
-  const importRefreshLogin = useCallback(async (home: string, refreshToken: string) => {
+  const importRefreshLogin = useCallback(async (home: string, refreshToken: string, accountId?: string) => {
     setBusy("login");
     stopPolling();
     setDevice(null);
     try {
-      const loggedIn = await importChatgptRefreshToken(home.trim(), refreshToken.trim());
+      const loggedIn = await importChatgptRefreshToken(home.trim(), refreshToken.trim(), accountId);
       setLogin(loggedIn);
-      setBanner({ kind: "ok", text: "Refresh Token 已换取并同步到 Codex 账号" });
+      setBanner(loginBanner(loggedIn, accountId, "Refresh Token 已换取并同步到 Codex 账号"));
       return true;
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
@@ -365,14 +365,14 @@ export function useCodexStateKit() {
     }
   }, [stopPolling]);
 
-  const importAccessLogin = useCallback(async (home: string, accessToken: string) => {
+  const importAccessLogin = useCallback(async (home: string, accessToken: string, accountId?: string) => {
     setBusy("login");
     stopPolling();
     setDevice(null);
     try {
       const loggedIn = await importChatgptAccessToken(home.trim(), accessToken.trim());
       setLogin(loggedIn);
-      setBanner({ kind: "ok", text: "Access Token 已同步到 Codex 账号" });
+      setBanner(loginBanner(loggedIn, accountId, "Access Token 已同步到 Codex 账号"));
       return true;
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
@@ -468,7 +468,6 @@ export function useCodexStateKit() {
     accounts,
     switchToAccount,
     removeSavedAccount,
-    renameSavedAccount,
     device,
     banner,
     error,

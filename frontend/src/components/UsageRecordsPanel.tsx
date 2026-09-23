@@ -143,11 +143,11 @@ function costParts(record: BillingRecord): string[] {
     .map(([label, nanos]) => `${label} ${formatMoney(nanos)}`);
 }
 
-/** Billing email, else the saved login's email or label, else the id. */
+/** Billing email, else the saved login's email, else the id. */
 export function accountLabel(accountId: string, email: string | null | undefined, saved: SavedAccount[]): string {
   if (email) return email;
   const login = saved.find((account) => account.accountId === accountId);
-  return login?.email || login?.label || accountId;
+  return login?.email || accountId;
 }
 
 export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, onRefreshMsChange }: UsageRecordsPanelProps) {

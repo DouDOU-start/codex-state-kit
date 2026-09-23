@@ -251,9 +251,20 @@ impl App {
     /// The outbound line for ChatGPT login and token import: the same exit
     /// (and `{session}`) business requests use, so a new account signs in
     /// from the line it is then bound to. Empty when no line is configured.
-    pub async fn login_proxy(&self) -> String {
+    ///
+    /// `account_id` names a saved account being re-authorized: it signs in
+    /// on its own manual proxy. Subscription nodes are picked in the core
+    /// that carries live traffic, so an account on a subscription line signs
+    /// in on the live line instead.
+    pub async fn login_proxy(&self, account_id: Option<&str>) -> String {
         let settings = self.settings.lock().await.clone();
-        let template = resolved_proxy(&settings, &self.mihomo);
+        let own = account_id
+            .and_then(|id| accounts::sign_in_network(Path::new(&settings.codex_home), id).ok()?)
+            .filter(|network| network.outbound_mode == OutboundMode::Manual);
+        let template = match own {
+            Some(network) => network.outbound_proxy,
+            None => resolved_proxy(&settings, &self.mihomo),
+        };
         business_proxy_key(&template, None).unwrap_or_default()
     }
 

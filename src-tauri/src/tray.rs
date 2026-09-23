@@ -31,9 +31,8 @@ struct AccountsChanged {
 
 fn display_name(account: &AccountView) -> String {
     account
-        .label
+        .email
         .clone()
-        .or_else(|| account.email.clone())
         .unwrap_or_else(|| account.account_id.clone())
 }
 

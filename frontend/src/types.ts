@@ -218,7 +218,7 @@ export interface ActionResult {
 }
 
 export interface Banner {
-  kind: "ok" | "error";
+  kind: "ok" | "warn" | "error";
   text: string;
 }
 
@@ -355,7 +355,6 @@ export interface PricingView {
 export interface SavedAccount {
   accountId: string;
   email?: string | null;
-  label?: string | null;
   authMode?: string | null;
   /** Access-token imports cannot refresh and must be re-imported on expiry. */
   refreshable: boolean;

@@ -16,6 +16,8 @@ pub enum LoginSession {
 pub struct LoginSlot {
     pub generation: u64,
     pub pending: Option<LoginSession>,
+    /// Outbound line of the pending login; device-code polls reuse it.
+    pub proxy: String,
     pub closed: bool,
 }
 

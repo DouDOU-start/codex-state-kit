@@ -317,11 +317,14 @@ export async function getLoginStatus(home?: string): Promise<LoginStatus> {
 export async function importChatgptRefreshToken(
   home: string | undefined,
   refreshToken: string,
+  /** A saved account being re-authorized: the exchange uses its own line. */
+  accountId?: string,
 ): Promise<LoginStatus> {
   if (isTauri) {
     return invoke<LoginStatus>("import_chatgpt_refresh_token", {
       home: home ?? null,
       refreshToken,
+      accountId: accountId ?? null,
     });
   }
   mockLogin = defaultLogin();
@@ -348,9 +351,10 @@ export async function importChatgptAccessToken(
 
 let mockLoginPolls = 0;
 
-export async function startChatgptLogin(home?: string, method: LoginMethod = "browser"): Promise<LoginStart> {
+/** `accountId`: a saved account being re-authorized signs in on its own line. */
+export async function startChatgptLogin(home?: string, method: LoginMethod = "browser", accountId?: string): Promise<LoginStart> {
   if (isTauri) {
-    return invoke<LoginStart>("start_chatgpt_login", { home: home ?? null, method });
+    return invoke<LoginStart>("start_chatgpt_login", { home: home ?? null, method, accountId: accountId ?? null });
   }
   mockLoginPolls = 0;
   return {
@@ -719,7 +723,6 @@ const mockAccounts: SavedAccount[] = [
     deviceId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     network: "手动代理 · socks5://proxy.example.test:44445",
     email: "mock@example.com",
-    label: null,
     authMode: "chatgpt",
     refreshable: true,
     usable: true,
@@ -732,7 +735,6 @@ const mockAccounts: SavedAccount[] = [
     deviceId: "5c9d1e02-7a41-4b8e-9f10-2d6e8a7b4c31",
     network: "订阅节点 · Kit → 香港 01",
     email: "previous@example.com",
-    label: "备用号",
     authMode: "chatgpt",
     refreshable: true,
     usable: true,
@@ -743,7 +745,6 @@ const mockAccounts: SavedAccount[] = [
   {
     accountId: "mock-account-c",
     email: "team@example.com",
-    label: null,
     authMode: "chatgptAuthTokens",
     refreshable: false,
     usable: true,
@@ -782,13 +783,6 @@ export async function removeAccount(accountId: string, home?: string): Promise<v
   if (index < 0) throw new Error("账号不存在");
   if (mockAccounts[index].active) throw new Error("不能删除正在使用的账号，请先切换到其他账号");
   mockAccounts.splice(index, 1);
-}
-
-export async function renameAccount(accountId: string, label: string, home?: string): Promise<void> {
-  if (isTauri) return invoke<void>("rename_account", { home: home ?? null, accountId, label });
-  const account = mockAccounts.find((item) => item.accountId === accountId);
-  if (!account) throw new Error("账号不存在");
-  account.label = label.trim() || null;
 }
 
 export interface AccountsChanged {

@@ -25,7 +25,6 @@ use crate::login::{
 
 pub const ACCOUNTS_FILE: &str = "accounts.codex-state-kit.json";
 const VAULT_VERSION: u32 = 1;
-const MAX_LABEL_CHARS: usize = 40;
 
 static VAULT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -109,8 +108,6 @@ struct StoredAccount {
     account_id: String,
     #[serde(default)]
     email: Option<String>,
-    #[serde(default)]
-    label: Option<String>,
     /// The full Kit auth file for this account.
     auth: Value,
     added_at: String,
@@ -125,7 +122,6 @@ struct StoredAccount {
 pub struct AccountView {
     pub account_id: String,
     pub email: Option<String>,
-    pub label: Option<String>,
     pub auth_mode: Option<String>,
     /// Access-token imports cannot refresh and need re-importing on expiry.
     pub refreshable: bool,
@@ -248,7 +244,6 @@ fn capture_locked(home: &Path, vault: &mut Vault) -> bool {
             vault.accounts.push(StoredAccount {
                 account_id,
                 email: status.email,
-                label: None,
                 auth,
                 added_at: at.clone(),
                 last_used_at: Some(at),
@@ -292,7 +287,6 @@ pub fn list(home: &Path) -> Result<Vec<AccountView>> {
             AccountView {
                 account_id: account.account_id.clone(),
                 email: account.email.clone().or(status.email),
-                label: account.label.clone(),
                 auth_mode: status.auth_mode,
                 refreshable: status.refreshable,
                 usable: status.logged_in,
@@ -360,21 +354,20 @@ pub fn remove(home: &Path, account_id: &str) -> Result<()> {
     save(home, &mut vault)
 }
 
-/// Sets or clears (empty label) an account's display name.
-pub fn rename(home: &Path, account_id: &str, label: &str) -> Result<()> {
-    let label: String = label.trim().chars().take(MAX_LABEL_CHARS).collect();
+/// The line a saved account signs in on when it is re-authorized: its own,
+/// unless it owns the live environment (then the live line is its own).
+pub fn sign_in_network(home: &Path, account_id: &str) -> Result<Option<NetworkProfile>> {
     let _guard = vault_lock();
-    let mut vault = load(home)?;
-    capture_locked(home, &mut vault);
-    let Some(account) = vault
+    let vault = load(home)?;
+    if vault.environment_owner.as_deref() == Some(account_id) {
+        return Ok(None);
+    }
+    Ok(vault
         .accounts
-        .iter_mut()
+        .iter()
         .find(|account| account.account_id == account_id)
-    else {
-        bail!("账号不存在");
-    };
-    account.label = (!label.is_empty()).then_some(label);
-    save(home, &mut vault)
+        .and_then(|account| account.environment.as_ref())
+        .map(|environment| environment.network.clone()))
 }
 
 /// First step of keeping each account's environment separate.
@@ -535,21 +528,13 @@ mod tests {
     }
 
     #[test]
-    fn active_account_cannot_be_removed_and_labels_are_trimmed() {
+    fn active_account_cannot_be_removed() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         login(home, "acct-a", "rt-a");
         capture(home).unwrap();
         login(home, "acct-b", "rt-b");
         assert!(remove(home, "acct-b").is_err());
-        rename(home, "acct-a", "  工作号  ").unwrap();
-        let label = list(home)
-            .unwrap()
-            .into_iter()
-            .find(|a| a.account_id == "acct-a")
-            .unwrap()
-            .label;
-        assert_eq!(label.as_deref(), Some("工作号"));
         remove(home, "acct-a").unwrap();
         assert_eq!(list(home).unwrap().len(), 1);
         assert!(switch(home, "acct-a").is_err());
@@ -612,6 +597,32 @@ mod tests {
         let b = accounts.iter().find(|a| a.account_id == "acct-b").unwrap();
         assert_eq!(b.device_id.as_deref(), Some("fresh"));
         assert_eq!(b.network.as_deref(), Some("手动代理 · socks5://b:2"));
+    }
+
+    #[test]
+    fn signing_in_again_renews_a_saved_account_in_place() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        login(home, "acct-a", "rt-a");
+        let mut live = sync(home, &env("dev-a", "socks5://a:1"));
+        login(home, "acct-b", "rt-b");
+        live = sync(home, &live);
+        live.network.outbound_proxy = "socks5://b:2".into();
+        live = sync(home, &live);
+        // acct-a signs in again on its own line, not on acct-b's live one.
+        let line = sign_in_network(home, "acct-a").unwrap().unwrap();
+        assert_eq!(line.outbound_proxy, "socks5://a:1");
+        assert!(sign_in_network(home, "acct-b").unwrap().is_none());
+
+        capture(home).unwrap();
+        login(home, "acct-a", "rt-a-new");
+        live = sync(home, &live);
+        assert_eq!(live.vm.installation_id, "dev-a");
+        assert_eq!(live.network.outbound_proxy, "socks5://a:1");
+        assert_eq!(list(home).unwrap().len(), 2);
+        switch(home, "acct-b").unwrap();
+        switch(home, "acct-a").unwrap();
+        assert_eq!(live_refresh(home), "rt-a-new");
     }
 
     #[test]

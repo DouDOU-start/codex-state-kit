@@ -24,7 +24,7 @@ import { LatencyProbe } from "@/components/LatencyProbe";
 import { useNotice, useNotify } from "@/components/Notifier";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { Status, VmIdentityView } from "@/types";
+import type { SavedAccount, Status, VmIdentityView } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -85,6 +85,8 @@ export default function App() {
   const [vmArch, setVmArch] = useState("arm64");
   const [vmTerminal, setVmTerminal] = useState("xterm-256color");
   const [addAccountOpen, setAddAccountOpen] = useState(false);
+  /** The saved account the login dialog re-authorizes; null adds a new one. */
+  const [reauthTarget, setReauthTarget] = useState<SavedAccount | null>(null);
   const [tab, setTab] = useState<TabId>(initialTab);
   const [refreshMs, setRefreshMs] = useState(savedRefreshMs);
   const changeRefreshMs = (intervalMs: number) => {
@@ -280,7 +282,7 @@ export default function App() {
                 options={fwd.accounts.map((account) => ({
                   value: account.accountId,
                   label: accountName(account),
-                  hint: account.label && account.email ? account.email : undefined,
+                  hint: account.usable ? undefined : "需重新授权",
                   disabled: !account.usable,
                 }))}
                 onChange={(accountId) => void fwd.switchToAccount(accountId)}
@@ -465,8 +467,14 @@ export default function App() {
           busy={fwd.busy !== null || Boolean(fwd.device)}
           onSwitch={(accountId) => void fwd.switchToAccount(accountId)}
           onRemove={(accountId) => void fwd.removeSavedAccount(accountId)}
-          onRename={(accountId, label) => void fwd.renameSavedAccount(accountId, label)}
-          onAdd={() => setAddAccountOpen(true)}
+          onReauthorize={(account) => {
+            setReauthTarget(account);
+            setAddAccountOpen(true);
+          }}
+          onAdd={() => {
+            setReauthTarget(null);
+            setAddAccountOpen(true);
+          }}
         />
         <section className="panel">
           <header>
@@ -589,6 +597,7 @@ export default function App() {
 
         <AddAccountDialog
           open={addAccountOpen}
+          target={reauthTarget}
           onClose={() => setAddAccountOpen(false)}
           fwd={fwd}
           codexHome={codexHome}
