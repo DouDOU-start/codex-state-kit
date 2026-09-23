@@ -85,9 +85,22 @@ svg { flex-shrink: 0; }
 .button--secondary:not(:disabled):hover { border-color: #a9c0d8; background: var(--surface-hover); }
 .button--ghost { background: transparent; color: var(--accent); padding: 0 9px; }
 .button--ghost:not(:disabled):hover { background: var(--surface-hover); }
-.latency-row { display: flex; align-items: center; gap: 8px; margin: 8px 0 2px; }
-.latency-row__ok { color: var(--green); font-size: 12px; font-weight: 650; }
-.latency-row__bad { color: var(--red); font-size: 11px; }
+/* 输入框右侧并排的按钮（如测延迟），高度与输入框一致。 */
+.field-row { display: flex; align-items: stretch; gap: 8px; }
+.field-row > input, .field-row > .ui-select { flex: 1; min-width: 0; }
+/* 测延迟：未测时显示图标和文字，测过后直接显示结果，颜色按快慢区分，点击重测。 */
+.latency-probe { display: inline-flex; flex-shrink: 0; min-width: 92px; min-height: 36px; align-items: center; justify-content: center; gap: 6px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--text-soft); background: var(--surface); font: 600 11px var(--font-sans); font-variant-numeric: tabular-nums; white-space: nowrap; cursor: pointer; transition: border-color .15s, background .15s, color .15s; }
+.latency-probe:not([data-grade]):not(:disabled):hover { border-color: #a9c0d8; color: var(--accent-strong); background: var(--surface-hover); }
+.latency-probe:focus-visible { outline: none; border-color: #83a8d0; box-shadow: 0 0 0 3px #477bb41a; }
+.latency-probe:disabled { cursor: default; opacity: .6; }
+.latency-probe svg { flex-shrink: 0; }
+.latency-probe svg.is-spinning { animation: spin .75s linear infinite; }
+.latency-probe i { width: 7px; height: 7px; flex-shrink: 0; border-radius: 50%; background: currentColor; }
+.latency-probe[data-grade="fast"] { border-color: #cae4d3; color: var(--green); background: var(--green-soft); }
+.latency-probe[data-grade="mid"] { border-color: #f0dcb8; color: var(--warm); background: var(--warm-soft); }
+.latency-probe[data-grade="slow"], .latency-probe[data-grade="bad"] { border-color: #efcfcb; color: var(--red); background: var(--red-soft); }
+.latency-probe[data-grade]:not(:disabled):hover { filter: brightness(.96); }
+.mihomo-picker__actions .latency-probe { min-width: 84px; min-height: 30px; font-size: 10px; }
 .page-nav { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .page-tabs { display: flex; min-width: 0; max-width: 100%; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: #f0f3f7; box-shadow: 0 6px 14px -12px rgba(48, 66, 88, .35); }
 .page-tabs button { position: relative; display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; gap: 7px; min-height: 32px; padding: 0 16px; border: 1px solid transparent; border-radius: 8px; color: var(--muted); background: transparent; font-size: 11px; white-space: nowrap; cursor: pointer; transition: color .15s, background .15s, border-color .15s; }

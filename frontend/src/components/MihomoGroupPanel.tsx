@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import X from "lucide-react/dist/esm/icons/x.js";
 import type { ProxyGroup } from "@/types";
+import { LatencyProbe } from "@/components/LatencyProbe";
 
 export function MihomoGroupPanel({
   group,
@@ -58,9 +59,11 @@ export function MihomoGroupPanel({
         >
           选择节点
         </button>
-        <button type="button" className="token-fetch-toggle" disabled={probing} onClick={onProbe}>
-          {probing ? "测试中" : "测延迟"}
-        </button>
+        <LatencyProbe
+          probing={probing}
+          sample={current?.delay != null ? { name: current.name, delayMs: current.delay, error: null } : null}
+          onProbe={onProbe}
+        />
       </div>
       {open ? (
         <dialog
