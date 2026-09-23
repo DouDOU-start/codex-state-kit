@@ -13,10 +13,11 @@ import Radio from "lucide-react/dist/esm/icons/radio.js";
 import Waypoints from "lucide-react/dist/esm/icons/waypoints.js";
 import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.js";
 import Settings2 from "lucide-react/dist/esm/icons/settings-2.js";
+import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
 import { AppShell } from "@/components/AppShell";
 import { BillingPanel } from "@/components/BillingPanel";
 import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
-import { NetworkLogDialog } from "@/components/NetworkLogDialog";
+import { UsageRecordsPanel } from "@/components/UsageRecordsPanel";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
 import type { LoginMode, Status, LatencySample, VmIdentityView } from "@/types";
@@ -42,10 +43,11 @@ function degradeChip(status: Status) {
   return { label: "312 降智", className: "runtime-chip runtime-chip--down" };
 }
 
-type TabId = "overview" | "network" | "account" | "device";
+type TabId = "overview" | "records" | "network" | "account" | "device";
 
 const TABS: { id: TabId; label: string; Icon: typeof Activity }[] = [
   { id: "overview", label: "概览", Icon: LayoutDashboard },
+  { id: "records", label: "使用记录", Icon: ScrollText },
   { id: "network", label: "出站网络", Icon: Network },
   { id: "account", label: "Codex 接入", Icon: Terminal },
   { id: "device", label: "虚拟设备", Icon: Monitor },
@@ -79,10 +81,8 @@ export default function App() {
   const [loginMode, setLoginMode] = useState<LoginMode>("browser");
   const [refreshTokenInput, setRefreshTokenInput] = useState("");
   const [accessTokenInput, setAccessTokenInput] = useState("");
-  const [networkLogsOpen, setNetworkLogsOpen] = useState(false);
   const [tab, setTab] = useState<TabId>(initialTab);
   const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
-  const networkLogTriggerRef = useRef<HTMLButtonElement>(null);
   const hydrated = useRef(false);
 
   useEffect(() => {
@@ -212,10 +212,25 @@ export default function App() {
   return (
     <AppShell>
       <div className="dash-page">
-        <div className="page-heading">
-          <div>
-            <h1>Codex 稳定助手</h1>
-            <p>自动维护 Token，缓解负载与降智问题。</p>
+        <div className="page-nav">
+          <div className="page-tabs" role="tablist" aria-label="页面分区" onKeyDown={onTabKeyDown}>
+            {TABS.map(({ id, label, Icon }) => (
+              <button
+                key={id}
+                ref={(node) => { tabRefs.current[id] = node; }}
+                id={`tab-${id}`}
+                type="button"
+                role="tab"
+                aria-selected={tab === id}
+                aria-controls={`tabpanel-${id}`}
+                tabIndex={tab === id ? 0 : -1}
+                onClick={() => selectTab(id)}
+              >
+                <Icon size={14} aria-hidden="true" />
+                {label}
+                {tabAlert[id] ? <i className="page-tabs__alert" title={tabAlert[id]} aria-label={tabAlert[id]} /> : null}
+              </button>
+            ))}
           </div>
           <div className="page-actions">
             <span className={chipClass(fwd.status)}>
@@ -228,15 +243,6 @@ export default function App() {
                 {degrade.label}
               </span>
             ) : null}
-            <button
-              ref={networkLogTriggerRef}
-              className="network-log-trigger"
-              type="button"
-              onClick={() => setNetworkLogsOpen(true)}
-            >
-              <Activity size={13} />
-              使用记录
-            </button>
           </div>
         </div>
 
@@ -266,25 +272,6 @@ export default function App() {
           </div>
         ) : null}
 
-        <div className="page-tabs" role="tablist" aria-label="页面分区" onKeyDown={onTabKeyDown}>
-          {TABS.map(({ id, label, Icon }) => (
-            <button
-              key={id}
-              ref={(node) => { tabRefs.current[id] = node; }}
-              id={`tab-${id}`}
-              type="button"
-              role="tab"
-              aria-selected={tab === id}
-              aria-controls={`tabpanel-${id}`}
-              tabIndex={tab === id ? 0 : -1}
-              onClick={() => selectTab(id)}
-            >
-              <Icon size={14} aria-hidden="true" />
-              {label}
-              {tabAlert[id] ? <i className="page-tabs__alert" title={tabAlert[id]} aria-label={tabAlert[id]} /> : null}
-            </button>
-          ))}
-        </div>
 
         <div className="tab-panel" role="tabpanel" id="tabpanel-overview" aria-labelledby="tab-overview" hidden={tab !== "overview"}>
         <section className="account-traffic" aria-label="当前账号请求统计">
@@ -313,6 +300,10 @@ export default function App() {
         />
         </div>
 
+
+        <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-records" aria-labelledby="tab-records" hidden={tab !== "records"}>
+          <UsageRecordsPanel active={tab === "records"} status={fwd.status} />
+        </section>
 
         <section className="panel tab-panel" role="tabpanel" id="tabpanel-network" aria-labelledby="tab-network" hidden={tab !== "network"}>
           <header>
@@ -666,12 +657,6 @@ export default function App() {
           <span><Shield size={13} /> 本地运行 · 配置尽在掌握</span>
           <span>CODEX STATE KIT</span>
         </footer>
-        <NetworkLogDialog
-          open={networkLogsOpen}
-          status={fwd.status}
-          triggerRef={networkLogTriggerRef}
-          onClose={() => setNetworkLogsOpen(false)}
-        />
       </div>
     </AppShell>
   );
