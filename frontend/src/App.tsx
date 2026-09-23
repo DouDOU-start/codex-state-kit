@@ -22,6 +22,7 @@ import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
 import { UsageRecordsPanel } from "@/components/UsageRecordsPanel";
 import { PricingPanel } from "@/components/PricingPanel";
 import { AccountsPanel, accountName } from "@/components/AccountsPanel";
+import { Select } from "@/components/Select";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
 import type { LoginMode, Status, LatencySample, VmIdentityView } from "@/types";
@@ -240,22 +241,22 @@ export default function App() {
           </div>
           <div className="page-actions">
             {fwd.accounts.length > 1 ? (
-              <label className="account-switcher" title="切换账号">
-                <Users size={13} aria-hidden="true" />
-                <select
-                  aria-label="切换账号"
-                  disabled={fwd.busy !== null || Boolean(fwd.device)}
-                  value={fwd.accounts.find((account) => account.active)?.accountId ?? ""}
-                  onChange={(event) => void fwd.switchToAccount(event.target.value)}
-                >
-                  {fwd.accounts.some((account) => account.active) ? null : <option value="">未使用已保存账号</option>}
-                  {fwd.accounts.map((account) => (
-                    <option key={account.accountId} value={account.accountId} disabled={!account.usable}>
-                      {accountName(account)}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              <Select
+                variant="compact"
+                className="account-switcher"
+                ariaLabel="切换账号"
+                placeholder="未使用已保存账号"
+                icon={<Users size={13} />}
+                disabled={fwd.busy !== null || Boolean(fwd.device)}
+                value={fwd.accounts.find((account) => account.active)?.accountId ?? ""}
+                options={fwd.accounts.map((account) => ({
+                  value: account.accountId,
+                  label: accountName(account),
+                  hint: account.label && account.email ? account.email : undefined,
+                  disabled: !account.usable,
+                }))}
+                onChange={(accountId) => void fwd.switchToAccount(accountId)}
+              />
             ) : null}
             <span className={chipClass(fwd.status)}>
               <i />
@@ -407,24 +408,27 @@ export default function App() {
             ))}
             {shownMihomoGroups.length > 0 ? null : (
               <>
-                <label className="field">
+                <div className="field">
                   <span>当前节点</span>
-                  <select
+                  <Select
+                    ariaLabel="当前节点"
+                    placeholder="连接后列出节点"
                     disabled={fwd.busy !== null || (fwd.status.mihomo?.nodes.length ?? 0) === 0}
                     value={mihomoNode || fwd.status.mihomo?.selected || ""}
-                    onChange={(event) => {
-                      setMihomoNode(event.target.value);
-                      void fwd.saveMihomo(mihomoSubscription, event.target.value);
-                    }}
-                  >
-                    {(fwd.status.mihomo?.nodes.length ?? 0) === 0 ? <option value="">连接后列出节点</option> : null}
-                    {(fwd.status.mihomo?.nodes ?? []).map((node) => {
+                    options={(fwd.status.mihomo?.nodes ?? []).map((node) => {
                       const sample = fwd.latency.mihomo?.samples.find((item) => item.name === node);
-                      const mark = sample ? (sample.delayMs != null ? ` · ${sample.delayMs} ms` : " · 超时") : "";
-                      return <option key={node} value={node}>{node}{mark}</option>;
+                      return {
+                        value: node,
+                        label: node,
+                        hint: sample ? (sample.delayMs != null ? `${sample.delayMs} ms` : "超时") : undefined,
+                      };
                     })}
-                  </select>
-                </label>
+                    onChange={(node) => {
+                      setMihomoNode(node);
+                      void fwd.saveMihomo(mihomoSubscription, node);
+                    }}
+                  />
+                </div>
                 <div className="latency-row">
                   <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null || (isTauri && fwd.status.mihomo?.phase !== "connected")} onClick={() => void fwd.probeLatency("mihomo")}>
                     {fwd.probing === "mihomo" ? "测试中" : "测延迟"}
@@ -633,25 +637,30 @@ export default function App() {
               <span>Originator</span>
               <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmOriginator} onChange={(event) => setVmOriginator(event.target.value)} />
             </label>
-            <label className="field">
+            <div className="field">
               <span>系统</span>
-              <select disabled={fwd.busy !== null} value={osType} onChange={(event) => setOsType(event.target.value)}>
-                <option value="Mac OS">Mac OS</option>
-                <option value="Linux">Linux</option>
-                <option value="Windows">Windows</option>
-              </select>
-            </label>
+              <Select
+                ariaLabel="系统"
+                disabled={fwd.busy !== null}
+                value={osType}
+                options={["Mac OS", "Linux", "Windows"].map((value) => ({ value, label: value }))}
+                onChange={setOsType}
+              />
+            </div>
             <label className="field">
               <span>系统版本</span>
               <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={osVersion} onChange={(event) => setOsVersion(event.target.value)} />
             </label>
-            <label className="field">
+            <div className="field">
               <span>架构</span>
-              <select disabled={fwd.busy !== null} value={vmArch} onChange={(event) => setVmArch(event.target.value)}>
-                <option value="arm64">arm64</option>
-                <option value="x86_64">x86_64</option>
-              </select>
-            </label>
+              <Select
+                ariaLabel="架构"
+                disabled={fwd.busy !== null}
+                value={vmArch}
+                options={["arm64", "x86_64"].map((value) => ({ value, label: value }))}
+                onChange={setVmArch}
+              />
+            </div>
             <label className="field">
               <span>终端</span>
               <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmTerminal} onChange={(event) => setVmTerminal(event.target.value)} />

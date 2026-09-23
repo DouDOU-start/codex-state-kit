@@ -11,6 +11,7 @@ import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import Route from "lucide-react/dist/esm/icons/route.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
 import { getBillingRecords, getBillingSummary, isTauri } from "@/lib/api";
+import { Select } from "@/components/Select";
 import type { BillingRecord, LogEntry, Status } from "@/types";
 
 interface UsageRecordsPanelProps {
@@ -233,20 +234,20 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
         </div>
       </header>
       <div className="usage-record-filter">
-        <label>账号
-          <select
-            aria-label="筛选账号"
+        <div className="usage-record-filter__field">
+          <span>账号</span>
+          <Select
+            variant="compact"
+            ariaLabel="筛选账号"
             value={accountId}
-            onChange={(event) => {
+            options={[{ value: "", label: "全部账号" }, ...accounts.map(([id, label]) => ({ value: id, label }))]}
+            onChange={(next) => {
               accountChosen.current = true;
-              setAccountId(event.target.value);
+              setAccountId(next);
               setPage(0);
             }}
-          >
-            <option value="">全部账号</option>
-            {accounts.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
-          </select>
-        </label>
+          />
+        </div>
         {error ? <span className="usage-record-error">{error}</span> : <span>按请求开始时间排列</span>}
       </div>
       <div className="usage-records__table" ref={tableRef}>
