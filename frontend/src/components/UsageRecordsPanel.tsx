@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import BookOpen from "lucide-react/dist/esm/icons/book-open.js";
 import Check from "lucide-react/dist/esm/icons/check.js";
 import ChevronLeft from "lucide-react/dist/esm/icons/chevron-left.js";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right.js";
+import CircleArrowDown from "lucide-react/dist/esm/icons/circle-arrow-down.js";
+import CircleArrowUp from "lucide-react/dist/esm/icons/circle-arrow-up.js";
+import PencilLine from "lucide-react/dist/esm/icons/pencil-line.js";
 import Copy from "lucide-react/dist/esm/icons/copy.js";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import Route from "lucide-react/dist/esm/icons/route.js";
@@ -17,27 +21,42 @@ interface UsageRecordsPanelProps {
 
 const PAGE_SIZE = 50;
 
-function formatMoney(costNanos: number | null | undefined): string {
-  if (costNanos == null) return "未定价";
+function formatAmount(costNanos: number): string {
   const amount = Number(costNanos) / 1_000_000_000;
-  if (!Number.isFinite(amount)) return "未定价";
-  const digits = amount < 1 ? 6 : 4;
-  return `$${amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: digits })}`;
+  return amount < 1 ? amount.toFixed(6) : amount.toFixed(4);
 }
 
-function formatTokens(value: number | null | undefined): string {
+function formatMoney(costNanos: number | null | undefined): string {
+  if (costNanos == null || !Number.isFinite(Number(costNanos))) return "未定价";
+  return `$${formatAmount(costNanos)}`;
+}
+
+/** 1 万以内显示千分位，更大时显示 K / M。 */
+function compactTokens(value: number | null | undefined): string {
   if (value == null) return "—";
-  return new Intl.NumberFormat("zh-CN").format(value);
+  if (value < 10_000) return new Intl.NumberFormat("en-US").format(value);
+  if (value < 1_000_000) return `${(value / 1000).toFixed(1)}K`;
+  return `${(value / 1_000_000).toFixed(2)}M`;
 }
 
 function formatDuration(ms?: number | null): string {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";
-  if (ms < 1000) return `${Math.round(ms)} ms`;
-  const seconds = Math.floor(ms / 1000);
-  if (seconds < 60) return `${seconds} 秒`;
-  const minutes = Math.floor(seconds / 60);
-  const rest = seconds % 60;
-  return `${minutes} 分 ${rest} 秒`;
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 100_000) return `${(ms / 1000).toFixed(2)}s`;
+  const seconds = Math.round(ms / 1000);
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+type Speed = "fast" | "mid" | "slow" | "none";
+
+/** 首字 5 秒 / 15 秒、总耗时 60 秒 / 180 秒为快慢分界。 */
+const FIRST_TOKEN_LIMITS: [number, number] = [5_000, 15_000];
+const TOTAL_LIMITS: [number, number] = [60_000, 180_000];
+
+function speed(ms: number | null | undefined, [fast, slow]: [number, number]): Speed {
+  if (ms == null || !Number.isFinite(ms)) return "none";
+  if (ms < fast) return "fast";
+  return ms < slow ? "mid" : "slow";
 }
 
 function durationMs(record: BillingRecord): number | null {
@@ -84,10 +103,6 @@ function costParts(record: BillingRecord): string[] {
     .map(([label, nanos]) => `${label} ${formatMoney(nanos)}`);
 }
 
-function latencyClass(ms: number | null | undefined): string {
-  if (ms == null) return "";
-  return ms >= 20_000 ? "usage-latency--slow" : "usage-latency--ok";
-}
 
 export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
   const [loading, setLoading] = useState(false);
@@ -256,6 +271,12 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
                 const model = record.sentModel || record.requestedModel || "未知模型";
                 const tier = record.serviceTier ? TIER_LABEL[record.serviceTier] : undefined;
                 const parts = costParts(record);
+                const cached = record.cachedInputTokens ?? 0;
+                const cacheWrite = record.cacheWriteTokens ?? 0;
+                const uncached = record.inputTokens == null ? null : Math.max(0, record.inputTokens - cached - cacheWrite);
+                const totalTokens = record.inputTokens == null && record.outputTokens == null
+                  ? null
+                  : (record.inputTokens ?? 0) + (record.outputTokens ?? 0);
                 return (
                   <tr key={record.requestId}>
                     <td className="usage-table__time">
@@ -274,16 +295,28 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
                     </td>
                     <td><span className="usage-type">{typeLabel(record)}</span></td>
                     <td className="usage-table__latency">
-                      <span className={latencyClass(first)}>首字 {formatDuration(first)}</span>
-                      <span className={latencyClass(total)}>总耗时 {formatDuration(total)}</span>
+                      <div className={`usage-latency usage-latency--${speed(first, FIRST_TOKEN_LIMITS)}`}>
+                        <span className="usage-latency__label">首字</span>
+                        <span className={`usage-speed--${speed(first, FIRST_TOKEN_LIMITS)}`}>{formatDuration(first)}</span>
+                        <span className="usage-latency__label">总耗时</span>
+                        <span className={`usage-speed--${speed(total, TOTAL_LIMITS)}`}>{formatDuration(total)}</span>
+                      </div>
                     </td>
                     <td className="usage-table__meter">
-                      <span>↓ {formatTokens(record.inputTokens)}{record.cachedInputTokens ? ` · 缓存读 ${formatTokens(record.cachedInputTokens)}` : ""}{record.cacheWriteTokens ? ` · 缓存写 ${formatTokens(record.cacheWriteTokens)}` : ""}</span>
-                      <span>↑ {formatTokens(record.outputTokens)}{record.reasoningTokens ? ` · 推理 ${formatTokens(record.reasoningTokens)}` : ""}</span>
+                      <div className="usage-meter">
+                        <div className="usage-meter__io">
+                          <span className="usage-meter__in" title="非缓存输入"><CircleArrowDown size={13} />{compactTokens(uncached)}</span>
+                          <span className="usage-meter__out" title={record.reasoningTokens ? `输出（含推理 ${compactTokens(record.reasoningTokens)}）` : "输出"}><CircleArrowUp size={13} />{compactTokens(record.outputTokens)}</span>
+                          <span className="usage-meter__cache" title="缓存读"><BookOpen size={12} />{compactTokens(record.inputTokens == null ? null : cached)}</span>
+                          {cacheWrite ? <span className="usage-meter__cache" title="缓存写"><PencilLine size={12} />{compactTokens(cacheWrite)}</span> : null}
+                        </div>
+                        <strong className="usage-meter__total" title="总 tokens（输入 + 输出）">{compactTokens(totalTokens)}</strong>
+                      </div>
                     </td>
-                    <td className="usage-table__cost">
-                      <strong>{formatMoney(record.costNanos)}</strong>
-                      {parts.map((part) => <small key={part}>{part}</small>)}
+                    <td className="usage-table__cost" title={parts.length ? parts.join("\n") : undefined}>
+                      {record.costNanos == null
+                        ? <span className="usage-cost usage-cost--none">未定价</span>
+                        : <span className="usage-cost"><i>$</i>{formatAmount(record.costNanos)}</span>}
                     </td>
                   </tr>
                 );
