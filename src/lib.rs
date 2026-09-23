@@ -27,9 +27,10 @@ pub use attach::{
 };
 pub use login::{
     exchange_refresh_token, has_chatgpt_login, http_client as login_http_client,
-    import_access_token, login_status, persist_refresh_token_import, poll_device_login,
-    start_device_login, token_import_http_client, LoginEndpoints, LoginStart, LoginStatus,
-    OAuthTokenResponse, PendingLogin, PollResult, PollStatus,
+    http_client_via as login_http_client_via, import_access_token, login_status,
+    persist_refresh_token_import, poll_device_login, start_device_login, token_import_http_client,
+    token_import_http_client_via, LoginEndpoints, LoginStart, LoginStatus, OAuthTokenResponse,
+    PendingLogin, PollResult, PollStatus,
 };
 pub use logs::LogEntry;
 pub use proxy::{join_upstream, App, ProxyHandle, Status};

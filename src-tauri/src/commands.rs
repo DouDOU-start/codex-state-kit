@@ -3,9 +3,9 @@ use codex_state_kit::billing::{BillingSummary, PricingRuleSpec, UsageFilter, Usa
 use codex_state_kit::pricing::{CatalogInfo, ModelPriceRow};
 use codex_state_kit::{
     exchange_refresh_token, import_access_token as persist_access_token, inspect_codex_config,
-    login_status, persist_refresh_token_import, poll_device_login, start_device_login,
-    token_import_http_client, CodexConfigView, LoginEndpoints, LoginStart, LoginStatus,
-    SettingsPatch, Status,
+    login_http_client_via, login_status, persist_refresh_token_import, poll_device_login,
+    start_device_login, token_import_http_client_via, CodexConfigView, LoginEndpoints, LoginStart,
+    LoginStatus, SettingsPatch, Status,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -350,7 +350,9 @@ pub async fn import_chatgpt_refresh_token(
         slot.cancel();
         slot.generation
     };
-    let client = command(token_import_http_client())?;
+    let client = command(token_import_http_client_via(
+        &state.core().login_proxy().await,
+    ))?;
     let tokens = command(exchange_refresh_token(&client, &refresh_token).await)?;
     let status = {
         let slot = state.pending_login.lock().expect("pending login");
@@ -398,6 +400,8 @@ pub async fn start_chatgpt_login(
 ) -> CommandResult<LoginStart> {
     let settings = state.core().settings.lock().await.clone();
     let home = PathBuf::from(home.unwrap_or(settings.codex_home));
+    // Sign in over the line this account will be bound to.
+    let proxy = state.core().login_proxy().await;
     let generation = {
         let mut slot = state.pending_login.lock().expect("pending login");
         if slot.closed {
@@ -405,13 +409,15 @@ pub async fn start_chatgpt_login(
         }
         slot.cancel();
         if matches!(method.unwrap_or_default(), LoginMethod::Browser) {
-            let (start, pending) = BrowserLogin::start(home).map_err(|err| err.to_string())?;
+            let (start, pending) =
+                BrowserLogin::start(home, &proxy).map_err(|err| err.to_string())?;
             slot.pending = Some(LoginSession::Browser(Arc::new(pending)));
             return Ok(start);
         }
         slot.generation
     };
-    match start_device_login(&state.core().login_http, &LoginEndpoints::default(), home).await {
+    let client = command(login_http_client_via(&proxy))?;
+    match start_device_login(&client, &LoginEndpoints::default(), home).await {
         Ok((start, pending)) => {
             let mut slot = state.pending_login.lock().expect("pending login");
             if slot.generation != generation || slot.closed {
@@ -441,12 +447,8 @@ pub async fn poll_chatgpt_login(state: State<'_, AppState>) -> CommandResult<Log
     let result = match pending {
         LoginSession::Browser(pending) => Ok(pending.poll()),
         LoginSession::Device(pending) => {
-            poll_device_login(
-                &state.core().login_http,
-                &LoginEndpoints::default(),
-                &pending,
-            )
-            .await
+            let client = command(login_http_client_via(&state.core().login_proxy().await))?;
+            poll_device_login(&client, &LoginEndpoints::default(), &pending).await
         }
     };
     let poll = {

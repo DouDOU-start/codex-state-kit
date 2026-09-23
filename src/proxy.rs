@@ -661,6 +661,16 @@ impl App {
         }
     }
 
+    /// The outbound line for ChatGPT login and token import: the same exit
+    /// (and `{session}`) business requests use, so a new account signs in
+    /// from the line it is then bound to. Empty when no line is configured.
+    pub async fn login_proxy(&self) -> String {
+        let settings = self.settings.lock().await.clone();
+        let template = resolved_proxy(&settings, &self.mihomo);
+        let session = self.turn_state.lock().await.bound_proxy_session();
+        business_proxy_key(&template, session.as_deref()).unwrap_or_default()
+    }
+
     pub async fn refresh_turn_state(&self) -> Result<Status> {
         self.sync_logged_in_account().await;
         // A click is a one-shot probe: drop cooldown and ignore the pause flag

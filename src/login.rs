@@ -159,23 +159,40 @@ enum ResolvedAuthMode {
     Other,
 }
 
-pub fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .proxy(crate::system_proxy::reqwest_proxy())
-        .timeout(Duration::from_secs(30))
+/// Auth requests go out on the account's outbound line (`outbound_proxy`,
+/// the same exit as its business traffic). With no line configured they
+/// follow the system proxy, like a browser.
+fn auth_client_builder(outbound_proxy: &str) -> Result<reqwest::ClientBuilder> {
+    let proxy = crate::fetch::dial_proxy_for_client(outbound_proxy.trim());
+    let builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+    Ok(if proxy.is_empty() {
+        builder.proxy(crate::system_proxy::reqwest_proxy())
+    } else {
+        builder.proxy(reqwest::Proxy::all(&proxy).context("出站代理地址无效")?)
+    })
+}
+
+pub fn http_client_via(outbound_proxy: &str) -> Result<reqwest::Client> {
+    auth_client_builder(outbound_proxy)?
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .context("build login http client")
 }
 
 /// RT 换票请求携带长期凭据，禁止跟随重定向，避免请求体被转发到其他来源。
-pub fn token_import_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .proxy(crate::system_proxy::reqwest_proxy())
-        .timeout(Duration::from_secs(30))
+pub fn token_import_http_client_via(outbound_proxy: &str) -> Result<reqwest::Client> {
+    auth_client_builder(outbound_proxy)?
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build token import http client")
+}
+
+pub fn http_client() -> Result<reqwest::Client> {
+    http_client_via("")
+}
+
+pub fn token_import_http_client() -> Result<reqwest::Client> {
+    token_import_http_client_via("")
 }
 
 pub fn kit_auth_path(home: &Path) -> PathBuf {
@@ -1783,6 +1800,34 @@ mod tests {
             r#"{{"chatgpt_account_id":"{account}","email":"user@example.com"}}"#
         ));
         format!("hdr.{payload}.sig")
+    }
+
+    #[tokio::test]
+    async fn auth_requests_use_the_accounts_outbound_line() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let seen = tokio::spawn(async move {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let mut buffer = vec![0u8; 1024];
+            let read = socket.read(&mut buffer).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buffer[..read]).to_string()
+        });
+        let client = http_client_via(&format!("http://127.0.0.1:{port}")).unwrap();
+        client
+            .get("http://auth.example.test/oauth/token")
+            .send()
+            .await
+            .unwrap();
+        let request = seen.await.unwrap();
+        assert!(
+            request.starts_with("GET http://auth.example.test/oauth/token HTTP/1.1"),
+            "{request}"
+        );
     }
 
     #[test]
