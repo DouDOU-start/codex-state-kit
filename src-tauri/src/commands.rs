@@ -178,6 +178,7 @@ pub async fn get_billing_records(
     to: Option<String>,
     source: Option<String>,
     model: Option<String>,
+    downgraded: Option<bool>,
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> CommandResult<UsageRecordsPage> {
@@ -187,6 +188,7 @@ pub async fn get_billing_records(
         to,
         source,
         model,
+        downgraded,
         limit,
         offset,
     }))
@@ -254,11 +256,6 @@ pub async fn get_codex_config(
         std::path::Path::new(&home),
         &suggested,
     ))
-}
-
-#[tauri::command(async)]
-pub async fn refresh_turn_state(state: State<'_, AppState>) -> CommandResult<Status> {
-    command(state.core().refresh_turn_state().await)
 }
 
 #[tauri::command(async)]
@@ -490,27 +487,6 @@ pub async fn cancel_chatgpt_login(state: State<'_, AppState>) -> CommandResult<A
         ok: true,
         message: "已取消登录".into(),
     })
-}
-
-#[tauri::command(async)]
-pub async fn set_bound_token_len(
-    state: State<'_, AppState>,
-    len: Option<usize>,
-) -> CommandResult<Status> {
-    Ok(state.proxy.core().set_bound_token_len(len).await)
-}
-
-#[tauri::command(async)]
-pub async fn set_model_bound_token_len(
-    state: State<'_, AppState>,
-    model: String,
-    len: Option<usize>,
-) -> CommandResult<Status> {
-    Ok(state
-        .proxy
-        .core()
-        .set_model_bound_token_len(&model, len)
-        .await)
 }
 
 #[tauri::command(async)]

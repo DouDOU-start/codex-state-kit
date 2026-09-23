@@ -629,6 +629,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "thiserror 2.0.20",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

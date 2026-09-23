@@ -30,24 +30,9 @@ export async function openGithubRepo(): Promise<void> {
   await invoke<void>("open_github_repo");
 }
 
-const emptyTurnState = () => ({
-  status: "empty",
-  ageSecs: null,
-  len: null,
-  source: null,
-  capturedAt: null,
-});
-
 const defaultStatus = (): Status => ({
-  stateMissPolicy: "preserve",
-  tokenReusePolicy: "shared_292",
-  stateFetchModel: "",
-  tokenFetchPaused: false,
-  tokenMaxAgeMins: 40,
-  tokenPrefetchAgeMins: 35,
   diagLogPath: "",
   forcedModel: "",
-  configuredModels: [],
   currentAccountId: "mock-account-b",
   currentAccountEmail: "mock@example.com",
   accountTraffic: { concurrentRequests: 2, rpm: 18 },
@@ -71,11 +56,6 @@ const defaultStatus = (): Status => ({
     groups: [],
     error: null,
   },
-  fetchError: null,
-  fetchOkAt: null,
-  turnState: emptyTurnState(),
-  degraded: false,
-  degradedAt: null,
   vmIdentity: {
     installationId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     sessionId: "11111111-2222-4333-8444-555555555555",
@@ -93,45 +73,29 @@ const defaultStatus = (): Status => ({
   wsUpstreamConnectedAt: null,
   chainSystemProxy: true,
   systemProxy: { enabled: true, detected: "HTTP 127.0.0.1:7897", lastError: null },
-  logs: [{
-    id: 1,
+  lastDowngrade: {
+    requestId: "mock-billing-1",
+    at: new Date(Date.now() - 86_400_000 + 9_000).toISOString(),
     accountId: "mock-account-a",
-    accountEmail: "previous@example.com",
-    ts: new Date(Date.now() - 900).toISOString(),
-    method: "POST",
-    path: "/responses",
-    status: 200,
-    ms: 263,
-    responseHeaderMs: 263,
-    flow: "token_fetch",
-    transport: "http_sse",
-    targetOrigin: "https://chatgpt.com:443",
-    finalOrigin: "https://chatgpt.com:443",
-    routeKind: "manual_proxy",
-    proxyEndpoint: "socks5h://proxy.example.test:44445",
-    peerAddr: "198.51.100.10:44445",
-    httpVersion: "HTTP/2",
-    model: "gpt-6-astra",
-    contentEncoding: "json",
-    bodyBytes: 142,
-    turnStateAction: "captured",
-    turnStateLen: null,
-    returnedTurnStateLen: 292,
-    errorKind: null,
-    streamState: "not_tracked",
-    firstChunkMs: null,
-    lastChunkMs: null,
-    streamTotalMs: null,
-    streamBytes: 0,
-    streamChunks: 0,
-    maxIdleMs: null,
-    currentIdleMs: null,
-  }, ...[
+    email: "previous@example.com",
+    report: {
+      verdict: "confirmed",
+      requestedModel: "gpt-6-astra",
+      effectiveModel: "gpt-5.6-luna",
+      safetyBuffering: true,
+      reasons: ["user_risk"],
+      useCases: ["cyber"],
+      fasterModel: "gpt-5.6-luna",
+      verifications: [],
+      signals: [],
+    },
+  },
+  logs: [
     { model: "gpt-6-astra", upstreamResponseModel: null },
     { model: "gpt-6-astra", upstreamResponseModel: "gpt-6-astra" },
     { model: "gpt-5.6-sol", upstreamResponseModel: "gpt-6-sol" },
   ].map((models, index) => ({
-    id: index + 2,
+    id: index + 1,
     accountId: "mock-account-b",
     accountEmail: "mock@example.com",
     ts: new Date().toISOString(),
@@ -155,9 +119,6 @@ const defaultStatus = (): Status => ({
     ...models,
     contentEncoding: "zstd",
     bodyBytes: 18432,
-    turnStateAction: "replaced",
-    turnStateLen: 292,
-    returnedTurnStateLen: 292,
     errorKind: null,
     streamState: "completed",
     firstChunkMs: 321,
@@ -167,40 +128,7 @@ const defaultStatus = (): Status => ({
     streamChunks: 48,
     maxIdleMs: 306,
     currentIdleMs: null,
-  })), {
-    id: 5,
-    accountId: "mock-account-b",
-    accountEmail: "mock@example.com",
-    ts: new Date(Date.now() - 400).toISOString(),
-    method: "POST",
-    path: "/responses",
-    status: 200,
-    ms: 2140,
-    responseHeaderMs: 2140,
-    flow: "token_fetch",
-    transport: "http_sse",
-    targetOrigin: "https://chatgpt.com:443",
-    finalOrigin: "https://chatgpt.com:443",
-    routeKind: "manual_proxy",
-    proxyEndpoint: "socks5h://proxy.example.test:44445",
-    peerAddr: "198.51.100.10:44445",
-    httpVersion: "HTTP/1.1",
-    model: "gpt-5.6-luna",
-    contentEncoding: "json",
-    bodyBytes: 156,
-    turnStateAction: "captured",
-    turnStateLen: null,
-    returnedTurnStateLen: 292,
-    errorKind: null,
-    streamState: "not_tracked",
-    firstChunkMs: null,
-    lastChunkMs: null,
-    streamTotalMs: null,
-    streamBytes: 0,
-    streamChunks: 0,
-    maxIdleMs: null,
-    currentIdleMs: null,
-  }],
+  })),
 });
 
 const defaultLogin = (): LoginStatus => ({
@@ -234,7 +162,6 @@ function cloneStatus(): Status {
       })),
     },
     accountTraffic: { ...mockStatus.accountTraffic },
-    turnState: { ...mockStatus.turnState },
     vmIdentity: { ...mockStatus.vmIdentity },
     logs: mockStatus.logs.map((entry) => ({ ...entry })),
   };
@@ -247,10 +174,6 @@ export async function getStatus(): Promise<Status> {
 export async function setConfig(settings: SettingsPatch): Promise<Status> {
   if (isTauri) {
     return invoke<Status>("set_config", { settings });
-  }
-  const tokenRouteChanged = settings.outboundMode !== mockStatus.outboundMode || settings.outboundProxy !== mockStatus.outboundProxy || settings.codexHome !== mockStatus.codexHome || settings.upstream !== mockStatus.upstream || settings.mihomoSubscription !== mockStatus.mihomoSubscription || settings.mihomoNode !== mockStatus.mihomoNode;
-  if (tokenRouteChanged) {
-    mockStatus.turnState = emptyTurnState();
   }
   const selected = settings.mihomoNode || "node-a";
   const nodes = settings.mihomoNode ? [settings.mihomoNode, "node-b"] : ["node-a", "node-b"];
@@ -279,14 +202,7 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
           error: null,
         }
       : { ...mockStatus.mihomo, phase: "stopped", proxyUrl: null, selected: null, groups: [], error: null },
-    stateMissPolicy: settings.stateMissPolicy,
-    tokenReusePolicy: settings.tokenReusePolicy,
-    stateFetchModel: settings.stateFetchModel,
-    tokenFetchPaused: settings.tokenFetchPaused ?? false,
-    tokenMaxAgeMins: settings.tokenMaxAgeMins ?? 40,
-    tokenPrefetchAgeMins: settings.tokenPrefetchAgeMins ?? 35,
     forcedModel: settings.forcedModel,
-    configuredModels: settings.models,
     wsUpstreamEnabled: settings.wsUpstreamEnabled !== false,
     chainSystemProxy: settings.chainSystemProxy !== false,
     systemProxy: { ...(mockStatus.systemProxy ?? { detected: null, lastError: null }), enabled: settings.chainSystemProxy !== false },
@@ -308,44 +224,6 @@ export async function getCodexConfig(home?: string): Promise<CodexConfigView> {
     suggestedBaseUrl: `http://${mockStatus.proxyListen}`,
     providers: mockConfig.providers.map((provider) => ({ ...provider })),
   };
-}
-
-export async function refreshTurnState(): Promise<Status> {
-  if (isTauri) {
-    return invoke<Status>("refresh_turn_state");
-  }
-  const ready = mockStatus.outboundMode === "mihomo"
-      ? mockStatus.mihomo.phase === "connected"
-      : Boolean(mockStatus.outboundProxy);
-  mockStatus = {
-    ...mockStatus,
-    fetchError: ready ? null : "出站代理尚未就绪",
-    fetchOkAt: ready ? new Date().toISOString() : null,
-    turnState: ready
-      ? {
-          status: "active",
-          ageSecs: 12,
-          len: 292,
-          source: "fetch",
-          capturedAt: new Date().toISOString(),
-        }
-      : emptyTurnState(),
-  };
-  return cloneStatus();
-}
-
-export async function setBoundTokenLen(len: number | null): Promise<Status> {
-  if (isTauri) {
-    return invoke<Status>("set_bound_token_len", { len });
-  }
-  return cloneStatus();
-}
-
-export async function setModelBoundTokenLen(model: string, len: number | null): Promise<Status> {
-  if (isTauri) {
-    return invoke<Status>("set_model_bound_token_len", { model, len });
-  }
-  return cloneStatus();
 }
 
 export async function probeOutboundLatency(kind: ProbeKind, proxy?: string): Promise<LatencyReport> {
@@ -613,7 +491,7 @@ const mockBillingRecords: BillingRecord[] = [
     provider: "chatgpt",
     accountId: "mock-account-b",
     email: "mock@example.com",
-    source: "token_fetch",
+    source: "business",
     startedAt: new Date(Date.now() - 60_000).toISOString(),
     finishedAt: new Date(Date.now() - 45_000).toISOString(),
     state: "missing_usage",
@@ -639,6 +517,26 @@ const mockBillingRecords: BillingRecord[] = [
     sentModel: "gpt-6-astra",
     responseModel: "gpt-6-astra",
     transport: "http_to_ws",
+    downgrade: {
+      verdict: "confirmed",
+      requestedModel: "gpt-6-astra",
+      effectiveModel: "gpt-5.6-luna",
+      safetyBuffering: true,
+      reasons: ["user_risk"],
+      useCases: ["cyber"],
+      fasterModel: "gpt-5.6-luna",
+      verifications: [],
+      turnStateLen: 780,
+      primaryUsedPercent: 60,
+      encryptedMin: 1292,
+      signals: [
+        "上游响应头 openai-model 为 gpt-5.6-luna，与请求的 gpt-6-astra 不一致（官方客户端据此提示请求被改路由到备用模型）",
+        "上游对本次请求启用了安全缓冲（safety buffering），响应被额外审查（场景 cyber，原因 user_risk），官方客户端会提示改用更快的 gpt-5.6-luna 重试",
+        "x-codex-turn-state 长度 780（仅供参考）",
+        "主额度已用 60%（仅供参考）",
+        "encrypted_content 最小块 1292 字节（仅供参考）",
+      ],
+    },
     inputTokens: 1_420,
     cachedInputTokens: 0,
     cacheWriteTokens: 0,
@@ -677,6 +575,25 @@ for (let index = 0; index < 70; index += 1) {
     sentModel: "gpt-5.1-codex",
     responseModel: index % 5 === 3 ? "gpt-5.1-codex-mini" : "gpt-5.1-codex-2025-11-13",
     transport: index % 2 ? "ws_to_ws" : "http_sse",
+    downgrade: index % 7 === 2
+      ? {
+          verdict: "suspected",
+          requestedModel: "gpt-5.1-codex",
+          effectiveModel: null,
+          safetyBuffering: true,
+          reasons: [],
+          useCases: [],
+          fasterModel: "gpt-5.1-codex-mini",
+          verifications: [],
+          turnStateLen: 780,
+          primaryUsedPercent: 60,
+          encryptedMin: 1292,
+          signals: [
+            "上游对本次请求启用了安全缓冲（safety buffering），响应被额外审查，官方客户端会提示改用更快的 gpt-5.1-codex-mini 重试",
+            "主额度已用 60%（仅供参考）",
+          ],
+        }
+      : null,
     inputTokens: 12_000,
     cachedInputTokens: 10_000,
     cacheWriteTokens: 0,
@@ -730,6 +647,7 @@ export async function getBillingRecords(query: BillingQuery = {}): Promise<Billi
       to: query.to ?? null,
       source: query.source ?? null,
       model: query.model ?? null,
+      downgraded: query.downgraded ?? null,
       limit: query.limit ?? 50,
       offset: query.offset ?? 0,
     });
@@ -738,6 +656,8 @@ export async function getBillingRecords(query: BillingQuery = {}): Promise<Billi
     if (query.accountId && record.accountId !== query.accountId) return false;
     if (query.source && record.source !== query.source) return false;
     if (query.model && record.sentModel !== query.model && record.requestedModel !== query.model) return false;
+    if (query.downgraded === true && !record.downgrade) return false;
+    if (query.downgraded === false && record.downgrade) return false;
     return true;
   });
   const limit = query.limit ?? 50;

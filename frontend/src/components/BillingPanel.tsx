@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import { Select } from "@/components/Select";
-import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
+import { useNotice } from "@/components/Notifier";
 import { getBillingRecords, getBillingSummary, isTauri } from "@/lib/api";
 import type { BillingRecord, BillingSummary } from "@/types";
 
@@ -93,6 +93,12 @@ export function BillingPanel({ currentAccountId, currentAccountEmail }: BillingP
       setLoading(false);
     }
   }, [currentAccountId]);
+  useNotice("billing-error", error, () => ({
+    kind: "error",
+    title: "读取使用统计失败",
+    message: error,
+    actions: [{ label: "重试", primary: true, onClick: () => void reload() }],
+  }));
 
   useEffect(() => {
     void reload();
@@ -171,11 +177,7 @@ export function BillingPanel({ currentAccountId, currentAccountEmail }: BillingP
         </div>
       </header>
       {error ? (
-        <div className="billing-panel__empty billing-panel__empty--error" role="status">
-          <TriangleAlert size={15} />
-          <span>{error}</span>
-          <button type="button" onClick={() => void reload()}>重试</button>
-        </div>
+        <div className="billing-panel__empty" role="status">使用统计暂不可用</div>
       ) : (
         <>
           <div className="usage-dash__cards">

@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import Shield from "lucide-react/dist/esm/icons/shield.js";
-import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import Activity from "lucide-react/dist/esm/icons/activity.js";
 import Monitor from "lucide-react/dist/esm/icons/monitor.js";
 import Network from "lucide-react/dist/esm/icons/network.js";
@@ -15,11 +14,12 @@ import BadgeDollarSign from "lucide-react/dist/esm/icons/badge-dollar-sign.js";
 import { AppShell } from "@/components/AppShell";
 import { BillingPanel } from "@/components/BillingPanel";
 import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
-import { UsageRecordsPanel } from "@/components/UsageRecordsPanel";
+import { downgradeLabel, UsageRecordsPanel } from "@/components/UsageRecordsPanel";
 import { PricingPanel } from "@/components/PricingPanel";
 import { AccountsPanel, accountName } from "@/components/AccountsPanel";
 import { AddAccountDialog } from "@/components/AddAccountDialog";
 import { Select } from "@/components/Select";
+import { useNotice, useNotify } from "@/components/Notifier";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
 import type { Status, LatencySample, VmIdentityView } from "@/types";
@@ -38,11 +38,6 @@ function delayText(sample?: LatencySample | null): string | null {
   if (!sample) return null;
   if (sample.delayMs != null) return `${sample.delayMs} ms`;
   return sample.error || "超时";
-}
-
-function degradeChip(status: Status) {
-  if (!status.degraded) return null;
-  return { label: "312 降智", className: "runtime-chip runtime-chip--down" };
 }
 
 type TabId = "overview" | "records" | "pricing" | "network" | "account" | "device";
@@ -85,6 +80,37 @@ export default function App() {
   const [tab, setTab] = useState<TabId>(initialTab);
   const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
   const hydrated = useRef(false);
+  const { notify, confirm } = useNotify();
+
+  // Action results from the backend hook become themed notices.
+  useEffect(() => {
+    if (fwd.banner) notify({ kind: fwd.banner.kind, message: fwd.banner.text });
+  }, [fwd.banner, notify]);
+
+  const proxyError = fwd.status?.proxyError ?? null;
+  useNotice("proxy-error", proxyError, () => ({ kind: "error", title: "本地代理异常", message: proxyError }));
+  const attachError = fwd.status?.attachError ?? null;
+  useNotice("attach-error", attachError, () => ({ kind: "error", title: "Codex 接入失败", message: attachError }));
+  const mihomoError = fwd.status?.outboundMode === "mihomo" ? fwd.status?.mihomo?.error ?? null : null;
+  useNotice("mihomo-error", mihomoError, () => ({ kind: "error", title: "订阅节点异常", message: mihomoError }));
+  const relayError = fwd.status?.outboundMode === "manual" ? fwd.status?.systemProxy?.lastError ?? null : null;
+  useNotice("system-proxy-error", relayError, () => ({ kind: "warn", title: "连接代理服务器失败", message: relayError }));
+  const lastDowngrade = fwd.status?.lastDowngrade ?? null;
+  useNotice("downgrade", lastDowngrade?.requestId ?? null, () => {
+    const event = lastDowngrade!;
+    const report = event.report;
+    const who = event.email || event.accountId;
+    const time = new Date(event.at).toLocaleTimeString("zh-CN", { hour12: false });
+    return {
+      kind: report.verdict === "confirmed" ? "error" : "warn",
+      title: report.verdict === "confirmed" ? "检测到降智请求" : "检测到疑似降智请求",
+      message: `${time} · ${who} · 请求 ${report.requestedModel ?? "未知模型"}：${downgradeLabel(report)}`
+        + (report.useCases.length || report.reasons.length
+          ? `（${[...report.useCases, ...report.reasons].join(" / ")}）`
+          : ""),
+      actions: [{ label: "查看使用记录", primary: true, onClick: () => selectTab("records") }],
+    };
+  });
 
   useEffect(() => {
     if (!fwd.status || hydrated.current) return;
@@ -189,7 +215,6 @@ export default function App() {
   }
 
   const loggedIn = Boolean(fwd.login?.loggedIn);
-  const degrade = degradeChip(fwd.status);
   const tabAlert: Partial<Record<TabId, string>> = {
     network: fwd.status.proxyError || fwd.status.mihomo?.error ? "出站网络异常" : undefined,
     account: loggedIn ? undefined : "尚未登录",
@@ -248,40 +273,9 @@ export default function App() {
               <i />
               {chipLabel(fwd.status)}
             </span>
-            {degrade ? (
-              <span className={degrade.className}>
-                <i />
-                {degrade.label}
-              </span>
-            ) : null}
           </div>
         </div>
 
-        {fwd.status.proxyError ? (
-          <div className="banner banner--error" role="alert">
-            <span>{fwd.status.proxyError}</span>
-          </div>
-        ) : null}
-
-        {fwd.status.attachError ? <div className="banner banner--error" role="alert">{fwd.status.attachError}</div> : null}
-
-        {fwd.banner ? (
-          <div className={`banner banner--${fwd.banner.kind}`} role="status">
-            <span>{fwd.banner.text}</span>
-            <button type="button" onClick={fwd.dismissBanner}>
-              关闭
-            </button>
-          </div>
-        ) : null}
-
-        {fwd.status.degraded ? (
-          <div className="banner banner--error" role="alert">
-            <span>
-              <TriangleAlert size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
-              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}。
-            </span>
-          </div>
-        ) : null}
 
 
         <div className="tab-panel" role="tabpanel" id="tabpanel-overview" aria-labelledby="tab-overview" hidden={tab !== "overview"}>
@@ -290,7 +284,7 @@ export default function App() {
             <Activity size={19} aria-hidden="true" />
             <div>
               <h2>当前账号请求</h2>
-              <p>{isTauri ? (loggedIn ? "经本机转发的业务请求 · 不含 Token 探测" : "登录后显示账号请求统计") : "浏览器示例数据 · 非实际请求"}</p>
+              <p>{isTauri ? (loggedIn ? "经本机转发的业务请求" : "登录后显示账号请求统计") : "浏览器示例数据 · 非实际请求"}</p>
             </div>
           </div>
           <dl className="account-traffic__metrics">
@@ -322,7 +316,7 @@ export default function App() {
 
         <section className="panel tab-panel" role="tabpanel" id="tabpanel-network" aria-labelledby="tab-network" hidden={tab !== "network"}>
           <header>
-            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站网络</h2><p>获取 Token 与业务发送共用这一条出站线路</p></div></div>
+            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站网络</h2><p>业务请求、登录和价格同步都走这一条出站线路</p></div></div>
           </header>
           {bindingNote}
           <div className="proxy-mode" role="group" aria-label="出站代理模式">
@@ -359,7 +353,7 @@ export default function App() {
               }}
             />
           </label>
-          <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。可把出口写成 {'{session}'}，打票时自动轮换；拿到稳定 292 后绑定该 session，业务也走同一条线路。</p>
+          <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。可把出口写成 {'{session}'}，Kit 自动生成会话出口；同一条上游连接沿用同一个 session。</p>
           <div className="system-proxy">
             <label className="system-proxy__toggle">
               <input
@@ -378,7 +372,6 @@ export default function App() {
                   : "未检测到系统代理，直连代理服务器"}
             </span>
             <p>适用于 Clash Verge 等只开了系统代理、没开 TUN 的情况：代理服务器需要翻墙才能连上时，Kit 会先经系统代理再连到它。开关 Clash 的系统代理后自动跟随，无需重启。</p>
-            {fwd.status.systemProxy?.lastError ? <p className="system-proxy__error">{fwd.status.systemProxy.lastError}</p> : null}
           </div>
           <div className="latency-row">
             <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null} onClick={() => void fwd.probeLatency("manual", outboundProxy)}>
@@ -448,11 +441,10 @@ export default function App() {
                 </div>
               </>
             )}
-            {fwd.status.mihomo?.error ? <p className="mihomo-error">{fwd.status.mihomo.error}</p> : null}
             <p className="panel__hint">
               {fwd.status.mihomo?.phase === "connected"
                 ? `已连接${fwd.status.mihomo.selected ? ` · ${fwd.status.mihomo.selected}` : ""}${fwd.status.mihomo.proxyUrl ? ` · ${fwd.status.mihomo.proxyUrl}` : ""}`
-                : "内核随应用内置。打票和业务都走这条订阅线路。"}
+                : "内核随应用内置。业务请求、登录和价格同步都走这条订阅线路。"}
             </p>
           </div>
           )}
@@ -492,7 +484,7 @@ export default function App() {
               }}
             />
           </label>
-          <p className="panel__hint">填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游，Token 也按该模型获取和复用。</p>
+          <p className="panel__hint">填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游。</p>
         </section>
         </div>
 
@@ -571,9 +563,14 @@ export default function App() {
               type="button"
               className="button button--ghost"
               disabled={fwd.busy !== null}
-              onClick={() => {
-                if (!window.confirm("重新生成 Installation ID 后，上游会把 Kit 看成一台新设备。确定继续？")) return;
-                void fwd.regenerateVmInstallation();
+              onClick={async () => {
+                const ok = await confirm({
+                  title: "换一台新机器？",
+                  message: "重新生成 Installation ID 后，上游会把当前账号看成一台新设备。",
+                  confirmText: "换新机器",
+                  danger: true,
+                });
+                if (ok) void fwd.regenerateVmInstallation();
               }}
             >
               换一台新机器

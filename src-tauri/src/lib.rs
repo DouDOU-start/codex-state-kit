@@ -2,6 +2,7 @@ mod commands;
 mod error;
 mod state;
 mod tray;
+mod window_shape;
 
 use tauri::{Manager, RunEvent};
 
@@ -42,6 +43,8 @@ pub fn run() {
             if cfg!(debug_assertions) {
                 mihomo_data.push("dev");
             }
+            // The built-in WARP line is gone; drop its device key and logs.
+            let _ = std::fs::remove_dir_all(mihomo_data.join("warp"));
             mihomo_data.push("mihomo");
             let state = AppState::initialize(MihomoPaths {
                 bundled_binary: mihomo_binary,
@@ -50,6 +53,9 @@ pub fn run() {
             .map_err(|err| err.to_string())?;
             state.start_runtime();
             app.manage(state);
+            if let Some(window) = app.get_webview_window("main") {
+                window_shape::round_corners(&window);
+            }
             if let Err(error) = tray::create(app.handle()) {
                 // The tray is a convenience: never block startup on it.
                 eprintln!("[tray] 创建托盘失败: {error}");
@@ -64,7 +70,6 @@ pub fn run() {
             commands::get_pricing,
             commands::sync_pricing,
             commands::set_config,
-            commands::refresh_turn_state,
             commands::get_codex_config,
             commands::get_login_status,
             commands::list_accounts,
@@ -77,8 +82,6 @@ pub fn run() {
             commands::poll_chatgpt_login,
             commands::cancel_chatgpt_login,
             commands::open_url,
-            commands::set_bound_token_len,
-            commands::set_model_bound_token_len,
             commands::probe_outbound_latency,
             commands::mihomo_groups,
             commands::mihomo_select,

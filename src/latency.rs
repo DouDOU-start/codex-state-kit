@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
-use crate::fetch;
+use crate::outbound;
 use crate::settings::normalize_proxy;
 
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -45,8 +45,8 @@ pub fn proxy_for_probe(raw: &str) -> Result<String> {
     if raw.is_empty() {
         bail!("请先填写代理地址");
     }
-    let resolved = if fetch::has_session_placeholder(raw) {
-        fetch::replace_session_placeholder(raw, "probe")
+    let resolved = if outbound::has_session_placeholder(raw) {
+        outbound::replace_session_placeholder(raw, "probe")
     } else {
         raw.to_string()
     };
@@ -54,7 +54,7 @@ pub fn proxy_for_probe(raw: &str) -> Result<String> {
     if normalized.is_empty() {
         bail!("请先填写代理地址");
     }
-    Ok(fetch::outbound_proxy_for_client(&normalized))
+    Ok(outbound::outbound_proxy_for_client(&normalized))
 }
 
 pub(crate) fn encode_path_segment(value: &str) -> String {

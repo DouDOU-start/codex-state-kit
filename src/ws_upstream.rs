@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tokio_tungstenite::WebSocketStream;
 use url::Url;
 
-use crate::fetch;
+use crate::outbound;
 use crate::ws_bridge;
 
 const MAX_AGE: Duration = Duration::from_secs(55 * 60);
@@ -66,6 +66,8 @@ struct Live {
     ws: WebSocketStream<BoxIo>,
     connected_at: Instant,
     key: String,
+    /// Handshake response headers (`openai-model`, safety buffering, …).
+    headers: http::HeaderMap,
 }
 
 enum Read {
@@ -100,32 +102,38 @@ impl WsUpstreamPool {
     /// `{session}` 在一条连接的存活期内保持不变。调用方已解析好的地址原样返回。
     pub async fn resolve_proxy(&self, template: &str, bound: Option<&str>) -> Result<String> {
         let template = template.trim();
-        if !fetch::has_session_placeholder(template) {
-            return Ok(fetch::dial_proxy_for_client(template));
+        if !outbound::has_session_placeholder(template) {
+            return Ok(outbound::dial_proxy_for_client(template));
         }
         if let Some(session) = bound.map(str::trim).filter(|value| !value.is_empty()) {
-            return Ok(fetch::dial_proxy_for_client(&fetch::apply_bound_session(
-                template,
-                Some(session),
-            )?));
+            return Ok(outbound::dial_proxy_for_client(
+                &outbound::apply_bound_session(template, Some(session))?,
+            ));
         }
         let mut guard = self.inner.lock().await;
         if guard.sticky_session.is_none() {
-            guard.sticky_session = Some(fetch::generate_proxy_session());
+            guard.sticky_session = Some(outbound::generate_proxy_session());
         }
         let session = guard.sticky_session.clone().context("缺少代理 session")?;
-        Ok(fetch::dial_proxy_for_client(
-            &fetch::replace_session_placeholder(template, &session),
+        Ok(outbound::dial_proxy_for_client(
+            &outbound::replace_session_placeholder(template, &session),
         ))
     }
 
+    /// Sends one turn and streams its events; also returns the handshake
+    /// headers of the connection that carried it.
     pub async fn open_turn(
         &self,
         dial: WsDial,
         payload: Value,
-    ) -> Result<mpsc::Receiver<Result<String, String>>> {
+    ) -> Result<(mpsc::Receiver<Result<String, String>>, http::HeaderMap)> {
         let mut guard = self.inner.clone().lock_owned().await;
         ensure(&mut guard, &dial).await?;
+        let headers = guard
+            .live
+            .as_ref()
+            .map(|live| live.headers.clone())
+            .unwrap_or_default();
         if let Err(err) = send_frame(&mut guard, &payload).await {
             guard.live = None;
             guard.connected_at = None;
@@ -135,7 +143,7 @@ impl WsUpstreamPool {
         tokio::spawn(async move {
             drive(guard, dial, payload, tx).await;
         });
-        Ok(rx)
+        Ok((rx, headers))
     }
 }
 
@@ -172,12 +180,13 @@ async fn ensure(inner: &mut Inner, dial: &WsDial) -> Result<()> {
     if replacing {
         inner.sticky_session = None;
     }
-    let ws = connect_upstream(dial).await?;
+    let (ws, headers) = connect_upstream(dial).await?;
     inner.connected_at = Some(chrono::Utc::now().to_rfc3339());
     inner.live = Some(Live {
         ws,
         connected_at: Instant::now(),
         key,
+        headers,
     });
     Ok(())
 }
@@ -299,7 +308,7 @@ async fn read_one(inner: &mut Inner, saw_event: bool) -> Read {
     }
 }
 
-async fn connect_upstream(dial: &WsDial) -> Result<WebSocketStream<BoxIo>> {
+async fn connect_upstream(dial: &WsDial) -> Result<(WebSocketStream<BoxIo>, http::HeaderMap)> {
     let url = Url::parse(&dial.url).context("上游 WebSocket 地址无效")?;
     let mut request = dial
         .url
@@ -318,10 +327,10 @@ async fn connect_upstream(dial: &WsDial) -> Result<WebSocketStream<BoxIo>> {
         insert_header(headers, name, value);
     }
     let io = dial_io(&url, &dial.proxy).await?;
-    let (stream, _response) = tokio_tungstenite::client_async_with_config(request, io, None)
+    let (stream, response) = tokio_tungstenite::client_async_with_config(request, io, None)
         .await
         .context("上游 WebSocket 握手失败")?;
-    Ok(stream)
+    Ok((stream, response.headers().clone()))
 }
 
 fn insert_header(headers: &mut http::HeaderMap, name: &str, value: &str) {
@@ -607,12 +616,24 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)] // tungstenite's handshake callback signature
     async fn round_trip_against_local_websocket() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response
+                        .headers_mut()
+                        .insert("openai-model", http::HeaderValue::from_static("gpt-5.6-luna"));
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
             let message = ws.next().await.unwrap().unwrap();
             let text = message.into_text().unwrap();
             assert!(text.contains("response.create"));
@@ -626,7 +647,7 @@ mod tests {
             .unwrap();
         });
         let pool = WsUpstreamPool::new();
-        let mut rx = pool
+        let (mut rx, handshake) = pool
             .open_turn(
                 WsDial {
                     url: format!("ws://{addr}/responses"),
@@ -639,6 +660,8 @@ mod tests {
             )
             .await
             .unwrap();
+        // The handshake headers carry the serving model for downgrade checks.
+        assert_eq!(handshake.get("openai-model").unwrap(), "gpt-5.6-luna");
         let first = rx.recv().await.unwrap().unwrap();
         assert!(first.contains("response.created"));
         let second = rx.recv().await.unwrap().unwrap();
@@ -678,7 +701,7 @@ mod tests {
                 .unwrap();
         });
         let pool = WsUpstreamPool::new();
-        let mut rx = pool
+        let (mut rx, _) = pool
             .open_turn(
                 WsDial {
                     url: "ws://chatgpt.com:443/backend-api/codex/responses".into(),
@@ -717,7 +740,7 @@ mod tests {
                 .unwrap();
         });
         let pool = WsUpstreamPool::new();
-        let mut rx = pool
+        let (mut rx, _) = pool
             .open_turn(
                 WsDial {
                     url: format!("ws://{addr}/responses"),

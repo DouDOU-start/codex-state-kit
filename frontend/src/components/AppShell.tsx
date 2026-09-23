@@ -4,11 +4,12 @@ import X from "lucide-react/dist/esm/icons/x.js";
 import Github from "lucide-react/dist/esm/icons/github.js";
 import ExternalLink from "lucide-react/dist/esm/icons/external-link.js";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useState, type PropsWithChildren } from "react";
+import { type PropsWithChildren } from "react";
 import { GITHUB_REPO_URL, isTauri, openGithubRepo } from "@/lib/api";
 import { version } from "../../../package.json";
 import { Logo } from "./Logo";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
+import { useNotice, useNotify } from "@/components/Notifier";
 
 async function windowAction(action: "minimize" | "maximize" | "close") {
   if (!isTauri) return;
@@ -19,8 +20,38 @@ async function windowAction(action: "minimize" | "maximize" | "close") {
 }
 
 export function AppShell({ children }: PropsWithChildren) {
-  const [repoError, setRepoError] = useState<string | null>(null);
+  const { notify } = useNotify();
   const updates = useUpdateCheck();
+  const update = updates.update;
+  useNotice(
+    "update",
+    update ? `${update.tag}:${updates.phase}:${updates.progress ?? ""}` : null,
+    () => ({
+      kind: "info",
+      title: updates.phase === "ready" ? "更新已就绪" : updates.phase === "installing" ? "正在安装更新" : updates.phase === "downloading" ? "正在下载更新" : "发现新版本",
+      message: updates.phase === "ready"
+        ? `v${update?.latestVersion} 已下载并通过签名校验。安装将关闭应用，请先结束当前会话。`
+        : updates.phase === "installing"
+          ? "正在恢复路由、停止订阅内核并等待在途请求结束，请勿关闭应用…"
+          : updates.phase === "downloading"
+            ? `正在下载 v${update?.latestVersion}${updates.progress === null ? "" : ` · ${updates.progress}%`}，下载期间可继续使用。`
+            : `v${update?.latestVersion} 已发布（当前 v${update?.currentVersion}）。`,
+      sticky: true,
+      actions: [
+        ...(updates.phase === "idle" ? [{ label: "下载更新", primary: true, onClick: () => void updates.download() }] : []),
+        ...(updates.phase === "ready" ? [{ label: "确认安装并重启", primary: true, onClick: () => void updates.install() }] : []),
+        { label: <>前往下载 <ExternalLink size={11} /></>, onClick: () => void updates.open(update?.tag) },
+      ],
+      onClose: updates.phase === "idle" ? updates.dismiss : undefined,
+    }),
+  );
+  useNotice("update-message", updates.message ?? null, () => ({
+    kind: "info",
+    message: updates.message,
+    sticky: true,
+    actions: [{ label: "发布页面", onClick: () => void updates.open() }],
+    onClose: updates.dismiss,
+  }));
   const versionLabel = import.meta.env.DEV || !isTauri ? "dev" : `v${version}`;
   return (
     <div className="app-shell">
@@ -39,8 +70,7 @@ export function AppShell({ children }: PropsWithChildren) {
             onClick={(event) => {
               if (!isTauri) return;
               event.preventDefault();
-              setRepoError(null);
-              void openGithubRepo().catch(() => setRepoError("无法打开浏览器，请访问 github.com/DouDOU-start/codex-state-kit"));
+              void openGithubRepo().catch(() => notify({ kind: "error", message: "无法打开浏览器，请访问 github.com/DouDOU-start/codex-state-kit" }));
             }}>
             <Github size={15} aria-hidden="true" /><span>GitHub</span><ExternalLink size={11} aria-hidden="true" />
           </a>
@@ -58,23 +88,6 @@ export function AppShell({ children }: PropsWithChildren) {
         </div>
       </header>
       <main className="app-content">
-        {updates.update ? <div className="update-notice" role="status">
-          <span>{updates.phase === "ready" ? <>v{updates.update.latestVersion} 已下载并通过签名校验。安装将关闭应用；请先结束当前会话。</> : updates.phase === "installing" ? "正在准备安装：恢复路由、停止 WARP，并等待在途请求结束，请勿关闭应用…" : updates.phase === "downloading" ? `正在下载 v${updates.update.latestVersion} ${updates.progress === null ? "" : `${updates.progress}%`}，下载期间可继续使用。` : <>发现新版本 <strong>v{updates.update.latestVersion}</strong>（当前 v{updates.update.currentVersion}）。</>}</span>
-          <div className="update-notice__actions">
-            {updates.phase === "idle" ? <button type="button" onClick={() => void updates.download()}>下载更新</button> : null}
-            {updates.phase === "ready" ? <button type="button" onClick={() => void updates.install()}>确认安装并重启</button> : null}
-            <button type="button" onClick={() => void updates.open(updates.update?.tag)}>前往下载 <ExternalLink size={12} /></button>
-            {updates.phase === "idle" ? <button type="button" onClick={updates.dismiss}>稍后</button> : null}
-          </div>
-        </div> : null}
-        {updates.message ? <div className="update-notice" role="status">
-          <span>{updates.message}</span>
-          <div className="update-notice__actions">
-            <button type="button" onClick={() => void updates.open()}>发布页面</button>
-            <button type="button" onClick={updates.dismiss}>关闭</button>
-          </div>
-        </div> : null}
-        {repoError ? <div className="banner banner--error repo-error" role="alert"><span>{repoError}</span><button type="button" onClick={() => setRepoError(null)}>关闭</button></div> : null}
         <div style={{ display: "contents" }} ref={(node) => { if (node) node.inert = updates.phase === "installing"; }}>
           {children}
         </div>

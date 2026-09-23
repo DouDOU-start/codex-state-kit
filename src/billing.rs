@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::downgrade::{DowngradeReport, DowngradeSignals, Verdict};
 use crate::pricing::{PriceBook, ServiceTier, Usage as PricingUsage};
 
 const PROVIDER_CHATGPT: &str = "chatgpt";
@@ -104,6 +105,9 @@ pub struct UsageOutcome {
     /// `http`, `http_sse`, `http_to_ws` or `ws_to_ws`.
     #[serde(default)]
     pub transport: Option<String>,
+    /// Downgrade evidence gathered from the response head and stream.
+    #[serde(default)]
+    pub downgrade_signals: DowngradeSignals,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,13 +162,15 @@ pub struct UsageRecord {
     pub output_cost_nanos: Option<i64>,
     pub first_token_ms: Option<u64>,
     pub transport: Option<String>,
+    /// Set when the response looks downgraded (see [`crate::downgrade`]).
+    pub downgrade: Option<DowngradeReport>,
     pub cost_nanos: Option<i64>,
     pub currency: Option<String>,
     pub error_kind: Option<String>,
 }
 
 /// Columns read by [`row_to_record`], in order.
-const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos,u.first_token_ms,u.transport";
+const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos,u.first_token_ms,u.transport,u.downgrade";
 
 /// (state, source, provider, sent_model, started_at, requested_service_tier)
 type PendingRow = (
@@ -198,6 +204,9 @@ pub struct UsageFilter {
     pub to: Option<String>,
     pub source: Option<String>,
     pub model: Option<String>,
+    /// `Some(true)` keeps only downgraded (confirmed or suspected) requests.
+    #[serde(default)]
+    pub downgraded: Option<bool>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -272,6 +281,19 @@ pub struct UsageRecordsPage {
 pub struct BillingStore {
     connection: Arc<Mutex<Connection>>,
     pricing: Arc<PriceBook>,
+    /// Latest downgraded request settled since Kit started.
+    last_downgrade: Arc<Mutex<Option<DowngradeEvent>>>,
+}
+
+/// A downgraded request, surfaced to the UI as a notice.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DowngradeEvent {
+    pub request_id: String,
+    pub at: String,
+    pub account_id: String,
+    pub email: Option<String>,
+    pub report: DowngradeReport,
 }
 
 impl BillingStore {
@@ -286,6 +308,7 @@ impl BillingStore {
         let store = Self {
             connection: Arc::new(Mutex::new(connection)),
             pricing,
+            last_downgrade: Arc::new(Mutex::new(None)),
         };
         store.configure()?;
         store.migrate()?;
@@ -297,6 +320,7 @@ impl BillingStore {
         let store = Self {
             connection: Arc::new(Mutex::new(Connection::open_in_memory()?)),
             pricing: Arc::new(PriceBook::bundled()),
+            last_downgrade: Arc::new(Mutex::new(None)),
         };
         store.configure()?;
         store.migrate()?;
@@ -305,6 +329,13 @@ impl BillingStore {
 
     pub fn pricing(&self) -> &Arc<PriceBook> {
         &self.pricing
+    }
+
+    pub fn last_downgrade(&self) -> Option<DowngradeEvent> {
+        self.last_downgrade
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn connection(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -370,6 +401,9 @@ impl BillingStore {
             ("output_cost_nanos", "INTEGER"),
             ("first_token_ms", "INTEGER"),
             ("transport", "TEXT"),
+            // JSON DowngradeReport, and its verdict for filtering.
+            ("downgrade", "TEXT"),
+            ("downgrade_verdict", "TEXT"),
         ] {
             if !existing.iter().any(|name| name == column) {
                 conn.execute_batch(&format!(
@@ -485,14 +519,39 @@ impl BillingStore {
             Priced::default()
         };
         let tokens = |value: Option<u64>| value.map(|v| v as i64);
+        let downgrade = outcome
+            .downgrade_signals
+            .report(sent_model.as_deref(), outcome.response_model.as_deref());
+        let downgrade_json = downgrade.as_ref().map(serde_json::to_string).transpose()?;
+        let downgrade_verdict = downgrade.as_ref().map(|report| match report.verdict {
+            Verdict::Confirmed => "confirmed",
+            Verdict::Suspected => "suspected",
+        });
         tx.execute(
-            "UPDATE usage_records SET finished_at=?2, state=?3, http_status=?4, response_model=?5, input_tokens=?6, cached_input_tokens=?7, output_tokens=?8, usage_source=?9, pricing_rule_id=?10, cost_nanos=?11, currency=?12, error_kind=?13, cache_write_tokens=?14, reasoning_tokens=?15, pricing_model=?16, service_tier=?17, long_context=?18, input_cost_nanos=?19, cache_read_cost_nanos=?20, cache_write_cost_nanos=?21, output_cost_nanos=?22, first_token_ms=?23, transport=?24 WHERE request_id=?1",
-            params![request_id, outcome.finished_at, state.as_str(), outcome.http_status.map(i64::from), outcome.response_model, tokens(outcome.usage.input_tokens), tokens(outcome.usage.cached_input_tokens), tokens(outcome.usage.output_tokens), outcome.usage_source, priced.rule_id, priced.total, priced.currency, outcome.error_kind, tokens(outcome.usage.cache_write_tokens), tokens(outcome.usage.reasoning_tokens), priced.model, priced.tier.map(ServiceTier::as_str), priced.long_context, priced.input, priced.cache_read, priced.cache_write, priced.output, tokens(outcome.first_token_ms), outcome.transport],
+            "UPDATE usage_records SET finished_at=?2, state=?3, http_status=?4, response_model=?5, input_tokens=?6, cached_input_tokens=?7, output_tokens=?8, usage_source=?9, pricing_rule_id=?10, cost_nanos=?11, currency=?12, error_kind=?13, cache_write_tokens=?14, reasoning_tokens=?15, pricing_model=?16, service_tier=?17, long_context=?18, input_cost_nanos=?19, cache_read_cost_nanos=?20, cache_write_cost_nanos=?21, output_cost_nanos=?22, first_token_ms=?23, transport=?24, downgrade=?25, downgrade_verdict=?26 WHERE request_id=?1",
+            params![request_id, outcome.finished_at, state.as_str(), outcome.http_status.map(i64::from), outcome.response_model, tokens(outcome.usage.input_tokens), tokens(outcome.usage.cached_input_tokens), tokens(outcome.usage.output_tokens), outcome.usage_source, priced.rule_id, priced.total, priced.currency, outcome.error_kind, tokens(outcome.usage.cache_write_tokens), tokens(outcome.usage.reasoning_tokens), priced.model, priced.tier.map(ServiceTier::as_str), priced.long_context, priced.input, priced.cache_read, priced.cache_write, priced.output, tokens(outcome.first_token_ms), outcome.transport, downgrade_json, downgrade_verdict],
         )?;
         tx.commit()?;
         drop(conn);
-        self.get_by_id(request_id)?
-            .context("settled billing record disappeared")
+        let record = self
+            .get_by_id(request_id)?
+            .context("settled billing record disappeared")?;
+        if let Some(report) = record.downgrade.clone() {
+            *self
+                .last_downgrade
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(DowngradeEvent {
+                request_id: record.request_id.clone(),
+                at: record
+                    .finished_at
+                    .clone()
+                    .unwrap_or_else(|| record.started_at.clone()),
+                account_id: record.account_id.clone(),
+                email: record.email.clone(),
+                report,
+            });
+        }
+        Ok(record)
     }
 
     /// Manual pricing rules (exact model match) take precedence, like
@@ -644,6 +703,11 @@ impl BillingStore {
             clauses.push("(u.sent_model=? OR u.requested_model=?)".into());
             values.push(Box::new(value.to_owned()));
             values.push(Box::new(value.to_owned()));
+        }
+        match filter.downgraded {
+            Some(true) => clauses.push("u.downgrade_verdict IS NOT NULL".into()),
+            Some(false) => clauses.push("u.downgrade_verdict IS NULL".into()),
+            None => {}
         }
         let where_sql = clauses.join(" AND ");
         let count_sql = format!("SELECT COUNT(*) FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE {where_sql}");
@@ -856,6 +920,9 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
             .get::<_, Option<i64>>(29)?
             .and_then(|v| u64::try_from(v).ok()),
         transport: row.get(30)?,
+        downgrade: row
+            .get::<_, Option<String>>(31)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
@@ -1025,6 +1092,48 @@ mod tests {
         assert_eq!(account.total.request_count, 2);
         assert_eq!(account.total.cost_nanos, None);
         assert_eq!(account.business.cost_nanos, None);
+    }
+
+    #[test]
+    fn downgraded_requests_are_stored_filtered_and_surfaced() {
+        let store = BillingStore::open_in_memory().unwrap();
+        for (id, served) in [("clean", "gpt-6-astra"), ("rerouted", "gpt-5.6-luna")] {
+            let mut request = start(id, "a");
+            request.sent_model = Some("gpt-6-astra".into());
+            request.requested_model = request.sent_model.clone();
+            store.begin_request(request).unwrap();
+            let mut signals = DowngradeSignals::default();
+            let mut headers = http::HeaderMap::new();
+            headers.insert("openai-model", http::HeaderValue::from_static(served));
+            signals.observe_headers(&headers);
+            store
+                .settle_request(
+                    id,
+                    UsageOutcome {
+                        state: UsageState::Measured,
+                        downgrade_signals: signals,
+                        ..UsageOutcome::default()
+                    },
+                )
+                .unwrap();
+        }
+        let clean = store.get_by_id("clean").unwrap().unwrap();
+        assert!(clean.downgrade.is_none());
+        let rerouted = store.get_by_id("rerouted").unwrap().unwrap();
+        let report = rerouted.downgrade.unwrap();
+        assert_eq!(report.verdict, Verdict::Confirmed);
+        assert_eq!(report.effective_model.as_deref(), Some("gpt-5.6-luna"));
+
+        let only = store
+            .list_usage(UsageFilter {
+                downgraded: Some(true),
+                ..UsageFilter::default()
+            })
+            .unwrap();
+        assert_eq!(only.total, 1);
+        assert_eq!(only.records[0].request_id, "rerouted");
+        let last = store.last_downgrade().unwrap();
+        assert_eq!(last.request_id, "rerouted");
     }
 
     #[test]

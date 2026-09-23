@@ -4,8 +4,6 @@
 
 use serde_json::{json, Value};
 
-use crate::turn_state;
-
 /// 只对 https 上游尝试 WebSocket。本地测试用的 `http://` 模拟端必须继续走 reqwest，
 /// 否则一次 WebSocket 握手会占掉只能 accept 一次的 TCP 桩。
 pub fn should_bridge_http(enabled: bool, method: &str, path: &str, target: &str) -> bool {
@@ -61,28 +59,6 @@ pub fn rewrite_model_in_ws_frame(frame: &mut Value, model: &str) {
     }
     if let Some(object) = frame.as_object_mut() {
         object.insert("model".to_string(), json!(model));
-    }
-}
-
-/// 同轮只改了 HTTP 头时，把票据补进帧的 `client_metadata`。
-pub fn ensure_turn_state(frame: &mut Value, token: &str) {
-    let token = token.trim();
-    if token.is_empty() {
-        return;
-    }
-    let Some(object) = frame.as_object_mut() else {
-        return;
-    };
-    let metadata = object.entry("client_metadata").or_insert_with(|| json!({}));
-    let Some(metadata) = metadata.as_object_mut() else {
-        return;
-    };
-    let present = metadata
-        .get(turn_state::HEADER_NAME)
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.is_empty());
-    if !present {
-        metadata.insert(turn_state::HEADER_NAME.to_string(), json!(token));
     }
 }
 
@@ -179,16 +155,10 @@ mod tests {
     }
 
     #[test]
-    fn model_rewrite_and_turn_state() {
+    fn model_rewrite() {
         let mut frame = json!({"model":"client","type":"response.create"});
         rewrite_model_in_ws_frame(&mut frame, "forced");
-        ensure_turn_state(&mut frame, "ticket");
-        ensure_turn_state(&mut frame, "other");
         assert_eq!(frame["model"], json!("forced"));
-        assert_eq!(
-            frame["client_metadata"][turn_state::HEADER_NAME],
-            json!("ticket")
-        );
     }
 
     #[test]

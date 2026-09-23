@@ -1,5 +1,4 @@
 export interface LogEntry {
-  statePolicy?: StateMissPolicy | null;
   accountId?: string | null;
   accountEmail?: string | null;
   id: number;
@@ -28,9 +27,6 @@ export interface LogEntry {
   upstreamResponseModel?: string | null;
   contentEncoding: string;
   bodyBytes: number;
-  turnStateAction: string;
-  turnStateLen?: number | null;
-  returnedTurnStateLen?: number | null;
   errorKind?: string | null;
   streamState: "not_tracked" | "awaiting_first_chunk" | "streaming" | "completed" | "error" | "cancelled" | string;
   firstChunkMs?: number | null;
@@ -40,43 +36,6 @@ export interface LogEntry {
   streamChunks: number;
   maxIdleMs?: number | null;
   currentIdleMs?: number | null;
-}
-
-export interface TokenLenCount {
-  len: number;
-  count: number;
-}
-
-export interface PoolTokenInfo {
-  len: number;
-  ageSecs: number;
-  isBound: boolean;
-  isValid: boolean;
-}
-
-export interface ModelTokenView {
-  model: string;
-  status: "active" | "refreshing" | "expired" | "empty" | string;
-  ageSecs?: number | null;
-  len?: number | null;
-  capturedAt?: string | null;
-  distribution?: TokenLenCount[];
-  poolTokens?: PoolTokenInfo[];
-  /** 模型级绑定覆盖（null/undefined 表示跟随全局） */
-  boundOverride?: number | null;
-  sharedFromModel?: string | null;
-}
-
-export interface TurnStateView {
-  status: "idle" | "active" | "partial" | "empty" | string;
-  ageSecs?: number | null;
-  len?: number | null;
-  source?: string | null;
-  capturedAt?: string | null;
-  models?: ModelTokenView[];
-  boundTokenLen?: number;
-  sharedSourceModel?: string | null;
-  boundProxySession?: string | null;
 }
 
 export interface VmIdentityView {
@@ -102,15 +61,8 @@ export interface VmProfile {
 }
 
 export interface Status {
-  tokenReusePolicy: TokenReusePolicy;
-  stateFetchModel: string;
-  tokenFetchPaused?: boolean;
-  tokenMaxAgeMins?: number;
-  tokenPrefetchAgeMins?: number;
   diagLogPath?: string;
   forcedModel: string;
-  stateMissPolicy: StateMissPolicy;
-  configuredModels: string[];
   currentAccountId?: string | null;
   currentAccountEmail?: string | null;
   accountTraffic: { concurrentRequests: number; rpm: number };
@@ -126,11 +78,6 @@ export interface Status {
   mihomoSubscription: string;
   mihomoNode: string;
   mihomo: MihomoStatus;
-  fetchError?: string | null;
-  fetchOkAt?: string | null;
-  turnState: TurnStateView;
-  degraded: boolean;
-  degradedAt?: string | null;
   logs: LogEntry[];
   vmIdentity: VmIdentityView;
   wsUpstreamEnabled: boolean;
@@ -138,6 +85,37 @@ export interface Status {
   wsUpstreamConnectedAt?: string | null;
   chainSystemProxy?: boolean;
   systemProxy?: SystemProxyView;
+  /** Latest downgraded request since Kit started. */
+  lastDowngrade?: DowngradeEvent | null;
+}
+
+/** confirmed: upstream reported a different serving model (openai-model). */
+export type DowngradeVerdict = "confirmed" | "suspected";
+
+export interface DowngradeReport {
+  verdict: DowngradeVerdict;
+  requestedModel?: string | null;
+  /** The model that served the turn instead, when known. */
+  effectiveModel?: string | null;
+  safetyBuffering: boolean;
+  reasons: string[];
+  useCases: string[];
+  /** Faster model upstream offered for a retry while buffering. */
+  fasterModel?: string | null;
+  verifications?: string[];
+  turnStateLen?: number | null;
+  primaryUsedPercent?: number | null;
+  encryptedMin?: number | null;
+  /** Human-readable evidence, strongest first. */
+  signals: string[];
+}
+
+export interface DowngradeEvent {
+  requestId: string;
+  at: string;
+  accountId: string;
+  email?: string | null;
+  report: DowngradeReport;
 }
 
 export interface SystemProxyView {
@@ -148,14 +126,7 @@ export interface SystemProxyView {
 }
 
 export interface SettingsPatch {
-  tokenReusePolicy: TokenReusePolicy;
-  stateFetchModel: string;
-  tokenFetchPaused?: boolean;
-  tokenMaxAgeMins?: number;
-  tokenPrefetchAgeMins?: number;
   forcedModel: string;
-  models: string[];
-  stateMissPolicy: StateMissPolicy;
   proxyListen: string;
   upstream: string;
   codexHome: string;
@@ -167,10 +138,8 @@ export interface SettingsPatch {
   chainSystemProxy?: boolean;
 }
 
-export type TokenReusePolicy = "shared_292" | "per_model";
 export type OutboundMode = "manual" | "mihomo";
 export type ProbeKind = "manual" | "mihomo";
-export type StateMissPolicy = "preserve" | "wait" | "strip" | "passthrough" | "strip_all";
 
 export interface LatencySample {
   name: string;
@@ -329,6 +298,7 @@ export interface BillingRecord {
   firstTokenMs?: number | null;
   /** http | http_sse | http_to_ws | ws_to_ws */
   transport?: string | null;
+  downgrade?: DowngradeReport | null;
   costNanos?: number | null;
   currency?: string | null;
   errorKind?: string | null;
@@ -340,6 +310,8 @@ export interface BillingQuery {
   to?: string | null;
   source?: BillingRecordSource | null;
   model?: string | null;
+  /** true keeps only downgraded (confirmed or suspected) requests. */
+  downgraded?: boolean | null;
   limit?: number;
   offset?: number;
 }

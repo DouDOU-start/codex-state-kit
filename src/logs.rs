@@ -14,7 +14,6 @@ pub const ROUTE_EMBEDDED_MIHOMO: &str = "embedded_mihomo";
 pub const ROUTE_MANUAL_PROXY: &str = "manual_proxy";
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_LOGS: usize = 80;
-const MAX_TOKEN_FETCH_LOGS: usize = 48;
 const UNSET_MILLIS: u64 = u64::MAX;
 const STREAM_AWAITING: u8 = 0;
 const STREAM_ACTIVE: u8 = 1;
@@ -249,7 +248,6 @@ fn optional_millis(value: u64) -> Option<u128> {
 
 #[derive(Clone, Debug, Default)]
 pub struct NetworkLogDetails {
-    pub state_policy: Option<crate::settings::StateMissPolicy>,
     pub account_id: Option<String>,
     pub account_email: Option<String>,
     pub flow: String,
@@ -265,9 +263,6 @@ pub struct NetworkLogDetails {
     pub upstream_response_model: Option<String>,
     pub content_encoding: String,
     pub body_bytes: usize,
-    pub turn_state_action: String,
-    pub turn_state_len: Option<usize>,
-    pub returned_turn_state_len: Option<usize>,
     pub error_kind: Option<String>,
     pub response_status: Option<u16>,
     pub response_header_ms: Option<u128>,
@@ -278,16 +273,11 @@ pub struct NetworkLogDetails {
     pub in_progress: bool,
     pub stream_lifecycle: Option<Arc<StreamLifecycle>>,
     pub diag: Option<crate::diag::Request>,
-    pub token_fp: Option<String>,
-    pub cookie_names: Vec<String>,
-    /// 本次请求实际注入的票据。只用于响应观测，不进入日志。
-    pub injected_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogEntry {
-    pub state_policy: Option<crate::settings::StateMissPolicy>,
     pub account_id: Option<String>,
     pub account_email: Option<String>,
     pub id: u64,
@@ -316,9 +306,6 @@ pub struct LogEntry {
     pub upstream_response_model: Option<String>,
     pub content_encoding: String,
     pub body_bytes: usize,
-    pub turn_state_action: String,
-    pub turn_state_len: Option<usize>,
-    pub returned_turn_state_len: Option<usize>,
     pub error_kind: Option<String>,
     pub stream_state: String,
     pub first_chunk_ms: Option<u128>,
@@ -348,7 +335,6 @@ impl LogEntry {
             .as_ref()
             .map(|lifecycle| lifecycle.snapshot());
         Self {
-            state_policy: details.state_policy,
             id: LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             account_id: details.account_id,
             account_email: details.account_email,
@@ -376,9 +362,6 @@ impl LogEntry {
             upstream_response_model: details.upstream_response_model,
             content_encoding: details.content_encoding,
             body_bytes: details.body_bytes,
-            turn_state_action: details.turn_state_action,
-            turn_state_len: details.turn_state_len,
-            returned_turn_state_len: details.returned_turn_state_len,
             error_kind: details.error_kind,
             stream_state: stream
                 .as_ref()
@@ -463,26 +446,6 @@ pub fn network_details(upstream: &str, proxy: &str) -> NetworkLogDetails {
         },
         proxy_endpoint: (!proxy.is_empty()).then(|| endpoint_origin(proxy)),
         content_encoding: "none".into(),
-        turn_state_action: "not_applicable".into(),
-        ..NetworkLogDetails::default()
-    }
-}
-
-pub fn token_network_details(
-    upstream: &str,
-    proxy: &str,
-    route_kind: &str,
-    model: &str,
-) -> NetworkLogDetails {
-    NetworkLogDetails {
-        flow: "token_fetch".into(),
-        transport: "http_sse".into(),
-        target_origin: endpoint_origin(upstream),
-        route_kind: route_kind.into(),
-        proxy_endpoint: Some(endpoint_origin(proxy)),
-        model: Some(safe_text(model, 80)).filter(|value| !value.is_empty()),
-        content_encoding: "json".into(),
-        turn_state_action: "awaiting_response".into(),
         ..NetworkLogDetails::default()
     }
 }
@@ -527,6 +490,7 @@ pub struct ResponseMetrics {
     usage_seen: bool,
     upstream_response_model: Option<String>,
     service_tier: Option<String>,
+    downgrade: crate::downgrade::DowngradeSignals,
     line: Vec<u8>,
     data: Vec<u8>,
     skip_event: bool,
@@ -626,8 +590,19 @@ impl ResponseBodyMetrics {
             // A statistics decoding failure must not interrupt forwarding or
             // turn a successful HTTP request into a network error.
             self.disabled = true;
-            self.sink_mut().metrics = ResponseMetrics::default();
+            // Header evidence is still valid when the body cannot be decoded.
+            let downgrade = std::mem::take(&mut self.sink_mut().metrics.downgrade);
+            self.sink_mut().metrics = ResponseMetrics {
+                downgrade,
+                ..ResponseMetrics::default()
+            };
         }
+    }
+
+    /// Upstream response (or WebSocket handshake) headers, for downgrade
+    /// detection. Kept even when body decoding is disabled.
+    pub fn observe_headers(&mut self, headers: &http::HeaderMap) {
+        self.sink_mut().metrics.downgrade.observe_headers(headers);
     }
 
     pub fn finish(&mut self, elapsed_ms: u128) {
@@ -747,6 +722,11 @@ impl ResponseMetrics {
         self.service_tier.as_deref()
     }
 
+    /// Downgrade evidence seen in the response headers and stream events.
+    pub fn downgrade_signals(&self) -> &crate::downgrade::DowngradeSignals {
+        &self.downgrade
+    }
+
     pub fn token_usage(&self) -> crate::billing::TokenUsage {
         crate::billing::TokenUsage {
             input_tokens: self.input_tokens,
@@ -804,6 +784,7 @@ impl ResponseMetrics {
         let Ok(json) = serde_json::from_slice::<serde_json::Value>(event) else {
             return;
         };
+        self.downgrade.observe_event(&json);
         if let Some(event_type) = json.get("type").and_then(serde_json::Value::as_str) {
             self.record_sse_event_type(event_type);
         }
@@ -1024,22 +1005,7 @@ fn find_cached_input_tokens(usage: &serde_json::Value) -> Option<u64> {
 }
 
 pub fn push(logs: &mut VecDeque<LogEntry>, entry: LogEntry) {
-    if entry.flow == "token_fetch" {
-        let token_count = logs
-            .iter()
-            .filter(|existing| existing.flow == "token_fetch")
-            .count();
-        if token_count >= MAX_TOKEN_FETCH_LOGS {
-            if let Some(index) = logs
-                .iter()
-                .position(|existing| existing.flow == "token_fetch")
-            {
-                logs.remove(index);
-            }
-        } else if logs.len() >= MAX_LOGS {
-            logs.pop_front();
-        }
-    } else if logs.len() >= MAX_LOGS {
+    if logs.len() >= MAX_LOGS {
         logs.pop_front();
     }
     logs.push_back(entry);
@@ -1420,46 +1386,14 @@ data: {"type":"response.completed","response":{"service_tier":"priority","usage"
     }
 
     #[test]
-    fn token_details_identify_mihomo_without_exposing_credentials() {
-        let details = token_network_details(
-            "https://chatgpt.com/backend-api/codex",
-            "socks5h://statekit:private@127.0.0.1:1080",
-            ROUTE_EMBEDDED_MIHOMO,
-            "gpt-6-astra",
-        );
-        assert_eq!(details.flow, "token_fetch");
-        assert_eq!(details.route_kind, ROUTE_EMBEDDED_MIHOMO);
-        assert_eq!(
-            details.proxy_endpoint.as_deref(),
-            Some("socks5h://127.0.0.1:1080")
-        );
-        assert_eq!(details.model.as_deref(), Some("gpt-6-astra"));
-    }
-
-    #[test]
-    fn token_details_identify_manual_proxy() {
-        let details = token_network_details(
-            "https://chatgpt.com/backend-api/codex",
-            "socks5h://proxy.example.test:44445",
-            ROUTE_MANUAL_PROXY,
-            "gpt-6-astra",
-        );
-        assert_eq!(details.route_kind, ROUTE_MANUAL_PROXY);
-        assert_eq!(
-            details.proxy_endpoint.as_deref(),
-            Some("socks5h://proxy.example.test:44445")
-        );
-    }
-
-    #[test]
     fn safe_text_removes_log_controls_and_bounds_input() {
         assert_eq!(safe_text("  gpt-6\nastra\t-extra", 12), "gpt-6astra-e");
     }
 
     #[test]
-    fn token_fetch_bursts_do_not_evict_all_business_logs() {
+    fn log_keeps_only_the_latest_entries() {
         let mut entries = VecDeque::new();
-        for _ in 0..60 {
+        for _ in 0..(MAX_LOGS + 20) {
             push(
                 &mut entries,
                 LogEntry::new(
@@ -1471,39 +1405,7 @@ data: {"type":"response.completed","response":{"service_tier":"priority","usage"
                 ),
             );
         }
-        for _ in 0..100 {
-            push(
-                &mut entries,
-                LogEntry::new(
-                    "POST",
-                    "/responses",
-                    502,
-                    Instant::now(),
-                    token_network_details(
-                        "https://chatgpt.com",
-                        "socks5h://127.0.0.1:1080",
-                        ROUTE_MANUAL_PROXY,
-                        "gpt-6-astra",
-                    ),
-                ),
-            );
-        }
-
         assert_eq!(entries.len(), MAX_LOGS);
-        assert_eq!(
-            entries
-                .iter()
-                .filter(|entry| entry.flow == "token_fetch")
-                .count(),
-            MAX_TOKEN_FETCH_LOGS
-        );
-        assert_eq!(
-            entries
-                .iter()
-                .filter(|entry| entry.flow == "business")
-                .count(),
-            MAX_LOGS - MAX_TOKEN_FETCH_LOGS
-        );
     }
 
     #[test]
