@@ -1,15 +1,10 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import Copy from "lucide-react/dist/esm/icons/copy.js";
-import ExternalLink from "lucide-react/dist/esm/icons/external-link.js";
-import LogIn from "lucide-react/dist/esm/icons/log-in.js";
 import Shield from "lucide-react/dist/esm/icons/shield.js";
 import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import Activity from "lucide-react/dist/esm/icons/activity.js";
 import Monitor from "lucide-react/dist/esm/icons/monitor.js";
 import Network from "lucide-react/dist/esm/icons/network.js";
 import Terminal from "lucide-react/dist/esm/icons/terminal.js";
-import CircleCheck from "lucide-react/dist/esm/icons/circle-check.js";
-import Radio from "lucide-react/dist/esm/icons/radio.js";
 import Waypoints from "lucide-react/dist/esm/icons/waypoints.js";
 import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.js";
 import Settings2 from "lucide-react/dist/esm/icons/settings-2.js";
@@ -23,10 +18,11 @@ import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
 import { UsageRecordsPanel } from "@/components/UsageRecordsPanel";
 import { PricingPanel } from "@/components/PricingPanel";
 import { AccountsPanel, accountName } from "@/components/AccountsPanel";
+import { AddAccountDialog } from "@/components/AddAccountDialog";
 import { Select } from "@/components/Select";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { LoginMode, Status, LatencySample, VmIdentityView } from "@/types";
+import type { Status, LatencySample, VmIdentityView } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -85,12 +81,9 @@ export default function App() {
   const [osVersion, setOsVersion] = useState("15.5.0");
   const [vmArch, setVmArch] = useState("arm64");
   const [vmTerminal, setVmTerminal] = useState("xterm-256color");
-  const [loginMode, setLoginMode] = useState<LoginMode>("browser");
-  const [refreshTokenInput, setRefreshTokenInput] = useState("");
-  const [accessTokenInput, setAccessTokenInput] = useState("");
+  const [addAccountOpen, setAddAccountOpen] = useState(false);
   const [tab, setTab] = useState<TabId>(initialTab);
   const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
-  const loginPanelRef = useRef<HTMLElement>(null);
   const hydrated = useRef(false);
 
   useEffect(() => {
@@ -196,15 +189,6 @@ export default function App() {
   }
 
   const loggedIn = Boolean(fwd.login?.loggedIn);
-  const loginLabel = fwd.login?.email || "ChatGPT";
-  const loginMeta = [
-    fwd.login?.accountId,
-    fwd.login?.refreshable
-      ? "含 Refresh Token"
-      : fwd.login?.authMode === "chatgptAuthTokens"
-        ? "Access Token · 不可自动刷新"
-        : null,
-  ].filter(Boolean).join(" · ");
   const degrade = degradeChip(fwd.status);
   const tabAlert: Partial<Record<TabId, string>> = {
     network: fwd.status.proxyError || fwd.status.mihomo?.error ? "出站网络异常" : undefined,
@@ -217,31 +201,6 @@ export default function App() {
   const shownMihomoGroups = kitGroups.length > 0
     ? kitGroups
     : mihomoGroups.filter((group) => group.groupType === "select");
-
-  const copyCode = async () => {
-    if (!fwd.device?.userCode) return;
-    try {
-      await navigator.clipboard.writeText(fwd.device.userCode);
-    } catch {
-      // ignore
-    }
-  };
-
-  const submitRefreshToken = async () => {
-    const refreshToken = refreshTokenInput.trim();
-    if (!refreshToken) return;
-    if (await fwd.importRefreshLogin(codexHome, refreshToken)) {
-      setRefreshTokenInput("");
-    }
-  };
-
-  const submitAccessToken = async () => {
-    const accessToken = accessTokenInput.trim();
-    if (!accessToken) return;
-    if (await fwd.importAccessLogin(codexHome, accessToken)) {
-      setAccessTokenInput("");
-    }
-  };
 
   return (
     <AppShell>
@@ -499,143 +458,15 @@ export default function App() {
           )}
         </section>
 
-        <div className="tab-panel tab-panel--split" role="tabpanel" id="tabpanel-account" aria-labelledby="tab-account" hidden={tab !== "account"}>
+        <div className="tab-panel" role="tabpanel" id="tabpanel-account" aria-labelledby="tab-account" hidden={tab !== "account"}>
         <AccountsPanel
           accounts={fwd.accounts}
           busy={fwd.busy !== null || Boolean(fwd.device)}
           onSwitch={(accountId) => void fwd.switchToAccount(accountId)}
           onRemove={(accountId) => void fwd.removeSavedAccount(accountId)}
           onRename={(accountId, label) => void fwd.renameSavedAccount(accountId, label)}
-          onAdd={() => {
-            loginPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-            loginPanelRef.current?.querySelector<HTMLButtonElement>(".login-methods button[aria-pressed=\"true\"]")?.focus();
-          }}
+          onAdd={() => setAddAccountOpen(true)}
         />
-        <section className="panel" ref={loginPanelRef}>
-          <header>
-            <div className="section-heading"><span className="section-icon section-icon--warm"><Terminal size={19} /></span><div><h2>Codex 接入</h2><p>登录账号，连接你的客户端</p></div></div>
-          </header>
-          <div className="proxy-mode login-methods" role="group" aria-label="登录方式">
-            <button type="button" aria-pressed={loginMode === "browser"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMode("browser")}><ExternalLink size={14} />浏览器回调</button>
-            <button type="button" aria-pressed={loginMode === "device"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMode("device")}><Copy size={14} />授权码登录</button>
-            <button type="button" aria-pressed={loginMode === "refresh"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMode("refresh")}><Radio size={14} />Refresh Token</button>
-            <button type="button" aria-pressed={loginMode === "access"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMode("access")}><Shield size={14} />Access Token</button>
-          </div>
-          <div className="login-box">
-            <span className="field-label">ChatGPT 账号 {loggedIn && !fwd.device ? <span className="account-status"><CircleCheck size={12} /> 已登录</span> : null}</span>
-            {fwd.device ? (
-              <div className="login-pending">
-                <p>{fwd.device.method === "browser" ? "请在浏览器完成授权，登录结果将自动同步。" : "在浏览器打开验证页并输入代码"}</p>
-                {fwd.device.method === "device" ? <div className="user-code">{fwd.device.userCode}</div> : null}
-                <div className="panel__actions">
-                  {fwd.device.method === "device" ? <button className="button button--secondary" type="button" onClick={() => void copyCode()}>
-                    <Copy size={14} />
-                    复制
-                  </button> : null}
-                  <button className="button button--secondary" type="button" onClick={() => void fwd.openLoginPage()}>
-                    <ExternalLink size={14} />
-                    打开页面
-                  </button>
-                  <button className="button button--ghost" type="button" onClick={() => void fwd.cancelLogin()}>
-                    取消
-                  </button>
-                </div>
-              </div>
-            ) : loginMode === "refresh" ? (
-              <div className="credential-import">
-                <label className="field">
-                  <span>Refresh Token</span>
-                  <input
-                    type="password"
-                    spellCheck={false}
-                    autoComplete="off"
-                    disabled={fwd.busy !== null}
-                    value={refreshTokenInput}
-                    placeholder="粘贴 Refresh Token"
-                    onChange={(event) => setRefreshTokenInput(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") void submitRefreshToken();
-                    }}
-                  />
-                </label>
-                <p>会先向官方授权服务换取新凭据，并保存服务端返回的轮换 Refresh Token。</p>
-                <div className="panel__actions">
-                  <button
-                    className="button button--primary"
-                    type="button"
-                    disabled={fwd.busy !== null || !refreshTokenInput.trim()}
-                    onClick={() => void submitRefreshToken()}
-                  >
-                    {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
-                    导入并登录
-                  </button>
-                </div>
-              </div>
-            ) : loginMode === "access" ? (
-              <div className="credential-import">
-                <label className="field">
-                  <span>Access Token</span>
-                  <input
-                    type="password"
-                    spellCheck={false}
-                    autoComplete="off"
-                    disabled={fwd.busy !== null}
-                    value={accessTokenInput}
-                    placeholder="粘贴 Codex Access Token（JWT）"
-                    onChange={(event) => setAccessTokenInput(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") void submitAccessToken();
-                    }}
-                  />
-                </label>
-                <p className="credential-warning">Access Token 不可自动刷新；过期后需要重新导入。</p>
-                <div className="panel__actions">
-                  <button
-                    className="button button--primary"
-                    type="button"
-                    disabled={fwd.busy !== null || !accessTokenInput.trim()}
-                    onClick={() => void submitAccessToken()}
-                  >
-                    {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
-                    导入并登录
-                  </button>
-                </div>
-              </div>
-            ) : loggedIn ? (
-              <div className="login-current">
-                <div>
-                  <strong>{loginLabel}</strong>
-                  {loginMeta ? <span className="login-meta">{loginMeta}</span> : null}
-                </div>
-                <button
-                  className="button button--ghost"
-                  type="button"
-                  disabled={fwd.busy !== null}
-                  onClick={() => void fwd.startLogin(codexHome, loginMode)}
-                >
-                  {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
-                  登录新账号
-                </button>
-              </div>
-            ) : (
-              <div className="login-current">
-                <span>尚未登录 ChatGPT</span>
-                <button
-                  className="button button--primary"
-                  type="button"
-                  disabled={fwd.busy !== null}
-                  onClick={() => void fwd.startLogin(codexHome, loginMode)}
-                >
-                  {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
-                  登录 ChatGPT
-                </button>
-              </div>
-            )}
-          </div>
-          <p className="panel__hint">
-            浏览器与授权码走官方 OAuth；Refresh Token 会换票并保存轮换凭据；Access Token 以 Codex 外部 Token 模式接入，过期后需重新导入。凭据提交后不回显、不写日志。 启动后自动接入，关闭时还原原来的官方账号、路由和本地模型配置。
-          </p>
-        </section>
         <section className="panel">
           <header>
             <div className="section-heading"><span className="section-icon"><Settings2 size={19} /></span><div><h2>转发设置</h2><p>本机 Codex 目录与上游模型</p></div></div>
@@ -749,6 +580,13 @@ export default function App() {
             </button>
           </div>
         </section>
+
+        <AddAccountDialog
+          open={addAccountOpen}
+          onClose={() => setAddAccountOpen(false)}
+          fwd={fwd}
+          codexHome={codexHome}
+        />
 
         <footer className="page-footer">
           <span><Shield size={13} /> 本地运行 · 配置尽在掌握</span>

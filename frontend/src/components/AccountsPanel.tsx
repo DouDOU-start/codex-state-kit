@@ -148,7 +148,7 @@ export function AccountsPanel({ accounts, busy, onSwitch, onRemove, onRename, on
           })}
         </ul>
       ) : (
-        <p className="accounts-empty">还没有保存的账号。用下方任一方式登录后，账号会自动加入列表。</p>
+        <p className="accounts-empty">还没有保存的账号。点击「添加账号」登录 ChatGPT，账号会自动加入列表。</p>
       )}
     </section>
   );

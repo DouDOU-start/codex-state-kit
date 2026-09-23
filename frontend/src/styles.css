@@ -114,8 +114,6 @@ svg { flex-shrink: 0; }
 .tab-panel { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .tab-panel.panel { display: block; }
 .tab-panel[hidden] { display: none !important; }
-.tab-panel--split { display: grid; grid-template-columns: 1.15fr .85fr; align-items: start; }
-.tab-panel--split > .panel > :last-child { margin-bottom: 0; }
 .account-traffic { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 18px; padding: 15px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .account-traffic__heading { display: flex; align-items: center; gap: 10px; color: var(--accent); }
 .account-traffic__heading h2 { margin: 0; color: var(--text); font-size: 12px; font-weight: 600; }
@@ -383,7 +381,7 @@ svg { flex-shrink: 0; }
 .spinner--blue { color: var(--accent); }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 900px) { .dash-page { width: calc(100% - 40px); padding-top: 16px; gap: 12px; } .panel { padding: 15px; } .dash-grid { gap: 14px; } .token-card { padding: 15px; } .token-card__badge { display: none; } }
-@media (max-width: 740px) { .tab-panel--split { grid-template-columns: 1fr; } .page-tabs { overflow-x: auto; } .dash-grid { grid-template-columns: 1fr; } .connection-section + .connection-section { padding-left: 0; padding-top: 20px; border-left: 0; border-top: 1px solid var(--line); } .field.connection-directory { align-items: stretch; flex-direction: column; gap: 8px; } .page-nav { align-items: stretch; flex-direction: column-reverse; gap: 8px; } .page-actions { justify-content: flex-start; } .titlebar { padding-left: 16px; } .dash-page { width: calc(100% - 32px); } .page-footer > span:last-child { display: none; } }
+@media (max-width: 740px) { .page-tabs { overflow-x: auto; } .dash-grid { grid-template-columns: 1fr; } .connection-section + .connection-section { padding-left: 0; padding-top: 20px; border-left: 0; border-top: 1px solid var(--line); } .field.connection-directory { align-items: stretch; flex-direction: column; gap: 8px; } .page-nav { align-items: stretch; flex-direction: column-reverse; gap: 8px; } .page-actions { justify-content: flex-start; } .titlebar { padding-left: 16px; } .dash-page { width: calc(100% - 32px); } .page-footer > span:last-child { display: none; } }
 @media (max-width: 440px) { .logo__word { font-size: 12px; } .window-controls button { width: 31px; } .token-card { padding: 17px; } .token-card__icon { display: none; } }
 .token-models { display: flex; flex-direction: column; gap: 8px; width: 100%; padding-top: 10px; border-top: 1px solid #e4ecf4; }
 .token-model-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
@@ -437,7 +435,6 @@ svg { flex-shrink: 0; }
 @media (max-width: 740px) { .billing-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .billing-metrics > div:first-child { grid-column: 1 / -1; } .billing-record { grid-template-columns: 66px minmax(110px, 1fr) 74px; } .billing-record__tokens { display: none; } }
 @media (max-width: 440px) { .billing-panel__toolbar { align-items: stretch; flex-direction: column; } .billing-record { grid-template-columns: 1fr auto; gap: 4px 8px; } .billing-record__time { grid-column: 1 / 2; } .billing-record__cost { grid-column: 2; grid-row: 1 / 3; } .billing-record__main { grid-column: 1; } }
 
-.tab-panel--split > .accounts-panel { grid-column: 1 / -1; }
 .accounts-panel > header { margin-bottom: 12px; }
 .accounts-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .accounts-item { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fbfcfd; }
@@ -509,3 +506,14 @@ input[type="checkbox"]:disabled { opacity: .5; cursor: not-allowed; }
 .system-proxy__state--on { color: var(--green); }
 .system-proxy p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.7; }
 .system-proxy .system-proxy__error { color: var(--red); }
+/* Modal dialog (components/AddAccountDialog.tsx) */
+.modal { width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 48px); padding: 0; overflow: auto; border: 1px solid #dce4ec; border-radius: 12px; color: var(--text); background: var(--surface); box-shadow: 0 24px 72px #24384d40; }
+.modal::backdrop { background: #1d2c3c59; backdrop-filter: blur(2px); }
+.modal[open] { animation: modal-in .16s ease-out; }
+@keyframes modal-in { from { opacity: 0; transform: translateY(6px) scale(.98); } }
+.modal__header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 18px 12px; border-bottom: 1px solid var(--line); }
+.modal__close { display: grid; width: 30px; height: 30px; place-items: center; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface); cursor: pointer; }
+.modal__close:hover { color: var(--text); border-color: var(--line-strong); background: var(--surface-hover); }
+.modal__body { padding: 16px 18px 6px; }
+.modal__body .login-methods { margin-top: 0; }
+.modal__body .panel__hint { margin-bottom: 12px; }
