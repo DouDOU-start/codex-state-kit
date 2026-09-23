@@ -22,7 +22,7 @@ socks5h://user:password@proxy.example.com:1080
 socks5://xmtt1126849-region-DE-sid-{session}-t-120:password@us.arxlabs.io:3010
 ```
 
-Kit 会把 `{session}` 换成随机值：上游 WebSocket 连接在存活期内沿用同一个 session，HTTP 请求每次生成新的 session。日志和状态只显示 session，不会回显密码。
+Kit 会把 `{session}` 换成随机值：上游 WebSocket 连接共用同一个 session，直到切换账号或线路；回退到 HTTP 时每次请求生成新的 session。日志和状态只显示 session，不会回显密码。
 
 ### 经系统代理连接
 
@@ -34,4 +34,14 @@ Clash Verge 等软件只开系统代理、没开 TUN 时，浏览器能出网，
 
 ## 失败处理
 
-线路不可用时业务请求返回 502，不会自动退回直连。业务请求优先走上游 WebSocket，握手失败时回退 HTTP SSE。
+线路不可用时业务请求返回 502，不会自动退回直连。
+
+## 上游 WebSocket
+
+业务请求和官方 Codex 客户端一样走上游 WebSocket，不需要设置：
+
+- **预热**：Kit 在后台预先连好一条连接，请求到达时直接发送，省去握手时间；账号、设备或线路变化后立即按新的身份重新预热。
+- **保活与换新**：空闲连接每 25 秒 ping 一次；连接用到约 50 分钟（上游约一小时断开）时在空闲期提前换新。
+- **并发**：一条连接一次只跑一轮，并发请求各用一条，最多 8 条；带 `previous_response_id` 的续跑回到原来那条连接。多出来的空闲连接闲置 10 分钟后关闭。
+- **自动重连**：连接在空闲时被上游断开，下一次请求会自动重连并重发，不会报错。
+- **回退**：握手失败时，本次请求改走 HTTP SSE，并在一段时间内（5 秒起，最长 2 分钟）直接走 HTTP，之后再尝试 WebSocket。

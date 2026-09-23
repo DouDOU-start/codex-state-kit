@@ -318,19 +318,6 @@ export default function App() {
             <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "manual")}><Network size={14} />手动代理</button>
             <button type="button" aria-pressed={fwd.status.outboundMode === "mihomo"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveMihomo(mihomoSubscription, mihomoNode)}><Waypoints size={14} />订阅节点</button>
           </div>
-          <div className="ws-line">
-            <label>
-              <input
-                type="checkbox"
-                checked={fwd.status.wsUpstreamEnabled !== false}
-                disabled={fwd.busy !== null}
-                onChange={(event) => void fwd.setWsUpstreamEnabled(event.target.checked)}
-              />
-              上游走 WebSocket
-            </label>
-            <span>{fwd.status.wsUpstreamConnected ? `已连接${fwd.status.wsUpstreamConnectedAt ? ` · ${fwd.status.wsUpstreamConnectedAt}` : ""}` : "未连接"}</span>
-            <button type="button" className="text-button" disabled={fwd.busy !== null} onClick={() => void fwd.reconnectUpstream()}>重连</button>
-          </div>
           {fwd.status.outboundMode === "manual" ? <>
           <div className="field">
             <span id="outbound-proxy-label">代理 URL</span>

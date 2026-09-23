@@ -41,6 +41,8 @@ const SSE_IDLE_AFTER_CHUNK: Duration = Duration::from_secs(90);
 const SSE_IDLE_BEFORE_CHUNK: Duration = Duration::from_secs(180);
 const SSE_IDLE_TIMEOUT_EVENT: &[u8] = b"data: {\"type\":\"response.incomplete\"}\n\n";
 const UPSTREAM_TRANSPORT_HEADER: &str = "x-csk-upstream-transport";
+/// How often the warm upstream WebSocket is pinged and checked.
+const WS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 
 fn business_stream_idle_timeout(chunks: u64) -> Duration {
     #[cfg(test)]
@@ -109,12 +111,9 @@ pub struct Status {
     pub forced_model: String,
     pub diag_log_path: String,
     pub vm_identity: identity::VmIdentityView,
-    pub ws_upstream_enabled: bool,
     pub chain_system_proxy: bool,
     /// Detected OS system proxy and the relay's last error.
     pub system_proxy: crate::system_proxy::SystemProxyView,
-    pub ws_upstream_connected: bool,
-    pub ws_upstream_connected_at: Option<String>,
     /// Latest downgraded request since Kit started.
     pub last_downgrade: Option<crate::billing::DowngradeEvent>,
 }
@@ -221,7 +220,6 @@ impl App {
             Path::new(&settings.codex_home),
             &format!("http://{}", settings.proxy_listen),
         );
-        let ws = self.ws_upstream.snapshot().await;
         Status {
             proxy_listen: settings.proxy_listen,
             upstream: settings.upstream,
@@ -242,13 +240,10 @@ impl App {
             forced_model: settings.forced_model,
             diag_log_path: diag::path().display().to_string(),
             vm_identity: self.vm_identity.lock().await.view(),
-            ws_upstream_enabled: settings.ws_upstream_enabled,
             chain_system_proxy: settings.chain_system_proxy,
             system_proxy: tokio::task::spawn_blocking(crate::system_proxy::view)
                 .await
                 .unwrap_or_else(|_| crate::system_proxy::view()),
-            ws_upstream_connected: ws.connected,
-            ws_upstream_connected_at: ws.connected_at,
             last_downgrade: self.billing.last_downgrade(),
         }
     }
@@ -387,11 +382,6 @@ impl ProxyHandle {
             .err()
             .map(|err| format!("自动接入失败：{err:#}"));
         result
-    }
-
-    pub async fn reconnect_ws_upstream(&self) -> Result<Status> {
-        self.app.ws_upstream.invalidate().await;
-        Ok(self.managed_status().await)
     }
 
     pub async fn update_vm_identity(&self, profile: identity::VmProfile) -> Result<Status> {
@@ -687,9 +677,6 @@ impl ProxyHandle {
                 *self.app.http.lock().await = http;
             }
         }
-        if old.ws_upstream_enabled != next.ws_upstream_enabled && !route_changed {
-            self.app.ws_upstream.invalidate().await;
-        }
         drop(transition);
         if old.proxy_listen != next.proxy_listen {
             if let Err(err) = self.start().await {
@@ -755,6 +742,21 @@ impl ProxyHandle {
             );
         }
         Ok(pricing.info())
+    }
+
+    /// Keeps an upstream WebSocket connected and healthy ahead of requests:
+    /// warms one up, pings it, replaces it before it expires, and re-warms
+    /// right after the account or outbound line changes.
+    pub async fn run_ws_keeper(&self) {
+        loop {
+            if let Ok(dial) = warm_ws_dial(&self.app).await {
+                self.app.ws_upstream.maintain(&dial).await;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(WS_KEEPALIVE_INTERVAL) => {},
+                _ = self.app.ws_upstream.changed() => {},
+            }
+        }
     }
 
     pub async fn run_sidecar_supervisor(&self) {
@@ -1665,16 +1667,15 @@ async fn forward_http_tracked(
             eprintln!("[identity] 请求体身份改写失败，保留原正文: {err}");
         }
     }
-    if ws_bridge::should_bridge_http(
-        request_settings.ws_upstream_enabled,
-        parts.method.as_str(),
-        path,
-        &target,
-    ) {
+    // Business turns go over the upstream WebSocket, like the official client;
+    // while the pool backs off after a failed handshake they use HTTP SSE.
+    if ws_bridge::should_bridge_http(parts.method.as_str(), path, &target)
+        && app.ws_upstream.available()
+    {
         match forward_responses_over_ws(
             app,
             &target,
-            &resolved_proxy,
+            &upstream_proxy,
             &parts.headers,
             &bytes,
             started,
@@ -1809,7 +1810,9 @@ async fn forward_responses_over_ws(
         .get("model")
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    let dial = ws_dial(target, proxy, headers, &identity, model)?;
+    // The pool's sticky `{session}`, so turns reuse the same connections.
+    let proxy = app.ws_upstream.resolve_proxy(proxy, None).await?;
+    let dial = ws_dial(target, &proxy, headers, &identity, model)?;
     let (rx, handshake) = app.ws_upstream.open_turn(dial, frame).await?;
     let header_ms = started.elapsed().as_millis();
     details.transport = "http_to_ws".into();
@@ -1896,14 +1899,6 @@ fn header_string(headers: &HeaderMap, name: &str) -> String {
 }
 
 async fn proxy_ws(app: Arc<App>, req: Request<Body>) -> Response {
-    if !app.settings.lock().await.ws_upstream_enabled {
-        eprintln!("[ws] 上游 WebSocket 已关闭，返回 426");
-        return (
-            StatusCode::UPGRADE_REQUIRED,
-            "WebSocket upstream is disabled",
-        )
-            .into_response();
-    }
     let headers = req.headers().clone();
     let (mut parts, _body) = req.into_parts();
     match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
@@ -2034,15 +2029,43 @@ async fn prepare_client_ws_frame(app: &App, text: &str) -> Result<serde_json::Va
 }
 
 async fn current_ws_dial(app: &App, client_headers: &HeaderMap, model: &str) -> Result<WsDial> {
+    business_ws_dial(app, client_headers, model, false).await
+}
+
+/// The dial the pool keeps warm: Kit's own login, since there is no client
+/// request to take headers from.
+async fn warm_ws_dial(app: &App) -> Result<WsDial> {
+    let settings = app.settings.lock().await.clone();
+    anyhow::ensure!(
+        ws_bridge::uses_websocket(&settings.upstream),
+        "上游不走 WebSocket"
+    );
+    let model = settings
+        .forced_model()
+        .map(str::to_string)
+        .unwrap_or_else(|| app.ws_upstream.last_model());
+    business_ws_dial(app, &HeaderMap::new(), &model, true).await
+}
+
+async fn business_ws_dial(
+    app: &App,
+    client_headers: &HeaderMap,
+    model: &str,
+    require_login: bool,
+) -> Result<WsDial> {
     let settings = app.settings.lock().await.clone();
     let mut headers = client_headers.clone();
-    if let Some((creds, true)) = app
+    match app
         .sync_request_identity(Path::new(&settings.codex_home))
         .await
     {
-        if !login::apply_chatgpt_credentials_headers(&mut headers, &creds) {
-            anyhow::bail!("无法应用 ChatGPT 鉴权请求头");
+        Some((creds, override_headers)) if override_headers || require_login => {
+            if !login::apply_chatgpt_credentials_headers(&mut headers, &creds) {
+                anyhow::bail!("无法应用 ChatGPT 鉴权请求头");
+            }
         }
+        None if require_login => anyhow::bail!("尚未登录 ChatGPT"),
+        _ => {}
     }
     let template = resolved_proxy(&settings, &app.mihomo);
     if settings.outbound_mode == OutboundMode::Mihomo && template.trim().is_empty() {

@@ -69,11 +69,6 @@ pub async fn mihomo_select(
 }
 
 #[tauri::command(async)]
-pub async fn ws_upstream_reconnect(state: State<'_, AppState>) -> CommandResult<Status> {
-    command(state.proxy.reconnect_ws_upstream().await)
-}
-
-#[tauri::command(async)]
 pub async fn update_vm_identity(
     state: State<'_, AppState>,
     profile: codex_state_kit::identity::VmProfile,

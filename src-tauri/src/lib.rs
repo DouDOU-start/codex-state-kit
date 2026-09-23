@@ -86,7 +86,6 @@ pub fn run() {
             commands::mihomo_groups,
             commands::mihomo_select,
             commands::mihomo_group_delay,
-            commands::ws_upstream_reconnect,
             commands::update_vm_identity,
             commands::regenerate_vm_installation_id,
             commands::detect_vm_cli_version,

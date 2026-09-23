@@ -62,10 +62,9 @@ openai_base_url = "http://127.0.0.1:8787"
 | `outbound_proxy` | 手动代理 URL；切换模式时保留。可把出口写成 `{session}`，见[出站代理](outbound.md) |
 | `mihomo_subscription` | 订阅 URL、本地文件路径或分享链接正文 |
 | `mihomo_node` | 固定使用的节点名；留空使用订阅中的第一个 |
-| `ws_upstream_enabled` | 业务请求是否优先走上游 WebSocket，默认 `true` |
 | `chain_system_proxy` | 是否经系统代理连接手动代理，默认 `true` |
 | `forced_model` | 强制绑定的上游模型 ID，例如 `gpt-6-astra`；填写后下游无论请求什么模型都会改成该值再转发。留空保持下游原模型 |
 
-旧版的 `upstream_proxy` 会迁移到 `outbound_proxy`；Turn-State 相关的旧字段（`models`、`state_miss_policy`、`token_reuse_policy` 等）读取时忽略，下次保存时移除。
+旧版的 `upstream_proxy` 会迁移到 `outbound_proxy`；Turn-State 相关的旧字段（`models`、`state_miss_policy`、`token_reuse_policy` 等）和 `ws_upstream_enabled`（上游现在固定走 WebSocket）读取时忽略，下次保存时移除。
 
 应用设置可能含代理密码，账号文件也包含凭据；提交问题报告时不要附上这些文件的原文。

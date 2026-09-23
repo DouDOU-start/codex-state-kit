@@ -43,9 +43,6 @@ pub struct Settings {
     /// 固定使用的节点名。空字符串表示连上后用订阅里的第一个。
     #[serde(default)]
     pub mihomo_node: String,
-    /// 业务请求优先走上游 WebSocket。握手失败时仍回退 HTTP SSE。
-    #[serde(default = "default_ws_upstream_enabled")]
-    pub ws_upstream_enabled: bool,
     /// Reach the manual proxy through the OS system proxy when one is set
     /// (Clash with only the system proxy on). See `system_proxy`.
     #[serde(default = "default_chain_system_proxy")]
@@ -63,7 +60,6 @@ impl Default for Settings {
             forced_model: String::new(),
             mihomo_subscription: String::new(),
             mihomo_node: String::new(),
-            ws_upstream_enabled: default_ws_upstream_enabled(),
             chain_system_proxy: default_chain_system_proxy(),
         }
     }
@@ -74,10 +70,6 @@ impl Settings {
         let model = self.forced_model.trim();
         (!model.is_empty()).then_some(model)
     }
-}
-
-fn default_ws_upstream_enabled() -> bool {
-    true
 }
 
 fn default_chain_system_proxy() -> bool {
@@ -122,8 +114,6 @@ pub struct SettingsPatch {
     pub mihomo_subscription: String,
     #[serde(default)]
     pub mihomo_node: String,
-    #[serde(default = "default_ws_upstream_enabled")]
-    pub ws_upstream_enabled: bool,
     /// Reach the manual proxy through the OS system proxy when one is set
     /// (Clash with only the system proxy on). See `system_proxy`.
     #[serde(default = "default_chain_system_proxy")]
@@ -145,7 +135,6 @@ impl SettingsPatch {
                 "订阅地址",
             )?,
             mihomo_node: normalize_mihomo_text(&self.mihomo_node, 128, "节点名")?,
-            ws_upstream_enabled: self.ws_upstream_enabled,
             chain_system_proxy: self.chain_system_proxy,
         };
         if settings.proxy_listen.is_empty()
@@ -338,7 +327,6 @@ mod tests {
             forced_model: String::new(),
             mihomo_subscription: String::new(),
             mihomo_node: String::new(),
-            ws_upstream_enabled: true,
             chain_system_proxy: true,
         }
         .into_settings()

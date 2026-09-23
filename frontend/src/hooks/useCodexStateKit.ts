@@ -12,7 +12,6 @@ import {
   probeOutboundLatency,
   mihomoSelect,
   mihomoGroupDelay,
-  reconnectWsUpstream,
   updateVmIdentity,
   regenerateVmInstallationId,
   detectVmCliVersion,
@@ -34,7 +33,6 @@ function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): Sett
     mihomoSubscription: status.mihomoSubscription ?? "",
     mihomoNode: status.mihomoNode ?? "",
     forcedModel: status.forcedModel ?? "",
-    wsUpstreamEnabled: status.wsUpstreamEnabled !== false,
     chainSystemProxy: status.chainSystemProxy !== false,
     ...overrides,
   };
@@ -405,20 +403,6 @@ export function useCodexStateKit() {
     }
   }, [device]);
 
-  const setWsUpstreamEnabled = useCallback(async (enabled: boolean) => {
-    setBusy("save");
-    try {
-      const latest = await getStatus();
-      const next = await setConfig(patchFrom(latest, { wsUpstreamEnabled: enabled }));
-      setStatus(next);
-      setBanner({ kind: "ok", text: enabled ? "上游已改为 WebSocket，失败时回退 HTTP" : "上游已改回 HTTP" });
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-    } finally {
-      setBusy(null);
-    }
-  }, []);
-
   const setChainSystemProxy = useCallback(async (enabled: boolean) => {
     setBusy("save");
     try {
@@ -478,19 +462,6 @@ export function useCodexStateKit() {
     }
   }, []);
 
-  const reconnectUpstream = useCallback(async () => {
-    setBusy("save");
-    try {
-      const next = await reconnectWsUpstream();
-      setStatus(next);
-      setBanner({ kind: "ok", text: "已断开上游 WebSocket，下次请求会重新连接" });
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-    } finally {
-      setBusy(null);
-    }
-  }, []);
-
   return {
     status,
     login,
@@ -513,12 +484,10 @@ export function useCodexStateKit() {
     selectMihomoNode,
     probeMihomoGroup,
     probeAllMihomo,
-    setWsUpstreamEnabled,
     setChainSystemProxy,
     saveVmIdentity,
     regenerateVmInstallation,
     detectVmVersion,
-    reconnectUpstream,
     startLogin,
     importRefreshLogin,
     importAccessLogin,
