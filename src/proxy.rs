@@ -23,6 +23,7 @@ use crate::attach::{self, is_attached};
 use crate::billing::{BillingStore, RequestStart, UsageOutcome, UsageState};
 use crate::chatgpt_cookies::{self, RoutingCookie};
 use crate::diag;
+use crate::downgrade;
 use crate::fetch;
 use crate::identity::{self, VmIdentity};
 use crate::login::{self, has_chatgpt_login};
@@ -324,6 +325,8 @@ pub struct Status {
     pub system_proxy: crate::system_proxy::SystemProxyView,
     pub ws_upstream_connected: bool,
     pub ws_upstream_connected_at: Option<String>,
+    /// Latest downgraded request since Kit started.
+    pub last_downgrade: Option<crate::billing::DowngradeEvent>,
 }
 
 pub struct App {
@@ -658,6 +661,7 @@ impl App {
                 .unwrap_or_else(|_| crate::system_proxy::view()),
             ws_upstream_connected: ws.connected,
             ws_upstream_connected_at: ws.connected_at,
+            last_downgrade: self.billing.last_downgrade(),
         }
     }
 
@@ -2223,12 +2227,13 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 details.transport = "http_sse".into();
             }
             resp.headers_mut().remove(UPSTREAM_TRANSPORT_HEADER);
-            let metrics = logs::ResponseBodyMetrics::new(
+            let mut metrics = logs::ResponseBodyMetrics::new(
                 resp.headers()
                     .get(header::CONTENT_ENCODING)
                     .map(|value| value.to_str().unwrap_or("unsupported"))
                     .unwrap_or_default(),
             );
+            metrics.observe_headers(resp.headers());
             let remaining_bytes = resp
                 .headers()
                 .get(header::CONTENT_LENGTH)
@@ -2536,6 +2541,7 @@ impl ResponseLogTracker {
             service_tier: self.metrics.service_tier().map(str::to_owned),
             first_token_ms: self.metrics.first_token_ms().map(|ms| ms as u64),
             transport: Some(self.entry.transport.clone()),
+            downgrade_signals: self.metrics.downgrade_signals().clone(),
         });
         self.billing_settled = true;
     }
@@ -2662,6 +2668,7 @@ impl Drop for ResponseLogTracker {
                     service_tier: self.metrics.service_tier().map(str::to_owned),
                     first_token_ms: self.metrics.first_token_ms().map(|ms| ms as u64),
                     transport: Some(self.entry.transport.clone()),
+                    downgrade_signals: self.metrics.downgrade_signals().clone(),
                     usage_source: self
                         .metrics
                         .usage_seen()
@@ -3260,7 +3267,7 @@ async fn forward_responses_over_ws(
         .and_then(|value| value.as_str())
         .unwrap_or("");
     let dial = ws_dial(target, proxy, headers, &identity, model)?;
-    let rx = app.ws_upstream.open_turn(dial, frame).await?;
+    let (rx, handshake) = app.ws_upstream.open_turn(dial, frame).await?;
     let header_ms = started.elapsed().as_millis();
     details.transport = "http_to_ws".into();
     details.response_header_ms = Some(header_ms);
@@ -3285,11 +3292,19 @@ async fn forward_responses_over_ws(
             None => None,
         }
     });
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(UPSTREAM_TRANSPORT_HEADER, "http_to_ws")
+        .header(UPSTREAM_TRANSPORT_HEADER, "http_to_ws");
+    // Codex and the downgrade check both read these from the response head,
+    // as they would on a plain HTTP stream.
+    for name in downgrade::WATCHED_HEADERS {
+        for value in handshake.get_all(name) {
+            response = response.header(name, value.clone());
+        }
+    }
+    response
         .body(Body::from_stream(stream))
         .context("构造 WebSocket SSE 响应")
 }
@@ -3406,8 +3421,8 @@ async fn client_ws_session(
                 continue;
             }
         };
-        let mut rx = match app.ws_upstream.open_turn(dial, frame).await {
-            Ok(rx) => rx,
+        let (mut rx, handshake) = match app.ws_upstream.open_turn(dial, frame).await {
+            Ok(opened) => opened,
             Err(err) => {
                 let mut metrics = logs::ResponseBodyMetrics::new("");
                 finish_client_ws_turn(
@@ -3426,6 +3441,7 @@ async fn client_ws_session(
             }
         };
         let mut metrics = logs::ResponseBodyMetrics::new("");
+        metrics.observe_headers(&handshake);
         let mut failed = false;
         while let Some(event) = rx.recv().await {
             match event {
@@ -3531,6 +3547,7 @@ async fn finish_client_ws_turn(
             service_tier: metrics.service_tier().map(str::to_owned),
             first_token_ms: metrics.first_token_ms().map(|ms| ms as u64),
             transport: Some("ws_to_ws".into()),
+            downgrade_signals: metrics.downgrade_signals().clone(),
         });
     }
     let settings = app.settings.lock().await.clone();
@@ -4563,6 +4580,120 @@ mod tests {
         let entry = app.logs.lock().await.back().unwrap().snapshot();
         assert_eq!(entry.error_kind.as_deref(), Some("stream_idle"));
         assert_eq!(entry.stream_state, "error");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rerouted_sse_response_is_recorded_as_downgraded() {
+        const TEST: &str = "proxy::tests::rerouted_sse_response_is_recorded_as_downgraded";
+        if std::env::var_os("CSK_DOWNGRADE_TEST_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("CSK_DOWNGRADE_TEST_CHILD", "1")
+                .env("HOME", dir.path())
+                .env("USERPROFILE", dir.path())
+                .env("APPDATA", dir.path())
+                .env("LOCALAPPDATA", dir.path())
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("ALL_PROXY")
+                .env_remove("http_proxy")
+                .env_remove("https_proxy")
+                .env_remove("all_proxy")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            login::kit_auth_path(home.path()),
+            serde_json::json!({
+                "auth_mode":"chatgpt",
+                "tokens":{
+                    "access_token":"dg-access",
+                    "refresh_token":"dg-refresh",
+                    "account_id":"account-a"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let upstream = axum::Router::new().fallback(|| async {
+            (
+                [
+                    (header::CONTENT_TYPE, "text/event-stream"),
+                    (HeaderName::from_static("openai-model"), "gpt-5.6-luna"),
+                    (
+                        HeaderName::from_static("x-codex-safety-buffering-enabled"),
+                        "true",
+                    ),
+                    (
+                        HeaderName::from_static("x-codex-safety-buffering-faster-model"),
+                        "gpt-5.6-luna",
+                    ),
+                ],
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\",\"safety_buffering\":{\"use_cases\":[\"cyber\"],\"reasons\":[\"user_risk\"]}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-astra\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+                ),
+            )
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = Arc::new(
+            App::new(Settings {
+                upstream: format!("http://{}", listener.local_addr().unwrap()),
+                codex_home: home.path().display().to_string(),
+                state_miss_policy: StateMissPolicy::Passthrough,
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        app.sync_logged_in_account().await;
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let response = proxy_http(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header("accept", "text/event-stream")
+                .header("chatgpt-account-id", "account-a")
+                .body(Body::from(r#"{"model":"gpt-6-astra","stream":true}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(event) = app.billing.last_downgrade() {
+                    break event;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let report = event.report;
+        assert_eq!(report.verdict, crate::downgrade::Verdict::Confirmed);
+        assert_eq!(report.requested_model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(report.effective_model.as_deref(), Some("gpt-5.6-luna"));
+        assert!(report.safety_buffering);
+        assert_eq!(report.use_cases, ["cyber"]);
+        let record = app.billing.get_by_id(&event.request_id).unwrap().unwrap();
+        assert!(record.downgrade.is_some());
         server.abort();
     }
 }

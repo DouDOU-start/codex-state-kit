@@ -138,6 +138,37 @@ export interface Status {
   wsUpstreamConnectedAt?: string | null;
   chainSystemProxy?: boolean;
   systemProxy?: SystemProxyView;
+  /** Latest downgraded request since Kit started. */
+  lastDowngrade?: DowngradeEvent | null;
+}
+
+/** confirmed: upstream reported a different serving model (openai-model). */
+export type DowngradeVerdict = "confirmed" | "suspected";
+
+export interface DowngradeReport {
+  verdict: DowngradeVerdict;
+  requestedModel?: string | null;
+  /** The model that served the turn instead, when known. */
+  effectiveModel?: string | null;
+  safetyBuffering: boolean;
+  reasons: string[];
+  useCases: string[];
+  /** Faster model upstream offered for a retry while buffering. */
+  fasterModel?: string | null;
+  verifications?: string[];
+  turnStateLen?: number | null;
+  primaryUsedPercent?: number | null;
+  encryptedMin?: number | null;
+  /** Human-readable evidence, strongest first. */
+  signals: string[];
+}
+
+export interface DowngradeEvent {
+  requestId: string;
+  at: string;
+  accountId: string;
+  email?: string | null;
+  report: DowngradeReport;
 }
 
 export interface SystemProxyView {
@@ -329,6 +360,7 @@ export interface BillingRecord {
   firstTokenMs?: number | null;
   /** http | http_sse | http_to_ws | ws_to_ws */
   transport?: string | null;
+  downgrade?: DowngradeReport | null;
   costNanos?: number | null;
   currency?: string | null;
   errorKind?: string | null;
@@ -340,6 +372,8 @@ export interface BillingQuery {
   to?: string | null;
   source?: BillingRecordSource | null;
   model?: string | null;
+  /** true keeps only downgraded (confirmed or suspected) requests. */
+  downgraded?: boolean | null;
   limit?: number;
   offset?: number;
 }

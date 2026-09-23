@@ -9,11 +9,12 @@ import PencilLine from "lucide-react/dist/esm/icons/pencil-line.js";
 import Copy from "lucide-react/dist/esm/icons/copy.js";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import Route from "lucide-react/dist/esm/icons/route.js";
+import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
 import { getBillingRecords, getBillingSummary, isTauri } from "@/lib/api";
 import { Select } from "@/components/Select";
 import { useNotify } from "@/components/Notifier";
-import type { BillingRecord, LogEntry, Status } from "@/types";
+import type { BillingRecord, DowngradeReport, LogEntry, Status } from "@/types";
 
 interface UsageRecordsPanelProps {
   /** 所在 tab 是否可见；切到该 tab 时重新读取记录。 */
@@ -105,6 +106,16 @@ function matchLog(record: BillingRecord, logs: LogEntry[]): LogEntry | undefined
   });
 }
 
+/** Badge text: confirmed reroutes name the serving model. */
+export function downgradeLabel(report: DowngradeReport): string {
+  if (report.verdict === "confirmed") {
+    return report.effectiveModel ? `已降级 → ${report.effectiveModel}` : "已降级";
+  }
+  if (report.safetyBuffering) return "疑似降智 · 安全缓冲";
+  if (report.verifications?.length) return "疑似降智 · 需验证";
+  return report.effectiveModel ? `疑似降智 → ${report.effectiveModel}` : "疑似降智";
+}
+
 const TIER_LABEL: Record<string, string> = { priority: "Priority", flex: "Flex" };
 
 /** 非零的分项成本，按 输入 / 缓存读 / 缓存写 / 输出 排列。 */
@@ -128,6 +139,7 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
   const [accounts, setAccounts] = useState<[string, string][]>([]);
   /** 空字符串表示全部账号。 */
   const [accountId, setAccountId] = useState("");
+  const [onlyDowngraded, setOnlyDowngraded] = useState(false);
   const { notify } = useNotify();
   const reportError = useCallback((cause: unknown) => {
     notify({ kind: "error", title: "读取使用记录失败", message: cause instanceof Error ? cause.message : String(cause) });
@@ -137,12 +149,13 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
   const requestSeq = useRef(0);
   const tableRef = useRef<HTMLDivElement>(null);
 
-  const loadPage = useCallback(async (account: string, pageIndex: number) => {
+  const loadPage = useCallback(async (account: string, pageIndex: number, downgraded: boolean) => {
     const seq = ++requestSeq.current;
     setLoading(true);
     try {
       const result = await getBillingRecords({
         accountId: account || null,
+        downgraded: downgraded || null,
         limit: PAGE_SIZE,
         offset: pageIndex * PAGE_SIZE,
       });
@@ -184,8 +197,31 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
   }, [active, loadAccounts]);
 
   useEffect(() => {
-    if (active) void loadPage(accountId, page);
-  }, [active, accountId, page, loadPage]);
+    if (active) void loadPage(accountId, page, onlyDowngraded);
+  }, [active, accountId, page, onlyDowngraded, loadPage]);
+
+  // A new downgrade settled while this tab is open: show it right away.
+  const reload = useRef(() => {});
+  reload.current = () => {
+    if (active) void loadPage(accountId, page, onlyDowngraded);
+  };
+  const lastDowngradeId = status.lastDowngrade?.requestId ?? null;
+  useEffect(() => {
+    if (lastDowngradeId) reload.current();
+  }, [lastDowngradeId]);
+
+  const explainDowngrade = (record: BillingRecord, report: DowngradeReport) => {
+    notify({
+      id: `downgrade-${record.requestId}`,
+      kind: report.verdict === "confirmed" ? "error" : "warn",
+      title: `${downgradeLabel(report)}（${recordClock(record).time}）`,
+      message: (
+        <ul className="downgrade-signals">
+          {report.signals.map((signal) => <li key={signal}>{signal}</li>)}
+        </ul>
+      ),
+    });
+  };
 
   useEffect(() => {
     if (copyState === "idle") return;
@@ -195,7 +231,7 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
 
   const refresh = () => {
     void loadAccounts();
-    void loadPage(accountId, page);
+    void loadPage(accountId, page, onlyDowngraded);
   };
 
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -211,6 +247,7 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
         record.sentModel || record.requestedModel || "未知模型",
         transportLabel(record),
         `→ ${record.responseModel ?? "—"}`,
+        record.downgrade ? downgradeLabel(record.downgrade) : "",
         `首字 ${formatDuration(record.firstTokenMs ?? log?.firstTokenMs)}`,
         `总耗时 ${formatDuration(log?.ms ?? durationMs(record))}`,
         `in ${record.inputTokens ?? "—"}`,
@@ -266,6 +303,17 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
             }}
           />
         </div>
+        <label className="pricing-toggle">
+          <input
+            type="checkbox"
+            checked={onlyDowngraded}
+            onChange={(event) => {
+              setOnlyDowngraded(event.target.checked);
+              setPage(0);
+            }}
+          />
+          只看降智请求
+        </label>
         <span>按请求开始时间排列</span>
       </div>
       <div className="usage-records__table" ref={tableRef}>
@@ -299,7 +347,7 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
                   ? null
                   : (record.inputTokens ?? 0) + (record.outputTokens ?? 0);
                 return (
-                  <tr key={record.requestId}>
+                  <tr key={record.requestId} className={record.downgrade ? `usage-row--${record.downgrade.verdict}` : undefined}>
                     <td className="usage-table__time">
                       <strong>{clock.time}</strong>
                       <small>{clock.date}</small>
@@ -325,6 +373,17 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
                           </span>
                         )}
                       </div>
+                      {record.downgrade ? (
+                        <button
+                          type="button"
+                          className={`usage-downgrade usage-downgrade--${record.downgrade.verdict}`}
+                          title="查看判定依据"
+                          onClick={() => explainDowngrade(record, record.downgrade!)}
+                        >
+                          <TriangleAlert size={11} />
+                          {downgradeLabel(record.downgrade)}
+                        </button>
+                      ) : null}
                       {record.pricingModel && record.pricingModel !== model ? <small>按 {record.pricingModel} 计价</small> : null}
                       {tier || record.longContext ? (
                         <span className="usage-table__badges">
@@ -365,8 +424,8 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
         ) : (
           <div className="usage-records__empty">
             <Route size={24} strokeWidth={1.5} />
-            <strong>还没有使用记录</strong>
-            <p>完成一次上游请求后，时间和用量会列在这里。</p>
+            <strong>{onlyDowngraded ? "没有降智请求" : "还没有使用记录"}</strong>
+            <p>{onlyDowngraded ? "没有检测到被改路由或安全缓冲的请求。" : "完成一次上游请求后，时间和用量会列在这里。"}</p>
           </div>
         )}
       </div>

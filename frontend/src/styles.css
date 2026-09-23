@@ -307,6 +307,15 @@ svg { flex-shrink: 0; }
 .usage-match { padding: 0 6px; border: 1px solid; border-radius: 5px; font-size: 9px; font-weight: 600; line-height: 1.6; white-space: nowrap; }
 .usage-match--ok { color: var(--green); border-color: #cae4d3; background: var(--green-soft); }
 .usage-match--bad { color: #b45309; border-color: #fed7aa; background: #fff7ed; }
+.usage-downgrade { display: inline-flex; align-items: center; gap: 4px; margin-top: 4px; padding: 1px 7px; border: 1px solid; border-radius: 5px; font: 600 10px/1.6 var(--font-sans); cursor: pointer; }
+.usage-downgrade--confirmed { color: #b42318; border-color: #f5c2bd; background: #fef3f2; }
+.usage-downgrade--suspected { color: #b45309; border-color: #fed7aa; background: #fff7ed; }
+.usage-downgrade:hover { filter: brightness(0.97); }
+.usage-downgrade:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.usage-table tr.usage-row--confirmed td:first-child { box-shadow: inset 3px 0 0 #d0605a; }
+.usage-table tr.usage-row--suspected td:first-child { box-shadow: inset 3px 0 0 #dca33a; }
+.downgrade-signals { margin: 0; padding-left: 16px; }
+.downgrade-signals li + li { margin-top: 3px; }
 .usage-table__model strong { font-weight: 650; }
 .usage-table__model small { margin-top: 2px; color: var(--muted); font-size: 10px; font-weight: 400; }
 .usage-table__badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }

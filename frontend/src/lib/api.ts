@@ -93,6 +93,23 @@ const defaultStatus = (): Status => ({
   wsUpstreamConnectedAt: null,
   chainSystemProxy: true,
   systemProxy: { enabled: true, detected: "HTTP 127.0.0.1:7897", lastError: null },
+  lastDowngrade: {
+    requestId: "mock-billing-1",
+    at: new Date(Date.now() - 86_400_000 + 9_000).toISOString(),
+    accountId: "mock-account-a",
+    email: "previous@example.com",
+    report: {
+      verdict: "confirmed",
+      requestedModel: "gpt-6-astra",
+      effectiveModel: "gpt-5.6-luna",
+      safetyBuffering: true,
+      reasons: ["user_risk"],
+      useCases: ["cyber"],
+      fasterModel: "gpt-5.6-luna",
+      verifications: [],
+      signals: [],
+    },
+  },
   logs: [{
     id: 1,
     accountId: "mock-account-a",
@@ -639,6 +656,26 @@ const mockBillingRecords: BillingRecord[] = [
     sentModel: "gpt-6-astra",
     responseModel: "gpt-6-astra",
     transport: "http_to_ws",
+    downgrade: {
+      verdict: "confirmed",
+      requestedModel: "gpt-6-astra",
+      effectiveModel: "gpt-5.6-luna",
+      safetyBuffering: true,
+      reasons: ["user_risk"],
+      useCases: ["cyber"],
+      fasterModel: "gpt-5.6-luna",
+      verifications: [],
+      turnStateLen: 780,
+      primaryUsedPercent: 60,
+      encryptedMin: 1292,
+      signals: [
+        "上游响应头 openai-model 为 gpt-5.6-luna，与请求的 gpt-6-astra 不一致（官方客户端据此提示请求被改路由到备用模型）",
+        "上游对本次请求启用了安全缓冲（safety buffering），响应被额外审查（场景 cyber，原因 user_risk），官方客户端会提示改用更快的 gpt-5.6-luna 重试",
+        "x-codex-turn-state 长度 780（仅供参考）",
+        "主额度已用 60%（仅供参考）",
+        "encrypted_content 最小块 1292 字节（仅供参考）",
+      ],
+    },
     inputTokens: 1_420,
     cachedInputTokens: 0,
     cacheWriteTokens: 0,
@@ -677,6 +714,25 @@ for (let index = 0; index < 70; index += 1) {
     sentModel: "gpt-5.1-codex",
     responseModel: index % 5 === 3 ? "gpt-5.1-codex-mini" : "gpt-5.1-codex-2025-11-13",
     transport: index % 2 ? "ws_to_ws" : "http_sse",
+    downgrade: index % 7 === 2
+      ? {
+          verdict: "suspected",
+          requestedModel: "gpt-5.1-codex",
+          effectiveModel: null,
+          safetyBuffering: true,
+          reasons: [],
+          useCases: [],
+          fasterModel: "gpt-5.1-codex-mini",
+          verifications: [],
+          turnStateLen: 780,
+          primaryUsedPercent: 60,
+          encryptedMin: 1292,
+          signals: [
+            "上游对本次请求启用了安全缓冲（safety buffering），响应被额外审查，官方客户端会提示改用更快的 gpt-5.1-codex-mini 重试",
+            "主额度已用 60%（仅供参考）",
+          ],
+        }
+      : null,
     inputTokens: 12_000,
     cachedInputTokens: 10_000,
     cacheWriteTokens: 0,
@@ -730,6 +786,7 @@ export async function getBillingRecords(query: BillingQuery = {}): Promise<Billi
       to: query.to ?? null,
       source: query.source ?? null,
       model: query.model ?? null,
+      downgraded: query.downgraded ?? null,
       limit: query.limit ?? 50,
       offset: query.offset ?? 0,
     });
@@ -738,6 +795,8 @@ export async function getBillingRecords(query: BillingQuery = {}): Promise<Billi
     if (query.accountId && record.accountId !== query.accountId) return false;
     if (query.source && record.source !== query.source) return false;
     if (query.model && record.sentModel !== query.model && record.requestedModel !== query.model) return false;
+    if (query.downgraded === true && !record.downgrade) return false;
+    if (query.downgraded === false && record.downgrade) return false;
     return true;
   });
   const limit = query.limit ?? 50;

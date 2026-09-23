@@ -178,6 +178,7 @@ pub async fn get_billing_records(
     to: Option<String>,
     source: Option<String>,
     model: Option<String>,
+    downgraded: Option<bool>,
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> CommandResult<UsageRecordsPage> {
@@ -187,6 +188,7 @@ pub async fn get_billing_records(
         to,
         source,
         model,
+        downgraded,
         limit,
         offset,
     }))

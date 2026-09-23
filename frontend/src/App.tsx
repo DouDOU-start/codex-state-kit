@@ -14,7 +14,7 @@ import BadgeDollarSign from "lucide-react/dist/esm/icons/badge-dollar-sign.js";
 import { AppShell } from "@/components/AppShell";
 import { BillingPanel } from "@/components/BillingPanel";
 import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
-import { UsageRecordsPanel } from "@/components/UsageRecordsPanel";
+import { downgradeLabel, UsageRecordsPanel } from "@/components/UsageRecordsPanel";
 import { PricingPanel } from "@/components/PricingPanel";
 import { AccountsPanel, accountName } from "@/components/AccountsPanel";
 import { AddAccountDialog } from "@/components/AddAccountDialog";
@@ -106,6 +106,22 @@ export default function App() {
     title: "检测到 312 降智信号",
     message: fwd.status?.degradedAt ? `出现时间：${fwd.status.degradedAt}` : "上游返回了降智信号，Kit 正在重新获取 Token。",
   }));
+  const lastDowngrade = fwd.status?.lastDowngrade ?? null;
+  useNotice("downgrade", lastDowngrade?.requestId ?? null, () => {
+    const event = lastDowngrade!;
+    const report = event.report;
+    const who = event.email || event.accountId;
+    const time = new Date(event.at).toLocaleTimeString("zh-CN", { hour12: false });
+    return {
+      kind: report.verdict === "confirmed" ? "error" : "warn",
+      title: report.verdict === "confirmed" ? "检测到降智请求" : "检测到疑似降智请求",
+      message: `${time} · ${who} · 请求 ${report.requestedModel ?? "未知模型"}：${downgradeLabel(report)}`
+        + (report.useCases.length || report.reasons.length
+          ? `（${[...report.useCases, ...report.reasons].join(" / ")}）`
+          : ""),
+      actions: [{ label: "查看使用记录", primary: true, onClick: () => selectTab("records") }],
+    };
+  });
 
   useEffect(() => {
     if (!fwd.status || hydrated.current) return;

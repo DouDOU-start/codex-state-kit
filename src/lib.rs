@@ -5,6 +5,7 @@ pub mod body_model;
 pub mod browser_login;
 pub mod chatgpt_cookies;
 pub mod diag;
+pub mod downgrade;
 pub mod fetch;
 pub mod identity;
 pub mod latency;

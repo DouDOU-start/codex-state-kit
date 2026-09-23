@@ -527,6 +527,7 @@ pub struct ResponseMetrics {
     usage_seen: bool,
     upstream_response_model: Option<String>,
     service_tier: Option<String>,
+    downgrade: crate::downgrade::DowngradeSignals,
     line: Vec<u8>,
     data: Vec<u8>,
     skip_event: bool,
@@ -626,8 +627,19 @@ impl ResponseBodyMetrics {
             // A statistics decoding failure must not interrupt forwarding or
             // turn a successful HTTP request into a network error.
             self.disabled = true;
-            self.sink_mut().metrics = ResponseMetrics::default();
+            // Header evidence is still valid when the body cannot be decoded.
+            let downgrade = std::mem::take(&mut self.sink_mut().metrics.downgrade);
+            self.sink_mut().metrics = ResponseMetrics {
+                downgrade,
+                ..ResponseMetrics::default()
+            };
         }
+    }
+
+    /// Upstream response (or WebSocket handshake) headers, for downgrade
+    /// detection. Kept even when body decoding is disabled.
+    pub fn observe_headers(&mut self, headers: &http::HeaderMap) {
+        self.sink_mut().metrics.downgrade.observe_headers(headers);
     }
 
     pub fn finish(&mut self, elapsed_ms: u128) {
@@ -747,6 +759,11 @@ impl ResponseMetrics {
         self.service_tier.as_deref()
     }
 
+    /// Downgrade evidence seen in the response headers and stream events.
+    pub fn downgrade_signals(&self) -> &crate::downgrade::DowngradeSignals {
+        &self.downgrade
+    }
+
     pub fn token_usage(&self) -> crate::billing::TokenUsage {
         crate::billing::TokenUsage {
             input_tokens: self.input_tokens,
@@ -804,6 +821,7 @@ impl ResponseMetrics {
         let Ok(json) = serde_json::from_slice::<serde_json::Value>(event) else {
             return;
         };
+        self.downgrade.observe_event(&json);
         if let Some(event_type) = json.get("type").and_then(serde_json::Value::as_str) {
             self.record_sse_event_type(event_type);
         }
