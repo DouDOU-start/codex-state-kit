@@ -183,6 +183,19 @@ type PendingRow = (
     Option<String>,
 );
 
+/// A measured record without a price, as read by [`BillingStore::price_unpriced`].
+struct UnpricedRow {
+    request_id: String,
+    provider: String,
+    source: String,
+    sent_model: Option<String>,
+    response_model: Option<String>,
+    started_at: String,
+    requested_tier: Option<String>,
+    reported_tier: Option<String>,
+    usage: TokenUsage,
+}
+
 #[derive(Default)]
 struct Priced {
     rule_id: Option<i64>,
@@ -419,6 +432,9 @@ impl BillingStore {
             // JSON DowngradeReport, and its verdict for filtering.
             ("downgrade", "TEXT"),
             ("downgrade_verdict", "TEXT"),
+            // The tier the response reported, so an unpriced record can be
+            // priced later exactly as it would have been.
+            ("reported_service_tier", "TEXT"),
         ] {
             if !existing.iter().any(|name| name == column) {
                 conn.execute_batch(&format!(
@@ -544,8 +560,8 @@ impl BillingStore {
             Verdict::Suspected => "suspected",
         });
         tx.execute(
-            "UPDATE usage_records SET finished_at=?2, state=?3, http_status=?4, response_model=?5, input_tokens=?6, cached_input_tokens=?7, output_tokens=?8, usage_source=?9, pricing_rule_id=?10, cost_nanos=?11, currency=?12, error_kind=?13, cache_write_tokens=?14, reasoning_tokens=?15, pricing_model=?16, service_tier=?17, long_context=?18, input_cost_nanos=?19, cache_read_cost_nanos=?20, cache_write_cost_nanos=?21, output_cost_nanos=?22, first_token_ms=?23, transport=?24, downgrade=?25, downgrade_verdict=?26 WHERE request_id=?1",
-            params![request_id, outcome.finished_at, state.as_str(), outcome.http_status.map(i64::from), outcome.response_model, tokens(outcome.usage.input_tokens), tokens(outcome.usage.cached_input_tokens), tokens(outcome.usage.output_tokens), outcome.usage_source, priced.rule_id, priced.total, priced.currency, outcome.error_kind, tokens(outcome.usage.cache_write_tokens), tokens(outcome.usage.reasoning_tokens), priced.model, priced.tier.map(ServiceTier::as_str), priced.long_context, priced.input, priced.cache_read, priced.cache_write, priced.output, tokens(outcome.first_token_ms), outcome.transport, downgrade_json, downgrade_verdict],
+            "UPDATE usage_records SET finished_at=?2, state=?3, http_status=?4, response_model=?5, input_tokens=?6, cached_input_tokens=?7, output_tokens=?8, usage_source=?9, pricing_rule_id=?10, cost_nanos=?11, currency=?12, error_kind=?13, cache_write_tokens=?14, reasoning_tokens=?15, pricing_model=?16, service_tier=?17, long_context=?18, input_cost_nanos=?19, cache_read_cost_nanos=?20, cache_write_cost_nanos=?21, output_cost_nanos=?22, first_token_ms=?23, transport=?24, downgrade=?25, downgrade_verdict=?26, reported_service_tier=?27 WHERE request_id=?1",
+            params![request_id, outcome.finished_at, state.as_str(), outcome.http_status.map(i64::from), outcome.response_model, tokens(outcome.usage.input_tokens), tokens(outcome.usage.cached_input_tokens), tokens(outcome.usage.output_tokens), outcome.usage_source, priced.rule_id, priced.total, priced.currency, outcome.error_kind, tokens(outcome.usage.cache_write_tokens), tokens(outcome.usage.reasoning_tokens), priced.model, priced.tier.map(ServiceTier::as_str), priced.long_context, priced.input, priced.cache_read, priced.cache_write, priced.output, tokens(outcome.first_token_ms), outcome.transport, downgrade_json, downgrade_verdict, outcome.service_tier],
         )?;
         tx.commit()?;
         drop(conn);
@@ -649,6 +665,68 @@ impl BillingStore {
             total: Some(cost.total),
             currency: Some("USD".into()),
         })
+    }
+
+    /// Prices measured records that found no price when they finished, e.g.
+    /// a model the price catalog did not list yet. Run after the catalog
+    /// changes; returns how many records were priced.
+    pub fn price_unpriced(&self) -> Result<usize> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        let rows: Vec<UnpricedRow> = tx
+            .prepare("SELECT u.request_id, a.provider, u.source, u.sent_model, u.response_model, u.started_at, u.requested_service_tier, u.reported_service_tier, u.input_tokens, u.cached_input_tokens, u.cache_write_tokens, u.output_tokens FROM usage_records u JOIN accounts a ON a.id=u.account_id WHERE u.state='measured' AND u.source='business' AND u.cost_nanos IS NULL")?
+            .query_map([], |row| {
+                let tokens = |index: usize| -> rusqlite::Result<Option<u64>> {
+                    Ok(row.get::<_, Option<i64>>(index)?.map(|value| value.max(0) as u64))
+                };
+                Ok(UnpricedRow {
+                    request_id: row.get(0)?,
+                    provider: row.get(1)?,
+                    source: row.get(2)?,
+                    sent_model: row.get(3)?,
+                    response_model: row.get(4)?,
+                    started_at: row.get(5)?,
+                    requested_tier: row.get(6)?,
+                    reported_tier: row.get(7)?,
+                    usage: TokenUsage {
+                        input_tokens: tokens(8)?,
+                        cached_input_tokens: tokens(9)?,
+                        cache_write_tokens: tokens(10)?,
+                        output_tokens: tokens(11)?,
+                        reasoning_tokens: None,
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut priced_count = 0;
+        for row in rows {
+            let models = [row.sent_model.as_deref(), row.response_model.as_deref()];
+            let tier =
+                ServiceTier::billed(row.requested_tier.as_deref(), row.reported_tier.as_deref());
+            let priced = self.resolve_cost(
+                &tx,
+                &row.provider,
+                &row.source,
+                &models,
+                &row.started_at,
+                &row.usage,
+                tier,
+            )?;
+            if priced.total.is_none() {
+                continue;
+            }
+            tx.execute(
+                "UPDATE usage_records SET pricing_rule_id=?2, cost_nanos=?3, currency=?4, pricing_model=?5, service_tier=?6, long_context=?7, input_cost_nanos=?8, cache_read_cost_nanos=?9, cache_write_cost_nanos=?10, output_cost_nanos=?11 WHERE request_id=?1 AND cost_nanos IS NULL",
+                params![row.request_id, priced.rule_id, priced.total, priced.currency, priced.model, priced.tier.map(ServiceTier::as_str), priced.long_context, priced.input, priced.cache_read, priced.cache_write, priced.output],
+            )?;
+            priced_count += 1;
+        }
+        tx.commit()?;
+        drop(conn);
+        if priced_count > 0 {
+            self.bump_revision();
+        }
+        Ok(priced_count)
     }
 
     pub fn mark_missing_usage(
@@ -1012,6 +1090,55 @@ mod tests {
         assert_eq!(summary.accounts.len(), 2);
         assert_eq!(summary.accounts[0].total.request_count, 1);
         assert_eq!(summary.accounts[0].total.cost_nanos, Some(1_900));
+    }
+
+    #[test]
+    fn records_finished_before_a_price_existed_are_priced_later() {
+        let store = BillingStore::open_in_memory().unwrap();
+        // Not a gpt-* name, so the catalog's fallback price does not apply.
+        store
+            .begin_request(RequestStart {
+                sent_model: Some("house-model".into()),
+                ..start("r1", "a")
+            })
+            .unwrap();
+        let unpriced = store
+            .settle_request(
+                "r1",
+                UsageOutcome {
+                    state: UsageState::Measured,
+                    finished_at: Some("2026-01-01T00:00:01.000Z".into()),
+                    response_model: Some("house-model".into()),
+                    usage: TokenUsage {
+                        input_tokens: Some(1_000),
+                        cached_input_tokens: Some(200),
+                        output_tokens: Some(500),
+                        ..TokenUsage::default()
+                    },
+                    ..UsageOutcome::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(unpriced.cost_nanos, None);
+        assert_eq!(store.price_unpriced().unwrap(), 0);
+        store
+            .add_pricing_rule(PricingRuleSpec {
+                provider: PROVIDER_CHATGPT.into(),
+                model: "house-model".into(),
+                input_nanos_per_million: 1_000_000,
+                cached_input_nanos_per_million: 500_000,
+                output_nanos_per_million: 2_000_000,
+                currency: "USD".into(),
+                effective_from: None,
+            })
+            .unwrap();
+        let revision = store.revision();
+        assert_eq!(store.price_unpriced().unwrap(), 1);
+        assert!(store.revision() > revision);
+        let record = store.get_by_id("r1").unwrap().unwrap();
+        assert_eq!(record.cost_nanos, Some(1_900));
+        assert_eq!(record.pricing_model.as_deref(), Some("house-model"));
+        assert_eq!(store.price_unpriced().unwrap(), 0);
     }
 
     #[test]

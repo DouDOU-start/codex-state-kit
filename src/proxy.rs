@@ -756,6 +756,13 @@ impl ProxyHandle {
                 &info.sha256[..info.sha256.len().min(12)]
             );
         }
+        // Records that finished before their model had a price (the first
+        // sync after startup included) are priced now.
+        match self.app.billing.price_unpriced() {
+            Ok(0) => {}
+            Ok(count) => eprintln!("[pricing] 补算了 {count} 条未定价记录"),
+            Err(err) => eprintln!("[pricing] 补算未定价记录失败: {err:#}"),
+        }
         Ok(pricing.info())
     }
 

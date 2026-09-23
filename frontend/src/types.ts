@@ -340,6 +340,8 @@ export interface PricingCatalogInfo {
   sha256: string;
   modelCount: number;
   remoteUrl: string;
+  /** When the prices in use were downloaded from the price repo. */
+  fetchedAt?: string | null;
   lastCheckedAt?: string | null;
   lastUpdatedAt?: string | null;
   lastError?: string | null;

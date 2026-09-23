@@ -683,6 +683,7 @@ const mockPricing = (): PricingView => ({
     sha256: "b746b9d7c04703f4ddeed8a8ba606d358b60e152398578936e17672d3059722b",
     modelCount: 6,
     remoteUrl: "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.json",
+    fetchedAt: new Date(Date.now() - 3_600_000).toISOString(),
     lastCheckedAt: null,
     lastUpdatedAt: null,
     lastError: null,

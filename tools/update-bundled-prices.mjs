@@ -1,10 +1,14 @@
 // Refresh src/pricing_catalog.json from the sub2api model price repo.
 //
-// The app downloads the same catalog at runtime; this bundled copy is the
-// offline fallback. Only OpenAI chat/responses models and the price fields the
-// billing code reads are kept, so the file stays small and reviewable.
+// Packaging runs this first (`tauri build`'s beforeBuildCommand), so every
+// build ships the latest prices and billing works before the first runtime
+// sync. The app keeps syncing the same catalog while it runs. Only OpenAI
+// chat/responses models and the price fields the billing code reads are
+// kept, so the file stays small and reviewable.
 //
-// Usage: node tools/update-bundled-prices.mjs
+// Usage: node tools/update-bundled-prices.mjs [--optional]
+//   --optional  keep the current file when the price repo cannot be reached,
+//               so a network hiccup does not fail the build.
 import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import path from "node:path";
@@ -28,16 +32,43 @@ for (const price of PRICES) {
   }
 }
 
+const optional = process.argv.includes("--optional");
+
 async function fetchText(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
-  return response.text();
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+      if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+      return await response.text();
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+    }
+  }
+  throw lastError;
 }
 
-const [raw, hashFile] = await Promise.all([fetchText(`${BASE}.json`), fetchText(`${BASE}.sha256`)]);
-const expected = hashFile.trim().split(/\s+/)[0].toLowerCase();
-const actual = createHash("sha256").update(raw).digest("hex");
-if (expected !== actual) throw new Error(`sha256 mismatch: expected ${expected}, got ${actual}`);
+async function download() {
+  // Fetch the hash first: a publish between the two requests then shows up
+  // as a mismatch instead of pairing new prices with an old hash.
+  const hashFile = await fetchText(`${BASE}.sha256`);
+  const raw = await fetchText(`${BASE}.json`);
+  const expected = hashFile.trim().split(/\s+/)[0].toLowerCase();
+  const actual = createHash("sha256").update(raw).digest("hex");
+  if (expected !== actual) throw new Error(`sha256 mismatch: expected ${expected}, got ${actual}`);
+  return { raw, actual };
+}
+
+let downloaded;
+try {
+  downloaded = await download();
+} catch (error) {
+  if (!optional) throw error;
+  console.warn(`[prices] 无法下载最新价格，沿用仓库里的内置价格：${error.message ?? error}`);
+  process.exit(0);
+}
+const { raw, actual } = downloaded;
 
 const catalog = JSON.parse(raw);
 const kept = {};
@@ -50,5 +81,6 @@ for (const name of Object.keys(catalog).sort()) {
 }
 
 const out = path.join(root, "src", "pricing_catalog.json");
-writeFileSync(out, `${JSON.stringify({ source_sha256: actual, models: kept }, null, 1)}\n`);
+const fetchedAt = new Date().toISOString();
+writeFileSync(out, `${JSON.stringify({ source_sha256: actual, fetched_at: fetchedAt, models: kept }, null, 1)}\n`);
 console.log(`wrote ${Object.keys(kept).length} models to ${path.relative(root, out)} (sha256 ${actual.slice(0, 12)}…)`);
