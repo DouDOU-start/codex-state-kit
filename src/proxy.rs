@@ -400,7 +400,7 @@ impl ProxyHandle {
     pub async fn update_vm_identity(&self, profile: identity::VmProfile) -> Result<Status> {
         {
             let mut identity = self.app.vm_identity.lock().await;
-            identity.apply_profile(profile)?;
+            identity.apply_profile(profile);
             identity.save()?;
         }
         self.app.ws_upstream.invalidate().await;
@@ -427,7 +427,6 @@ impl ProxyHandle {
         {
             let mut identity = self.app.vm_identity.lock().await;
             identity.cli_version = version;
-            identity.version_locked = false;
             identity.save()?;
         }
         self.app.ws_upstream.invalidate().await;
@@ -578,9 +577,12 @@ impl ProxyHandle {
     /// Makes an account's saved environment live.
     async fn apply_environment(&self, target: &AccountEnvironment) -> Result<()> {
         {
-            let next = target.vm.clone().with_runtime_ids();
+            let mut live = self.app.vm_identity.lock().await;
+            let mut next = target.vm.clone().with_runtime_ids();
+            // The CLI version follows the codex installed here, not the account.
+            next.cli_version = live.cli_version.clone();
             next.save()?;
-            *self.app.vm_identity.lock().await = next;
+            *live = next;
         }
         self.app.ws_upstream.invalidate().await;
         let mut next = self.app.settings.lock().await.clone();

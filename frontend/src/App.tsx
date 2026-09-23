@@ -24,7 +24,7 @@ import { LatencyProbe } from "@/components/LatencyProbe";
 import { useNotice, useNotify } from "@/components/Notifier";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { SavedAccount, Status, VmIdentityView } from "@/types";
+import type { DevicePlatform, SavedAccount, Status } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -45,6 +45,12 @@ const TABS: { id: TabId; label: string; Icon: typeof Activity }[] = [
   { id: "network", label: "出站网络", Icon: Network },
   { id: "account", label: "Codex 接入", Icon: Terminal },
   { id: "device", label: "虚拟设备", Icon: Monitor },
+];
+
+const PLATFORMS: { id: DevicePlatform; label: string }[] = [
+  { id: "mac", label: "macOS" },
+  { id: "windows", label: "Windows" },
+  { id: "linux", label: "Linux" },
 ];
 
 const TAB_STORAGE_KEY = "codex-state-kit.tab";
@@ -78,12 +84,6 @@ export default function App() {
   const [mihomoSubscription, setMihomoSubscription] = useState("");
   const [mihomoNode, setMihomoNode] = useState("");
   const [forcedModel, setForcedModel] = useState("");
-  const [cliVersion, setCliVersion] = useState("0.155.0");
-  const [vmOriginator, setVmOriginator] = useState("codex_cli_rs");
-  const [osType, setOsType] = useState("Mac OS");
-  const [osVersion, setOsVersion] = useState("15.5.0");
-  const [vmArch, setVmArch] = useState("arm64");
-  const [vmTerminal, setVmTerminal] = useState("xterm-256color");
   const [addAccountOpen, setAddAccountOpen] = useState(false);
   /** The saved account the login dialog re-authorizes; null adds a new one. */
   const [reauthTarget, setReauthTarget] = useState<SavedAccount | null>(null);
@@ -139,15 +139,6 @@ export default function App() {
     setMihomoSubscription(fwd.status.mihomoSubscription ?? "");
     setMihomoNode(fwd.status.mihomoNode ?? "");
     setForcedModel(fwd.status.forcedModel ?? "");
-    const identity = fwd.status.vmIdentity;
-    if (identity) {
-      setCliVersion(identity.cliVersion);
-      setVmOriginator(identity.originator);
-      setOsType(identity.osType);
-      setOsVersion(identity.osVersion);
-      setVmArch(identity.arch);
-      setVmTerminal(identity.terminal);
-    }
   }, [fwd.status]);
 
   // Switching accounts swaps the bound outbound line and virtual device on
@@ -160,13 +151,6 @@ export default function App() {
     setMihomoNode(fwd.status.mihomoNode ?? "");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fwd.status?.outboundProxy, fwd.status?.mihomoSubscription, fwd.status?.mihomoNode]);
-
-  useEffect(() => {
-    const identity = fwd.status?.vmIdentity;
-    if (!identity || !hydrated.current) return;
-    applyVmDraft(identity);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fwd.status?.vmIdentity?.installationId, fwd.status?.vmIdentity?.userAgent]);
 
   const activeAccount = fwd.accounts.find((account) => account.active);
   const bindingNote = activeAccount ? (
@@ -201,15 +185,6 @@ export default function App() {
     selectTab(TABS[next].id, true);
   }
 
-  function applyVmDraft(identity: VmIdentityView) {
-    setCliVersion(identity.cliVersion);
-    setVmOriginator(identity.originator);
-    setOsType(identity.osType);
-    setOsVersion(identity.osVersion);
-    setVmArch(identity.arch);
-    setVmTerminal(identity.terminal);
-  }
-
   if (!fwd.status) {
     return (
       <AppShell>
@@ -232,6 +207,8 @@ export default function App() {
       </AppShell>
     );
   }
+
+  const vmIdentity = fwd.status.vmIdentity;
 
   const loggedIn = Boolean(fwd.login?.loggedIn);
   const tabAlert: Partial<Record<TabId, string>> = {
@@ -511,71 +488,54 @@ export default function App() {
               <span className="section-icon"><Monitor size={19} /></span>
               <div>
                 <h2>虚拟设备</h2>
-                <p>{fwd.status.vmIdentity?.userAgent ?? "上游看到的 Codex CLI 身份"}</p>
+                <p>{vmIdentity?.userAgent ?? "上游看到的 Codex CLI 身份"}</p>
               </div>
             </div>
-            <span className="vm-identity__id">Installation {fwd.status.vmIdentity?.installationId ?? "—"}</span>
+            <span className="vm-identity__id">Installation {vmIdentity?.installationId ?? "—"}</span>
           </header>
           {bindingNote}
-          <div className="vm-identity__grid">
-            <label className="field">
-              <span>CLI 版本</span>
-              <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={cliVersion} onChange={(event) => setCliVersion(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>Originator</span>
-              <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmOriginator} onChange={(event) => setVmOriginator(event.target.value)} />
-            </label>
-            <div className="field">
-              <span>系统</span>
-              <Select
-                ariaLabel="系统"
-                disabled={fwd.busy !== null}
-                value={osType}
-                options={["Mac OS", "Linux", "Windows"].map((value) => ({ value, label: value }))}
-                onChange={setOsType}
-              />
+          <div className="field">
+            <span>系统</span>
+            <div className="proxy-mode vm-platforms" role="group" aria-label="系统">
+              {PLATFORMS.map(({ id, label }) => (
+                <button
+                  key={id}
+                  type="button"
+                  aria-pressed={vmIdentity?.platform === id}
+                  disabled={fwd.busy !== null}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={async () => {
+                    if (!vmIdentity || vmIdentity.platform === id) return;
+                    const ok = await confirm({
+                      title: `把虚拟设备换成 ${label}？`,
+                      message: "系统版本、架构和终端会一起换成该系统的参数。上游会看到这台设备的系统变了，没有必要时不要来回切换。",
+                      confirmText: "切换系统",
+                    });
+                    if (ok) void fwd.saveVmIdentity({ platform: id });
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
             </div>
-            <label className="field">
-              <span>系统版本</span>
-              <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={osVersion} onChange={(event) => setOsVersion(event.target.value)} />
-            </label>
-            <div className="field">
-              <span>架构</span>
-              <Select
-                ariaLabel="架构"
-                disabled={fwd.busy !== null}
-                value={vmArch}
-                options={["arm64", "x86_64"].map((value) => ({ value, label: value }))}
-                onChange={setVmArch}
-              />
-            </div>
-            <label className="field">
-              <span>终端</span>
-              <input type="text" spellCheck={false} autoComplete="off" disabled={fwd.busy !== null} value={vmTerminal} onChange={(event) => setVmTerminal(event.target.value)} />
-            </label>
           </div>
+          <dl className="vm-identity__grid">
+            {([
+              ["CLI 版本", vmIdentity?.cliVersion],
+              ["Originator", vmIdentity?.originator],
+              ["系统版本", vmIdentity ? `${vmIdentity.osType} ${vmIdentity.osVersion}` : undefined],
+              ["架构", vmIdentity?.arch],
+              ["终端", vmIdentity?.terminal],
+            ] as const).map(([term, value]) => (
+              <div key={term} className="vm-identity__item">
+                <dt>{term}</dt>
+                <dd>{value ?? "—"}</dd>
+              </div>
+            ))}
+          </dl>
+          <p className="panel__hint">系统版本、架构和终端跟随所选系统，与官方 CLI 在该系统上上报的一致；CLI 版本跟随本机安装的 codex，Originator 固定为官方 CLI。</p>
           <div className="vm-identity__actions">
-            <button
-              type="button"
-              className="button button--secondary"
-              disabled={fwd.busy !== null}
-              onClick={() => {
-                void fwd.saveVmIdentity({
-                  cliVersion,
-                  originator: vmOriginator,
-                  osType,
-                  osVersion,
-                  arch: vmArch,
-                  terminal: vmTerminal,
-                }).then((next) => {
-                  if (next) applyVmDraft(next.vmIdentity);
-                });
-              }}
-            >
-              保存身份
-            </button>
-            <button type="button" className="button button--ghost" disabled={fwd.busy !== null} onClick={() => void fwd.detectVmVersion().then((next) => { if (next) applyVmDraft(next.vmIdentity); })}>检测本机 CLI</button>
+            <button type="button" className="button button--ghost" disabled={fwd.busy !== null} onClick={() => void fwd.detectVmVersion()}>检测本机 CLI</button>
             <button
               type="button"
               className="button button--ghost"

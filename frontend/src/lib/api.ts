@@ -10,6 +10,7 @@ import type {
   ProbeKind,
   SettingsPatch,
   Status,
+  VmIdentityView,
   VmProfile,
   LatencyReport,
   LatencySample,
@@ -59,6 +60,7 @@ const defaultStatus = (): Status => ({
   vmIdentity: {
     installationId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     sessionId: "11111111-2222-4333-8444-555555555555",
+    platform: "mac",
     cliVersion: "0.155.0",
     originator: "codex_cli_rs",
     osType: "Mac OS",
@@ -66,7 +68,6 @@ const defaultStatus = (): Status => ({
     arch: "arm64",
     terminal: "xterm-256color",
     userAgent: "codex_cli_rs/0.155.0 (Mac OS 15.5.0; arm64) xterm-256color",
-    versionLocked: false,
   },
   chainSystemProxy: true,
   systemProxy: { enabled: true, detected: "HTTP 127.0.0.1:7897", lastError: null },
@@ -261,21 +262,21 @@ export async function mihomoGroupDelay(group: string): Promise<LatencySample[]> 
   });
 }
 
-function mockUserAgent(profile: VmProfile): string {
-  return `${profile.originator}/${profile.cliVersion} (${profile.osType} ${profile.osVersion}; ${profile.arch}) ${profile.terminal}`;
+/** Mirrors the backend presets (src/identity.rs) for the browser preview. */
+const MOCK_PLATFORMS: Record<VmProfile["platform"], Pick<VmIdentityView, "osType" | "osVersion" | "arch" | "terminal">> = {
+  mac: { osType: "Mac OS", osVersion: "15.5.0", arch: "arm64", terminal: "xterm-256color" },
+  windows: { osType: "Windows", osVersion: "10.0.26100", arch: "x86_64", terminal: "WindowsTerminal" },
+  linux: { osType: "Ubuntu", osVersion: "24.4.0", arch: "x86_64", terminal: "xterm-256color" },
+};
+
+function mockUserAgent(identity: VmIdentityView): string {
+  return `${identity.originator}/${identity.cliVersion} (${identity.osType} ${identity.osVersion}; ${identity.arch}) ${identity.terminal}`;
 }
 
 export async function updateVmIdentity(profile: VmProfile): Promise<Status> {
   if (isTauri) return invoke<Status>("update_vm_identity", { profile });
-  mockStatus = {
-    ...mockStatus,
-    vmIdentity: {
-      ...mockStatus.vmIdentity,
-      ...profile,
-      userAgent: mockUserAgent(profile),
-      versionLocked: true,
-    },
-  };
+  const vmIdentity = { ...mockStatus.vmIdentity, platform: profile.platform, ...MOCK_PLATFORMS[profile.platform] };
+  mockStatus = { ...mockStatus, vmIdentity: { ...vmIdentity, userAgent: mockUserAgent(vmIdentity) } };
   return cloneStatus();
 }
 
@@ -293,17 +294,8 @@ export async function regenerateVmInstallationId(): Promise<Status> {
 
 export async function detectVmCliVersion(): Promise<Status> {
   if (isTauri) return invoke<Status>("detect_vm_cli_version");
-  const cliVersion = "0.160.0";
-  const profile: VmProfile = { ...mockStatus.vmIdentity, cliVersion };
-  mockStatus = {
-    ...mockStatus,
-    vmIdentity: {
-      ...mockStatus.vmIdentity,
-      cliVersion,
-      userAgent: mockUserAgent(profile),
-      versionLocked: false,
-    },
-  };
+  const vmIdentity = { ...mockStatus.vmIdentity, cliVersion: "0.160.0" };
+  mockStatus = { ...mockStatus, vmIdentity: { ...vmIdentity, userAgent: mockUserAgent(vmIdentity) } };
   return cloneStatus();
 }
 

@@ -1,12 +1,16 @@
-//! Kit 对外呈现的一台 Mac 上的 Codex CLI。
+//! Kit 对外呈现的一台装着 Codex CLI 的机器。
 //!
 //! `installation_id` 写在磁盘上，重启后不变。`session_id`、`window_id` 和 `thread_id`
 //! 每次进程启动重新生成。探针、业务 HTTP 和上游 WebSocket 都用这一份，不透传客户端自己的设备头。
+//!
+//! 系统只能在 Mac / Windows / Linux 三个预设里选。系统版本、架构和终端跟着预设走，
+//! 取值与官方 CLI 在对应系统上用 `os_info` 和终端检测得到的一致，避免拼出不存在的组合
+//! （例如 Windows 配 macOS 的版本号）。CLI 版本跟随本机安装的 codex，originator 固定。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -14,11 +18,39 @@ use uuid::Uuid;
 use crate::settings::{home_dir, is_dev_mode};
 
 const DEFAULT_VERSION: &str = "0.155.0";
-const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
-const DEFAULT_OS_TYPE: &str = "Mac OS";
-const DEFAULT_OS_VERSION: &str = "15.5.0";
-const DEFAULT_ARCH: &str = "arm64";
-const DEFAULT_TERMINAL: &str = "xterm-256color";
+const ORIGINATOR: &str = "codex_cli_rs";
+
+/// The operating system the virtual device reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DevicePlatform {
+    #[default]
+    Mac,
+    Windows,
+    Linux,
+}
+
+/// What the official CLI reports on a platform: `(os_type, os_version, arch, terminal)`.
+/// Mac: macOS 15.5 on Apple silicon. Windows: Windows 11 24H2 (os_info reports
+/// `10.0.<build>`) in Windows Terminal. Linux: Ubuntu 24.04, which os_info
+/// reports by distribution as `Ubuntu 24.4.0`.
+impl DevicePlatform {
+    fn preset(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::Mac => ("Mac OS", "15.5.0", "arm64", "xterm-256color"),
+            Self::Windows => ("Windows", "10.0.26100", "x86_64", "WindowsTerminal"),
+            Self::Linux => ("Ubuntu", "24.4.0", "x86_64", "xterm-256color"),
+        }
+    }
+
+    fn of(os_type: &str) -> Self {
+        match os_type.trim() {
+            "Mac OS" => Self::Mac,
+            "Windows" => Self::Windows,
+            _ => Self::Linux,
+        }
+    }
+}
 
 const IDENTITY_HEADERS: &[&str] = &[
     "x-codex-installation-id",
@@ -44,8 +76,6 @@ pub struct VmIdentity {
     pub os_version: String,
     pub arch: String,
     pub terminal: String,
-    #[serde(default)]
-    pub version_locked: bool,
     #[serde(skip)]
     pub session_id: String,
     #[serde(skip)]
@@ -54,15 +84,11 @@ pub struct VmIdentity {
     pub thread_id: String,
 }
 
+/// The only user choice for a virtual device; everything else follows it.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmProfile {
-    pub cli_version: String,
-    pub originator: String,
-    pub os_type: String,
-    pub os_version: String,
-    pub arch: String,
-    pub terminal: String,
+    pub platform: DevicePlatform,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -70,6 +96,7 @@ pub struct VmProfile {
 pub struct VmIdentityView {
     pub installation_id: String,
     pub session_id: String,
+    pub platform: DevicePlatform,
     pub cli_version: String,
     pub originator: String,
     pub os_type: String,
@@ -77,7 +104,6 @@ pub struct VmIdentityView {
     pub arch: String,
     pub terminal: String,
     pub user_agent: String,
-    pub version_locked: bool,
 }
 
 impl VmIdentity {
@@ -90,12 +116,11 @@ impl VmIdentity {
         if !valid_uuid(&identity.installation_id) {
             identity.installation_id = Uuid::new_v4().to_string();
         }
+        identity.normalize();
         identity.fill_runtime();
         #[cfg(not(test))]
-        if !identity.version_locked {
-            if let Some(version) = detect_local_cli_version() {
-                identity.cli_version = version;
-            }
+        if let Some(version) = detect_local_cli_version() {
+            identity.cli_version = version;
         }
         if identity.save_to(&path).is_err() {
             eprintln!("[identity] 无法写入 {}", path.display());
@@ -103,7 +128,7 @@ impl VmIdentity {
         identity
     }
 
-    /// 测试和不落盘的临时身份。字段与默认 Mac CLI 指纹一致。
+    /// 测试和不落盘的临时身份：默认的 Mac 预设。
     pub fn ephemeral() -> Self {
         let mut identity = Self::fresh();
         identity.fill_runtime();
@@ -130,6 +155,7 @@ impl VmIdentity {
         VmIdentityView {
             installation_id: self.installation_id.clone(),
             session_id: self.session_id.clone(),
+            platform: self.platform(),
             cli_version: self.cli_version.clone(),
             originator: self.originator.clone(),
             os_type: self.os_type.clone(),
@@ -137,26 +163,33 @@ impl VmIdentity {
             arch: self.arch.clone(),
             terminal: self.terminal.clone(),
             user_agent: self.user_agent(),
-            version_locked: self.version_locked,
         }
     }
 
-    pub fn apply_profile(&mut self, profile: VmProfile) -> Result<()> {
-        let next = Self {
-            installation_id: self.installation_id.clone(),
-            cli_version: normalize_version(&profile.cli_version)?,
-            originator: normalize_token(&profile.originator, "originator", 64)?,
-            os_type: normalize_os_type(&profile.os_type)?,
-            os_version: normalize_token(&profile.os_version, "系统版本", 32)?,
-            arch: normalize_arch(&profile.arch)?,
-            terminal: normalize_token(&profile.terminal, "终端", 64)?,
-            version_locked: true,
-            session_id: self.session_id.clone(),
-            window_id: self.window_id.clone(),
-            thread_id: self.thread_id.clone(),
-        };
-        *self = next;
-        Ok(())
+    pub fn platform(&self) -> DevicePlatform {
+        DevicePlatform::of(&self.os_type)
+    }
+
+    pub fn apply_profile(&mut self, profile: VmProfile) {
+        self.set_platform(profile.platform);
+    }
+
+    fn set_platform(&mut self, platform: DevicePlatform) {
+        let (os_type, os_version, arch, terminal) = platform.preset();
+        self.os_type = os_type.into();
+        self.os_version = os_version.into();
+        self.arch = arch.into();
+        self.terminal = terminal.into();
+        self.originator = ORIGINATOR.into();
+    }
+
+    /// Brings a stored identity (possibly hand-edited by an older version)
+    /// back to its platform's preset.
+    fn normalize(&mut self) {
+        self.set_platform(self.platform());
+        if !is_version(self.cli_version.trim()) {
+            self.cli_version = DEFAULT_VERSION.into();
+        }
     }
 
     /// The same device profile on a new machine: new installation and
@@ -173,6 +206,7 @@ impl VmIdentity {
         if !valid_uuid(&self.installation_id) {
             self.installation_id = Uuid::new_v4().to_string();
         }
+        self.normalize();
         self.fill_runtime();
         self
     }
@@ -186,19 +220,20 @@ impl VmIdentity {
     }
 
     fn fresh() -> Self {
-        Self {
+        let mut identity = Self {
             installation_id: Uuid::new_v4().to_string(),
             cli_version: DEFAULT_VERSION.into(),
-            originator: DEFAULT_ORIGINATOR.into(),
-            os_type: DEFAULT_OS_TYPE.into(),
-            os_version: DEFAULT_OS_VERSION.into(),
-            arch: DEFAULT_ARCH.into(),
-            terminal: DEFAULT_TERMINAL.into(),
-            version_locked: false,
+            originator: String::new(),
+            os_type: String::new(),
+            os_version: String::new(),
+            arch: String::new(),
+            terminal: String::new(),
             session_id: String::new(),
             window_id: String::new(),
             thread_id: String::new(),
-        }
+        };
+        identity.set_platform(DevicePlatform::Mac);
+        identity
     }
 
     fn fill_runtime(&mut self) {
@@ -373,14 +408,6 @@ fn compress_deflate(bytes: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|_| "无法重新压缩 deflate 请求体".to_string())
 }
 
-fn normalize_version(raw: &str) -> Result<String> {
-    let value = raw.trim();
-    if !is_version(value) {
-        bail!("CLI 版本需要是 x.y.z");
-    }
-    Ok(value.to_string())
-}
-
 fn is_version(value: &str) -> bool {
     let mut parts = value.split('.');
     let ok = (0..3).all(|_| {
@@ -389,38 +416,6 @@ fn is_version(value: &str) -> bool {
             .is_some_and(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
     });
     ok && parts.next().is_none()
-}
-
-fn normalize_os_type(raw: &str) -> Result<String> {
-    match raw.trim() {
-        "Mac OS" => Ok("Mac OS".into()),
-        "Linux" => Ok("Linux".into()),
-        "Windows" => Ok("Windows".into()),
-        _ => bail!("系统类型只能是 Mac OS、Linux 或 Windows"),
-    }
-}
-
-fn normalize_arch(raw: &str) -> Result<String> {
-    match raw.trim() {
-        "arm64" => Ok("arm64".into()),
-        "x86_64" => Ok("x86_64".into()),
-        _ => bail!("架构只能是 arm64 或 x86_64"),
-    }
-}
-
-fn normalize_token(raw: &str, label: &str, max: usize) -> Result<String> {
-    let value = raw.trim();
-    if value.is_empty() || value.len() > max || value.chars().any(|ch| ch.is_control() || ch == ' ')
-    {
-        bail!("{label}无效");
-    }
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | ':' | '-'))
-    {
-        bail!("{label}包含不支持的字符");
-    }
-    Ok(value.to_string())
 }
 
 fn valid_uuid(value: &str) -> bool {
@@ -503,34 +498,49 @@ mod tests {
     }
 
     #[test]
-    fn profile_rejects_a_bad_version_and_locks_manual_edits() {
+    fn platform_presets_set_every_system_field() {
         let mut identity = VmIdentity::ephemeral();
-        let err = identity
-            .apply_profile(VmProfile {
-                cli_version: "latest".into(),
-                originator: "codex_cli_rs".into(),
-                os_type: "Mac OS".into(),
-                os_version: "15.5.0".into(),
-                arch: "arm64".into(),
-                terminal: "xterm-256color".into(),
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("x.y.z"));
-        identity
-            .apply_profile(VmProfile {
-                cli_version: "0.160.0".into(),
-                originator: "codex_cli_rs".into(),
-                os_type: "Linux".into(),
-                os_version: "6.8.0".into(),
-                arch: "x86_64".into(),
-                terminal: "xterm-256color".into(),
-            })
-            .unwrap();
-        assert!(identity.version_locked);
+        identity.apply_profile(VmProfile {
+            platform: DevicePlatform::Windows,
+        });
+        assert_eq!(identity.platform(), DevicePlatform::Windows);
         assert_eq!(
             identity.user_agent(),
-            "codex_cli_rs/0.160.0 (Linux 6.8.0; x86_64) xterm-256color"
+            "codex_cli_rs/0.155.0 (Windows 10.0.26100; x86_64) WindowsTerminal"
         );
+        identity.apply_profile(VmProfile {
+            platform: DevicePlatform::Linux,
+        });
+        assert_eq!(
+            identity.user_agent(),
+            "codex_cli_rs/0.155.0 (Ubuntu 24.4.0; x86_64) xterm-256color"
+        );
+    }
+
+    #[test]
+    fn hand_edited_identities_are_brought_back_to_their_preset() {
+        let mut identity = VmIdentity::ephemeral();
+        identity.os_type = "Windows".into();
+        identity.os_version = "15.5.0".into();
+        identity.arch = "arm64".into();
+        identity.originator = "custom".into();
+        identity.cli_version = "latest".into();
+        let installation = identity.installation_id.clone();
+        let identity = identity.with_runtime_ids();
+        assert_eq!(identity.installation_id, installation);
+        assert_eq!(
+            identity.user_agent(),
+            "codex_cli_rs/0.155.0 (Windows 10.0.26100; x86_64) WindowsTerminal"
+        );
+        // Old files carrying the retired version lock still load.
+        let raw = r#"{"installationId":"00000000-0000-4000-8000-000000000000","cliVersion":"0.160.0",
+            "originator":"codex_cli_rs","osType":"Linux","osVersion":"6.8.0","arch":"x86_64",
+            "terminal":"xterm-256color","versionLocked":true}"#;
+        let old: VmIdentity = serde_json::from_str(raw).unwrap();
+        let old = old.with_runtime_ids();
+        assert_eq!(old.platform(), DevicePlatform::Linux);
+        assert_eq!(old.os_version, "24.4.0");
+        assert_eq!(old.cli_version, "0.160.0");
     }
 
     #[test]

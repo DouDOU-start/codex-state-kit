@@ -38,9 +38,13 @@ export interface LogEntry {
   currentIdleMs?: number | null;
 }
 
+/** The system a virtual device reports; version, arch and terminal follow it. */
+export type DevicePlatform = "mac" | "windows" | "linux";
+
 export interface VmIdentityView {
   installationId: string;
   sessionId: string;
+  platform: DevicePlatform;
   cliVersion: string;
   originator: string;
   osType: string;
@@ -48,16 +52,10 @@ export interface VmIdentityView {
   arch: string;
   terminal: string;
   userAgent: string;
-  versionLocked: boolean;
 }
 
 export interface VmProfile {
-  cliVersion: string;
-  originator: string;
-  osType: string;
-  osVersion: string;
-  arch: string;
-  terminal: string;
+  platform: DevicePlatform;
 }
 
 export interface Status {
