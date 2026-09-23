@@ -157,8 +157,6 @@ svg { flex-shrink: 0; }
 .billing-record__cost { color: var(--accent-strong); font-weight: 600; text-align: right; white-space: nowrap; }
 .billing-records__empty { margin: 0; padding: 13px; border: 1px dashed var(--line-strong); border-radius: 7px; color: var(--muted); font-size: 9px; text-align: center; }
 .billing-panel__empty { display: flex; align-items: center; justify-content: center; gap: 7px; min-height: 60px; color: var(--muted); font-size: 10px; text-align: center; }
-.billing-panel__empty--error { justify-content: flex-start; padding: 9px 10px; border: 1px solid #efd6d3; border-radius: 7px; color: var(--red); background: var(--red-soft); text-align: left; }
-.billing-panel__empty--error button { margin-left: auto; border: 0; color: var(--red); background: transparent; font-size: 10px; cursor: pointer; }
 .dash-grid { display: grid; grid-template-columns: .92fr 1.08fr; align-items: stretch; column-gap: 20px; row-gap: 12px; }
 .dash-grid > .panel__hint { grid-column: 1 / -1; margin: 0; }
 .connection-section { min-width: 0; }
@@ -230,7 +228,6 @@ svg { flex-shrink: 0; }
 .proxy-mode { display: flex; gap: 4px; padding: 4px; margin: -4px 0 12px; border: 1px solid var(--line); border-radius: 10px; background: #f0f3f7; }
 .proxy-mode button { display: flex; flex: 1; align-items: center; justify-content: center; gap: 7px; padding: 7px 6px; border: 1px solid transparent; border-radius: 7px; font-size: 11px; color: var(--muted); background: transparent; cursor: pointer; }
 .proxy-mode button[aria-pressed="true"] { color: var(--accent-strong); background: #fffefa; border-color: #dbe4ef; box-shadow: 0 2px 4px #273d5408; font-weight: 600; }
-.mihomo-error { padding: 9px 11px; border: 1px solid #efd6d3; border-radius: 7px; color: var(--red); background: var(--red-soft); font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
 .vm-panel > header { align-items: flex-start; }
 .vm-identity__id { max-width: 280px; color: var(--muted); font: 10px/1.5 var(--font-mono); text-align: right; overflow-wrap: anywhere; }
 .vm-identity__grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 12px; }
@@ -496,7 +493,6 @@ input[type="checkbox"]:disabled { opacity: .5; cursor: not-allowed; }
 .system-proxy__state { color: var(--muted); font-size: 10px; }
 .system-proxy__state--on { color: var(--green); }
 .system-proxy p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.7; }
-.system-proxy .system-proxy__error { color: var(--red); }
 /* Modal dialog (components/AddAccountDialog.tsx) */
 .modal { width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 48px); padding: 0; overflow: auto; border: 1px solid #dce4ec; border-radius: 12px; color: var(--text); background: var(--surface); box-shadow: 0 24px 72px #24384d40; }
 .modal::backdrop { background: #1d2c3c59; backdrop-filter: blur(2px); }

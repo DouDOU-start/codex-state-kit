@@ -96,6 +96,10 @@ export default function App() {
   useNotice("proxy-error", proxyError, () => ({ kind: "error", title: "本地代理异常", message: proxyError }));
   const attachError = fwd.status?.attachError ?? null;
   useNotice("attach-error", attachError, () => ({ kind: "error", title: "Codex 接入失败", message: attachError }));
+  const mihomoError = fwd.status?.outboundMode === "mihomo" ? fwd.status?.mihomo?.error ?? null : null;
+  useNotice("mihomo-error", mihomoError, () => ({ kind: "error", title: "订阅节点异常", message: mihomoError }));
+  const relayError = fwd.status?.outboundMode === "manual" ? fwd.status?.systemProxy?.lastError ?? null : null;
+  useNotice("system-proxy-error", relayError, () => ({ kind: "warn", title: "连接代理服务器失败", message: relayError }));
   const degradedKey = fwd.status?.degraded ? fwd.status.degradedAt ?? "degraded" : null;
   useNotice("degraded", degradedKey, () => ({
     kind: "warn",
@@ -370,7 +374,6 @@ export default function App() {
                   : "未检测到系统代理，直连代理服务器"}
             </span>
             <p>适用于 Clash Verge 等只开了系统代理、没开 TUN 的情况：代理服务器需要翻墙才能连上时，Kit 会先经系统代理再连到它。开关 Clash 的系统代理后自动跟随，无需重启。</p>
-            {fwd.status.systemProxy?.lastError ? <p className="system-proxy__error">{fwd.status.systemProxy.lastError}</p> : null}
           </div>
           <div className="latency-row">
             <button type="button" className="token-fetch-toggle" disabled={fwd.probing !== null} onClick={() => void fwd.probeLatency("manual", outboundProxy)}>
@@ -440,7 +443,6 @@ export default function App() {
                 </div>
               </>
             )}
-            {fwd.status.mihomo?.error ? <p className="mihomo-error">{fwd.status.mihomo.error}</p> : null}
             <p className="panel__hint">
               {fwd.status.mihomo?.phase === "connected"
                 ? `已连接${fwd.status.mihomo.selected ? ` · ${fwd.status.mihomo.selected}` : ""}${fwd.status.mihomo.proxyUrl ? ` · ${fwd.status.mihomo.proxyUrl}` : ""}`
