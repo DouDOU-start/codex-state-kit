@@ -76,8 +76,22 @@ function recordClock(record: BillingRecord): { time: string; date: string } {
   };
 }
 
-function typeLabel(record: BillingRecord): string {
-  return record.source === "business" ? "流式" : "请求";
+const TRANSPORT_LABEL: Record<string, string> = {
+  http: "HTTP",
+  http_sse: "HTTP SSE",
+  http_to_ws: "HTTP → WebSocket",
+  ws_to_ws: "WebSocket",
+};
+
+function transportLabel(record: BillingRecord): string {
+  return record.transport ? TRANSPORT_LABEL[record.transport] ?? record.transport : "—";
+}
+
+/** 上游返回带日期的快照名（如 gpt-5.1-codex-2025-11-13）也算一致。 */
+function sameModel(sent: string, response: string): boolean {
+  const a = sent.trim().toLowerCase();
+  const b = response.trim().toLowerCase();
+  return a === b || b.startsWith(`${a}-`);
 }
 
 function matchLog(record: BillingRecord, logs: LogEntry[]): LogEntry | undefined {
@@ -192,7 +206,8 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
         clock.time,
         clock.date,
         record.sentModel || record.requestedModel || "未知模型",
-        typeLabel(record),
+        transportLabel(record),
+        `→ ${record.responseModel ?? "—"}`,
         `首字 ${formatDuration(record.firstTokenMs ?? log?.firstTokenMs)}`,
         `总耗时 ${formatDuration(log?.ms ?? durationMs(record))}`,
         `in ${record.inputTokens ?? "—"}`,
@@ -257,7 +272,6 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
               <tr>
                 <th>时间</th>
                 <th>模型</th>
-                <th>类型</th>
                 <th>延迟</th>
                 <th>计量</th>
                 <th>费用</th>
@@ -270,6 +284,9 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
                 const first = record.firstTokenMs ?? log?.firstTokenMs ?? null;
                 const total = log?.ms ?? durationMs(record);
                 const model = record.sentModel || record.requestedModel || "未知模型";
+                const requested = record.requestedModel || model;
+                const response = record.responseModel;
+                const matches = response ? sameModel(model, response) : null;
                 const tier = record.serviceTier ? TIER_LABEL[record.serviceTier] : undefined;
                 const parts = costParts(record);
                 const cached = record.cachedInputTokens ?? 0;
@@ -285,7 +302,26 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
                       <small>{clock.date}</small>
                     </td>
                     <td className="usage-table__model">
-                      <strong>{model}</strong>
+                      <div className="usage-model__line">
+                        <span className="usage-model__key">请求模型</span>
+                        <strong>{requested}</strong>
+                        <span className="usage-model__transport">· {transportLabel(record)}</span>
+                      </div>
+                      {model !== requested ? (
+                        <div className="usage-model__line usage-model__line--sub">
+                          <span className="usage-model__key">↳ 转发为</span>
+                          <strong>{model}</strong>
+                        </div>
+                      ) : null}
+                      <div className="usage-model__line usage-model__line--sub">
+                        <span className="usage-model__key">↳ 上游响应</span>
+                        <strong>{response ?? "—"}</strong>
+                        {matches === null ? null : (
+                          <span className={matches ? "usage-match usage-match--ok" : "usage-match usage-match--bad"}>
+                            {matches ? "模型一致" : "模型不一致"}
+                          </span>
+                        )}
+                      </div>
                       {record.pricingModel && record.pricingModel !== model ? <small>按 {record.pricingModel} 计价</small> : null}
                       {tier || record.longContext ? (
                         <span className="usage-table__badges">
@@ -294,7 +330,6 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
                         </span>
                       ) : null}
                     </td>
-                    <td><span className="usage-type">{typeLabel(record)}</span></td>
                     <td className="usage-table__latency">
                       <div className={`usage-latency usage-latency--${speed(first, FIRST_TOKEN_LIMITS)}`}>
                         <span className="usage-latency__label">首字</span>

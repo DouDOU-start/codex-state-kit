@@ -317,6 +317,8 @@ export interface BillingRecord {
   outputCostNanos?: number | null;
   /** Persisted time to first visible output. */
   firstTokenMs?: number | null;
+  /** http | http_sse | http_to_ws | ws_to_ws */
+  transport?: string | null;
   costNanos?: number | null;
   currency?: string | null;
   errorKind?: string | null;

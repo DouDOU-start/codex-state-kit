@@ -312,13 +312,20 @@ svg { flex-shrink: 0; }
 .usage-table__time strong, .usage-table__time small { display: block; }
 .usage-table__time strong { font: 600 12px/1.3 var(--font-sans); }
 .usage-table__time small { display: block; color: var(--muted); font-size: 10px; }
-.usage-table__model strong, .usage-table__model small { display: block; }
+.usage-table__model small { display: block; }
+.usage-model__line { display: flex; align-items: center; flex-wrap: wrap; gap: 3px 6px; min-width: 0; font-size: 11px; line-height: 1.6; }
+.usage-model__line strong { overflow: hidden; color: var(--text); font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.usage-model__line--sub strong { color: var(--text-soft); font-weight: 600; }
+.usage-model__key { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.usage-model__transport { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.usage-match { padding: 0 6px; border: 1px solid; border-radius: 5px; font-size: 9px; font-weight: 600; line-height: 1.6; white-space: nowrap; }
+.usage-match--ok { color: var(--green); border-color: #cae4d3; background: var(--green-soft); }
+.usage-match--bad { color: #b45309; border-color: #fed7aa; background: #fff7ed; }
 .usage-table__model strong { font-weight: 650; }
 .usage-table__model small { margin-top: 2px; color: var(--muted); font-size: 10px; font-weight: 400; }
 .usage-table__badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .usage-badge { display: inline-flex; padding: 1px 6px; border-radius: 999px; color: var(--accent-strong); background: var(--accent-soft); font-size: 9px; font-weight: 600; }
 .usage-badge--warm { color: var(--warm); background: var(--warm-soft); }
-.usage-type { display: inline-flex; padding: 2px 7px; border-radius: 999px; color: #3d6f9a; background: #e7f1fb; font-size: 10px; }
 .usage-table td.usage-table__latency, .usage-table td.usage-table__meter, .usage-table td.usage-table__cost { vertical-align: middle; }
 .usage-latency { display: grid; grid-template-columns: auto auto; gap: 1px 10px; width: fit-content; padding-left: 9px; border-left: 3px solid var(--line-strong); font-size: 11px; font-variant-numeric: tabular-nums; }
 .usage-latency--fast { border-color: #4fa77a; }

@@ -101,6 +101,9 @@ pub struct UsageOutcome {
     /// Time to the first visible output, kept so latency survives restarts.
     #[serde(default)]
     pub first_token_ms: Option<u64>,
+    /// `http`, `http_sse`, `http_to_ws` or `ws_to_ws`.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,13 +157,14 @@ pub struct UsageRecord {
     pub cache_write_cost_nanos: Option<i64>,
     pub output_cost_nanos: Option<i64>,
     pub first_token_ms: Option<u64>,
+    pub transport: Option<String>,
     pub cost_nanos: Option<i64>,
     pub currency: Option<String>,
     pub error_kind: Option<String>,
 }
 
 /// Columns read by [`row_to_record`], in order.
-const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos,u.first_token_ms";
+const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos,u.first_token_ms,u.transport";
 
 /// (state, source, provider, sent_model, started_at, requested_service_tier)
 type PendingRow = (
@@ -365,6 +369,7 @@ impl BillingStore {
             ("cache_write_cost_nanos", "INTEGER"),
             ("output_cost_nanos", "INTEGER"),
             ("first_token_ms", "INTEGER"),
+            ("transport", "TEXT"),
         ] {
             if !existing.iter().any(|name| name == column) {
                 conn.execute_batch(&format!(
@@ -481,8 +486,8 @@ impl BillingStore {
         };
         let tokens = |value: Option<u64>| value.map(|v| v as i64);
         tx.execute(
-            "UPDATE usage_records SET finished_at=?2, state=?3, http_status=?4, response_model=?5, input_tokens=?6, cached_input_tokens=?7, output_tokens=?8, usage_source=?9, pricing_rule_id=?10, cost_nanos=?11, currency=?12, error_kind=?13, cache_write_tokens=?14, reasoning_tokens=?15, pricing_model=?16, service_tier=?17, long_context=?18, input_cost_nanos=?19, cache_read_cost_nanos=?20, cache_write_cost_nanos=?21, output_cost_nanos=?22, first_token_ms=?23 WHERE request_id=?1",
-            params![request_id, outcome.finished_at, state.as_str(), outcome.http_status.map(i64::from), outcome.response_model, tokens(outcome.usage.input_tokens), tokens(outcome.usage.cached_input_tokens), tokens(outcome.usage.output_tokens), outcome.usage_source, priced.rule_id, priced.total, priced.currency, outcome.error_kind, tokens(outcome.usage.cache_write_tokens), tokens(outcome.usage.reasoning_tokens), priced.model, priced.tier.map(ServiceTier::as_str), priced.long_context, priced.input, priced.cache_read, priced.cache_write, priced.output, tokens(outcome.first_token_ms)],
+            "UPDATE usage_records SET finished_at=?2, state=?3, http_status=?4, response_model=?5, input_tokens=?6, cached_input_tokens=?7, output_tokens=?8, usage_source=?9, pricing_rule_id=?10, cost_nanos=?11, currency=?12, error_kind=?13, cache_write_tokens=?14, reasoning_tokens=?15, pricing_model=?16, service_tier=?17, long_context=?18, input_cost_nanos=?19, cache_read_cost_nanos=?20, cache_write_cost_nanos=?21, output_cost_nanos=?22, first_token_ms=?23, transport=?24 WHERE request_id=?1",
+            params![request_id, outcome.finished_at, state.as_str(), outcome.http_status.map(i64::from), outcome.response_model, tokens(outcome.usage.input_tokens), tokens(outcome.usage.cached_input_tokens), tokens(outcome.usage.output_tokens), outcome.usage_source, priced.rule_id, priced.total, priced.currency, outcome.error_kind, tokens(outcome.usage.cache_write_tokens), tokens(outcome.usage.reasoning_tokens), priced.model, priced.tier.map(ServiceTier::as_str), priced.long_context, priced.input, priced.cache_read, priced.cache_write, priced.output, tokens(outcome.first_token_ms), outcome.transport],
         )?;
         tx.commit()?;
         drop(conn);
@@ -850,6 +855,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         first_token_ms: row
             .get::<_, Option<i64>>(29)?
             .and_then(|v| u64::try_from(v).ok()),
+        transport: row.get(30)?,
     })
 }
 
@@ -1036,6 +1042,7 @@ mod tests {
                     response_model: Some("gpt-5.1-codex-2026-01-01".into()),
                     service_tier: Some("default".into()),
                     first_token_ms: Some(1_234),
+                    transport: Some("http_sse".into()),
                     usage: TokenUsage {
                         input_tokens: Some(10_000),
                         cached_input_tokens: Some(8_000),
@@ -1059,6 +1066,7 @@ mod tests {
         assert_eq!(record.currency.as_deref(), Some("USD"));
         assert_eq!(record.reasoning_tokens, Some(400));
         assert_eq!(record.first_token_ms, Some(1_234));
+        assert_eq!(record.transport.as_deref(), Some("http_sse"));
         let totals = &store
             .account_summaries(UsageFilter::default())
             .unwrap()

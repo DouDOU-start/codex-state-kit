@@ -2398,6 +2398,7 @@ impl ResponseLogTracker {
             error_kind: self.entry.error_kind.clone(),
             service_tier: self.metrics.service_tier().map(str::to_owned),
             first_token_ms: self.metrics.first_token_ms().map(|ms| ms as u64),
+            transport: Some(self.entry.transport.clone()),
         });
         self.billing_settled = true;
     }
@@ -2523,6 +2524,7 @@ impl Drop for ResponseLogTracker {
                     usage: self.metrics.token_usage(),
                     service_tier: self.metrics.service_tier().map(str::to_owned),
                     first_token_ms: self.metrics.first_token_ms().map(|ms| ms as u64),
+                    transport: Some(self.entry.transport.clone()),
                     usage_source: self
                         .metrics
                         .usage_seen()
@@ -3362,6 +3364,7 @@ async fn finish_client_ws_turn(
             error_kind: failed.then(|| "ws_upstream".into()),
             service_tier: metrics.service_tier().map(str::to_owned),
             first_token_ms: metrics.first_token_ms().map(|ms| ms as u64),
+            transport: Some("ws_to_ws".into()),
         });
     }
     let settings = app.settings.lock().await.clone();
