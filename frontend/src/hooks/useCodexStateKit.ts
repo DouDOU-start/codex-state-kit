@@ -100,7 +100,7 @@ export function useCodexStateKit() {
 
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void loadStatus(true), 1500);
+    const timer = window.setInterval(() => void loadStatus(true), 1000);
     return () => window.clearInterval(timer);
   }, [loadStatus, refresh]);
 

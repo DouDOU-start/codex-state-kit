@@ -13,6 +13,7 @@ import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
 import BadgeDollarSign from "lucide-react/dist/esm/icons/badge-dollar-sign.js";
 import { AppShell } from "@/components/AppShell";
 import { BillingPanel } from "@/components/BillingPanel";
+import { REFRESH_OPTIONS } from "@/components/RefreshControl";
 import { MihomoGroupPanel } from "@/components/MihomoGroupPanel";
 import { downgradeLabel, UsageRecordsPanel } from "@/components/UsageRecordsPanel";
 import { PricingPanel } from "@/components/PricingPanel";
@@ -47,6 +48,18 @@ const TABS: { id: TabId; label: string; Icon: typeof Activity }[] = [
 ];
 
 const TAB_STORAGE_KEY = "codex-state-kit.tab";
+const REFRESH_STORAGE_KEY = "codex-state-kit.refresh-ms";
+
+/** Auto-refresh interval for the overview and usage records; 1 s by default. */
+function savedRefreshMs(): number {
+  try {
+    const saved = window.localStorage.getItem(REFRESH_STORAGE_KEY);
+    if (saved !== null && REFRESH_OPTIONS.some((option) => option.value === saved)) return Number(saved);
+  } catch {
+    // storage unavailable
+  }
+  return 1000;
+}
 
 function initialTab(): TabId {
   try {
@@ -73,6 +86,15 @@ export default function App() {
   const [vmTerminal, setVmTerminal] = useState("xterm-256color");
   const [addAccountOpen, setAddAccountOpen] = useState(false);
   const [tab, setTab] = useState<TabId>(initialTab);
+  const [refreshMs, setRefreshMs] = useState(savedRefreshMs);
+  const changeRefreshMs = (intervalMs: number) => {
+    setRefreshMs(intervalMs);
+    try {
+      window.localStorage.setItem(REFRESH_STORAGE_KEY, String(intervalMs));
+    } catch {
+      // storage unavailable
+    }
+  };
   const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
   const hydrated = useRef(false);
   const { notify, confirm } = useNotify();
@@ -297,12 +319,15 @@ export default function App() {
         <BillingPanel
           currentAccountId={fwd.status.currentAccountId}
           currentAccountEmail={fwd.status.currentAccountEmail}
+          active={tab === "overview"}
+          refreshMs={refreshMs}
+          onRefreshMsChange={changeRefreshMs}
         />
         </div>
 
 
         <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-records" aria-labelledby="tab-records" hidden={tab !== "records"}>
-          <UsageRecordsPanel active={tab === "records"} status={fwd.status} />
+          <UsageRecordsPanel active={tab === "records"} status={fwd.status} refreshMs={refreshMs} onRefreshMsChange={changeRefreshMs} />
         </section>
 
         <section className="panel tab-panel tab-panel--flush" role="tabpanel" id="tabpanel-pricing" aria-labelledby="tab-pricing" hidden={tab !== "pricing"}>

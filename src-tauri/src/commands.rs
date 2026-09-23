@@ -163,6 +163,13 @@ pub async fn get_billing_summary(
     }))
 }
 
+/// Changes whenever usage records are written; the UI polls this cheaply
+/// and reloads records and summaries only when it moves.
+#[tauri::command(async)]
+pub async fn get_billing_revision(state: State<'_, AppState>) -> CommandResult<u64> {
+    Ok(state.core().billing.revision())
+}
+
 /// Query persisted request-level billing records with optional account/time,
 /// source and model filters.
 #[tauri::command(async)]

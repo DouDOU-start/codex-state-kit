@@ -1,18 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import BookOpen from "lucide-react/dist/esm/icons/book-open.js";
 import Check from "lucide-react/dist/esm/icons/check.js";
-import ChevronLeft from "lucide-react/dist/esm/icons/chevron-left.js";
-import ChevronRight from "lucide-react/dist/esm/icons/chevron-right.js";
 import CircleArrowDown from "lucide-react/dist/esm/icons/circle-arrow-down.js";
 import CircleArrowUp from "lucide-react/dist/esm/icons/circle-arrow-up.js";
 import PencilLine from "lucide-react/dist/esm/icons/pencil-line.js";
 import Copy from "lucide-react/dist/esm/icons/copy.js";
-import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import Route from "lucide-react/dist/esm/icons/route.js";
 import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
-import { getBillingRecords, getBillingSummary, isTauri } from "@/lib/api";
+import { getBillingRecords, getBillingRevision, getBillingSummary, isTauri } from "@/lib/api";
 import { Select } from "@/components/Select";
+import { PAGE_SIZES, Pager } from "@/components/Pager";
+import { RefreshControl } from "@/components/RefreshControl";
+import { usePolling } from "@/hooks/usePolling";
 import { useNotify } from "@/components/Notifier";
 import type { BillingRecord, DowngradeReport, LogEntry, Status } from "@/types";
 
@@ -20,9 +20,22 @@ interface UsageRecordsPanelProps {
   /** 所在 tab 是否可见；切到该 tab 时重新读取记录。 */
   active: boolean;
   status: Status;
+  /** Auto-refresh interval; 0 turns it off. */
+  refreshMs: number;
+  onRefreshMsChange: (intervalMs: number) => void;
 }
 
-const PAGE_SIZE = 50;
+const PAGE_SIZE_KEY = "codex-state-kit.records-page-size";
+
+function savedPageSize(): number {
+  try {
+    const saved = Number(window.localStorage.getItem(PAGE_SIZE_KEY));
+    if (PAGE_SIZES.includes(saved)) return saved;
+  } catch {
+    // storage unavailable
+  }
+  return 50;
+}
 
 function formatAmount(costNanos: number): string {
   const amount = Number(costNanos) / 1_000_000_000;
@@ -131,36 +144,44 @@ function costParts(record: BillingRecord): string[] {
 }
 
 
-export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
+export function UsageRecordsPanel({ active, status, refreshMs, onRefreshMsChange }: UsageRecordsPanelProps) {
   const [loading, setLoading] = useState(false);
   const [records, setRecords] = useState<BillingRecord[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(savedPageSize);
   const [accounts, setAccounts] = useState<[string, string][]>([]);
   /** 空字符串表示全部账号。 */
   const [accountId, setAccountId] = useState("");
   const [onlyDowngraded, setOnlyDowngraded] = useState(false);
   const { notify } = useNotify();
   const reportError = useCallback((cause: unknown) => {
-    notify({ kind: "error", title: "读取使用记录失败", message: cause instanceof Error ? cause.message : String(cause) });
+    // One notice, updated in place, even when auto-refresh keeps failing.
+    notify({ id: "usage-records-error", kind: "error", title: "读取使用记录失败", message: cause instanceof Error ? cause.message : String(cause) });
   }, [notify]);
   const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
   const accountChosen = useRef(false);
   const requestSeq = useRef(0);
   const tableRef = useRef<HTMLDivElement>(null);
 
-  const loadPage = useCallback(async (account: string, pageIndex: number, downgraded: boolean) => {
+  /** Revision of the data on screen; auto-refresh reloads when it moves. */
+  const shownRevision = useRef<number | null>(null);
+
+  /** `silent`: an auto-refresh, so no spinner and no jump back to the top. */
+  const loadPage = useCallback(async (account: string, pageIndex: number, downgraded: boolean, size: number, silent = false) => {
     const seq = ++requestSeq.current;
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
+      // Read the revision first: a write during the query is caught next tick.
+      const revision = await getBillingRevision();
       const result = await getBillingRecords({
         accountId: account || null,
         downgraded: downgraded || null,
-        limit: PAGE_SIZE,
-        offset: pageIndex * PAGE_SIZE,
+        limit: size,
+        offset: pageIndex * size,
       });
       if (seq !== requestSeq.current) return;
-      const lastPage = Math.max(0, Math.ceil(result.total / PAGE_SIZE) - 1);
+      const lastPage = Math.max(0, Math.ceil(result.total / size) - 1);
       if (pageIndex > lastPage) {
         // 记录变少（例如切换账号）后当前页已不存在，回到最后一页。
         setPage(lastPage);
@@ -168,11 +189,12 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
       }
       setRecords(result.records);
       setTotal(result.total);
-      tableRef.current?.scrollTo({ top: 0 });
+      shownRevision.current = revision;
+      if (!silent) tableRef.current?.scrollTo({ top: 0 });
     } catch (cause) {
       if (seq === requestSeq.current) reportError(cause);
     } finally {
-      if (seq === requestSeq.current) setLoading(false);
+      if (seq === requestSeq.current && !silent) setLoading(false);
     }
   }, [reportError]);
 
@@ -197,18 +219,28 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
   }, [active, loadAccounts]);
 
   useEffect(() => {
-    if (active) void loadPage(accountId, page, onlyDowngraded);
-  }, [active, accountId, page, onlyDowngraded, loadPage]);
+    if (active) void loadPage(accountId, page, onlyDowngraded, pageSize);
+  }, [active, accountId, page, onlyDowngraded, pageSize, loadPage]);
 
-  // A new downgrade settled while this tab is open: show it right away.
-  const reload = useRef(() => {});
-  reload.current = () => {
-    if (active) void loadPage(accountId, page, onlyDowngraded);
+  // Auto-refresh: a cheap revision check each tick, a reload only on change.
+  usePolling(async () => {
+    const revision = await getBillingRevision();
+    if (revision === shownRevision.current) return;
+    const knownTotal = total;
+    await loadPage(accountId, page, onlyDowngraded, pageSize, true);
+    // New records may come from an account not in the filter yet.
+    if (knownTotal === 0 || accounts.length === 0) void loadAccounts();
+  }, refreshMs, active);
+
+  const changePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(0);
+    try {
+      window.localStorage.setItem(PAGE_SIZE_KEY, String(size));
+    } catch {
+      // storage unavailable
+    }
   };
-  const lastDowngradeId = status.lastDowngrade?.requestId ?? null;
-  useEffect(() => {
-    if (lastDowngradeId) reload.current();
-  }, [lastDowngradeId]);
 
   const explainDowngrade = (record: BillingRecord, report: DowngradeReport) => {
     notify({
@@ -231,10 +263,9 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
 
   const refresh = () => {
     void loadAccounts();
-    void loadPage(accountId, page, onlyDowngraded);
+    void loadPage(accountId, page, onlyDowngraded, pageSize);
   };
 
-  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const visible = records;
 
   const copyRows = async () => {
@@ -278,10 +309,7 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
           </div>
         </div>
         <div className="usage-records__actions">
-          <button className="billing-panel__refresh" type="button" disabled={loading} onClick={refresh}>
-            <RefreshCw size={13} className={loading ? "is-spinning" : undefined} />
-            {loading ? "读取中" : "刷新"}
-          </button>
+          <RefreshControl loading={loading} onRefresh={refresh} intervalMs={refreshMs} onIntervalChange={onRefreshMsChange} />
           <button className="billing-panel__refresh" type="button" disabled={!visible.length} onClick={() => void copyRows()}>
             {copyState === "done" ? <Check size={13} /> : <Copy size={13} />}
             {copyState === "done" ? "已复制" : copyState === "error" ? "复制失败" : "复制本页"}
@@ -429,18 +457,15 @@ export function UsageRecordsPanel({ active, status }: UsageRecordsPanelProps) {
           </div>
         )}
       </div>
-      {total > PAGE_SIZE ? (
-        <nav className="usage-records__pager" aria-label="使用记录分页">
-          <span>第 {page + 1} / {pageCount} 页 · 共 {total} 条</span>
-          <div>
-            <button className="billing-panel__refresh" type="button" disabled={loading || page === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}>
-              <ChevronLeft size={13} />上一页
-            </button>
-            <button className="billing-panel__refresh" type="button" disabled={loading || page + 1 >= pageCount} onClick={() => setPage((current) => current + 1)}>
-              下一页<ChevronRight size={13} />
-            </button>
-          </div>
-        </nav>
+      {total > 0 ? (
+        <Pager
+          page={page}
+          pageSize={pageSize}
+          total={total}
+          disabled={loading}
+          onPage={setPage}
+          onPageSize={changePageSize}
+        />
       ) : null}
     </div>
   );

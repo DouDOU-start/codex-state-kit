@@ -625,6 +625,12 @@ export async function getBillingSummary(period: Pick<BillingQuery, "from" | "to"
   return cloneBillingSummary(mockBillingSummary());
 }
 
+/** Changes whenever usage records are written; poll it to know when to reload. */
+export async function getBillingRevision(): Promise<number> {
+  if (isTauri) return invoke<number>("get_billing_revision");
+  return 0;
+}
+
 export async function getBillingRecords(query: BillingQuery = {}): Promise<BillingRecordsPage> {
   if (isTauri) {
     return invoke<BillingRecordsPage>("get_billing_records", {

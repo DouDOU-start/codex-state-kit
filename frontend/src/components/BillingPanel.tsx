@@ -1,13 +1,19 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Select } from "@/components/Select";
 import { useNotice } from "@/components/Notifier";
-import { getBillingRecords, getBillingSummary, isTauri } from "@/lib/api";
+import { RefreshControl } from "@/components/RefreshControl";
+import { usePolling } from "@/hooks/usePolling";
+import { getBillingRecords, getBillingRevision, getBillingSummary, isTauri } from "@/lib/api";
 import type { BillingRecord, BillingSummary } from "@/types";
 
 interface BillingPanelProps {
   currentAccountId?: string | null;
   currentAccountEmail?: string | null;
+  /** Whether the overview is on screen; auto-refresh only runs then. */
+  active: boolean;
+  /** Auto-refresh interval; 0 turns it off. */
+  refreshMs: number;
+  onRefreshMsChange: (intervalMs: number) => void;
 }
 
 function daysAgo(days: number): string {
@@ -63,25 +69,32 @@ function tokenSum(records: BillingRecord[]): number {
   return records.reduce((sum, record) => sum + (record.inputTokens ?? 0) + (record.outputTokens ?? 0), 0);
 }
 
-export function BillingPanel({ currentAccountId, currentAccountEmail }: BillingPanelProps) {
+export function BillingPanel({ currentAccountId, currentAccountEmail, active, refreshMs, onRefreshMsChange }: BillingPanelProps) {
   const [summary, setSummary] = useState<BillingSummary | null>(null);
   const [records, setRecords] = useState<BillingRecord[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState(currentAccountId ?? "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const reload = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  /** Revision of the data on screen; auto-refresh reloads when it moves. */
+  const shownRevision = useRef<number | null>(null);
+
+  /** `silent`: an auto-refresh, so the refresh button does not spin. */
+  const reload = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     const from = daysAgo(30);
     const to = new Date().toISOString();
     try {
+      // Read the revision first: a write during the query is caught next tick.
+      const revision = await getBillingRevision();
       const [nextSummary, nextRecords] = await Promise.all([
         getBillingSummary({ from, to }),
         getBillingRecords({ from, to, limit: 500, offset: 0 }),
       ]);
       setSummary(nextSummary);
       setRecords(nextRecords.records);
+      setError(null);
+      shownRevision.current = revision;
       setSelectedAccountId((current) => {
         if (current && nextSummary.accounts.some((account) => account.accountId === current)) return current;
         if (currentAccountId && nextSummary.accounts.some((account) => account.accountId === currentAccountId)) return currentAccountId;
@@ -90,7 +103,7 @@ export function BillingPanel({ currentAccountId, currentAccountEmail }: BillingP
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [currentAccountId]);
   useNotice("billing-error", error, () => ({
@@ -103,6 +116,11 @@ export function BillingPanel({ currentAccountId, currentAccountEmail }: BillingP
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  // Auto-refresh: a cheap revision check each tick, a reload only on change.
+  usePolling(async () => {
+    if ((await getBillingRevision()) !== shownRevision.current) await reload(true);
+  }, refreshMs, active);
 
   const accounts = summary?.accounts ?? [];
   const selected = accounts.find((account) => account.accountId === selectedAccountId) ?? accounts[0];
@@ -170,10 +188,7 @@ export function BillingPanel({ currentAccountId, currentAccountEmail }: BillingP
               onChange={setSelectedAccountId}
             />
           ) : null}
-          <button type="button" onClick={() => void reload()} disabled={loading}>
-            <RefreshCw size={13} className={loading ? "is-spinning" : undefined} />
-            {loading ? "读取中" : "刷新"}
-          </button>
+          <RefreshControl loading={loading} onRefresh={() => void reload()} intervalMs={refreshMs} onIntervalChange={onRefreshMsChange} />
         </div>
       </header>
       {error ? (

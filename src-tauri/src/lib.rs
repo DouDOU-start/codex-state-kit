@@ -66,6 +66,7 @@ pub fn run() {
             commands::get_status,
             commands::get_billing_summary,
             commands::get_billing_records,
+            commands::get_billing_revision,
             commands::set_billing_pricing,
             commands::get_pricing,
             commands::sync_pricing,
