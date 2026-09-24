@@ -1852,28 +1852,12 @@ async fn forward_http_tracked(
             eprintln!("[identity] 请求体身份改写失败，保留原正文: {err}");
         }
     }
-    // Business turns go over the upstream WebSocket, like the official client;
-    // while the pool backs off after a failed handshake they use HTTP SSE.
-    if ws_bridge::should_bridge_http(parts.method.as_str(), path, &target)
-        && app.ws_upstream.available()
-    {
-        match forward_responses_over_ws(
-            app,
-            &target,
-            &upstream_proxy,
-            &parts.headers,
-            &bytes,
-            started,
-            details,
-        )
-        .await
-        {
-            Ok(response) => return Ok(response),
-            Err(err) => {
-                eprintln!("[ws] 上游 WebSocket 失败: {err:#}，回退到 HTTP");
-            }
-        }
-    }
+    // HTTP clients stay on the native HTTP SSE path.  The HTTP→WebSocket
+    // bridge can receive the generated content but lose the upstream
+    // `response.completed` usage event when the WS closes, which leaves the
+    // durable billing row interrupted and impossible to price.  Native SSE
+    // carries the complete usage record reliably.  Real WebSocket clients
+    // still use the upstream WebSocket path in `proxy_ws` below.
     // WebSocket 链式续跑才认 previous_response_id；走 HTTP 时必须去掉，
     // 否则上游返回 "Invalid previous_response_id"。
     if parts.method == http::Method::POST && path.contains("/responses") {
@@ -1978,6 +1962,7 @@ async fn forward_http_tracked(
     Ok(response)
 }
 
+#[allow(dead_code)]
 async fn forward_responses_over_ws(
     app: &App,
     target: &str,
