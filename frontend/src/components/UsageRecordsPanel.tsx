@@ -47,6 +47,16 @@ function formatMoney(costNanos: number | null | undefined): string {
   return `$${formatAmount(costNanos)}`;
 }
 
+function unpricedLabel(record: BillingRecord): { label: string; title: string } {
+  if (record.state === "missing_usage" || record.inputTokens == null || record.outputTokens == null) {
+    return { label: "缺少用量", title: "上游没有返回完整的输入/输出 token，暂时无法计算费用。" };
+  }
+  if (record.state === "interrupted") {
+    return { label: "请求未完成", title: "请求在返回完整用量前中断，暂时无法计算费用。" };
+  }
+  return { label: "未定价", title: "已有完整用量，但当前价格目录没有匹配的模型价格。" };
+}
+
 /** 1 万以内显示千分位，更大时显示 K / M。 */
 function compactTokens(value: number | null | undefined): string {
   if (value == null) return "—";
@@ -406,7 +416,10 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                     </td>
                     <td className="usage-table__cost" title={parts.length ? parts.join("\n") : undefined}>
                       {record.costNanos == null
-                        ? <span className="usage-cost usage-cost--none">未定价</span>
+                        ? (() => {
+                          const reason = unpricedLabel(record);
+                          return <span className="usage-cost usage-cost--none" title={reason.title}>{reason.label}</span>;
+                        })()
                         : <span className="usage-cost"><i>$</i>{formatAmount(record.costNanos)}</span>}
                     </td>
                   </tr>
