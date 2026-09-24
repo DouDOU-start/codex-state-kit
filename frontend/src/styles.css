@@ -88,7 +88,8 @@ svg { flex-shrink: 0; }
 /* 输入框右侧并排的按钮（如测延迟），高度与输入框一致。 */
 .field-row { display: flex; align-items: stretch; gap: 8px; }
 .field-row > input, .field-row > .ui-select { flex: 1; min-width: 0; }
-.codex-latency-row { align-items: center; }
+.codex-latency-row { align-items: center; min-height: 28px; }
+.codex-latency-row > .panel__hint { margin: 0; line-height: 28px; }
 .codex-latency-row .latency-probe { min-height: 28px; }
 /* 测延迟：未测时显示图标和文字，测过后直接显示结果，颜色按快慢区分，点击重测。 */
 .latency-probe { display: inline-flex; flex-shrink: 0; min-width: 76px; min-height: 30px; align-items: center; justify-content: center; gap: 5px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--text-soft); background: var(--surface); font: 600 10px var(--font-sans); font-variant-numeric: tabular-nums; white-space: nowrap; cursor: pointer; transition: border-color .15s, background .15s, color .15s; }
