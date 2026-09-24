@@ -58,6 +58,15 @@ function unpricedLabel(record: BillingRecord): { label: string; title: string } 
   return { label: "未定价", title: "已有完整用量，但当前价格目录没有匹配的模型价格。" };
 }
 
+function stateLabel(state: BillingRecord["state"]): string {
+  return ({
+    pending: "处理中",
+    measured: "已计量",
+    missing_usage: "缺少用量",
+    interrupted: "请求中断",
+  } as Record<string, string>)[state] ?? state;
+}
+
 /** 1 万以内显示千分位，更大时显示 K / M。 */
 function compactTokens(value: number | null | undefined): string {
   if (value == null) return "—";
@@ -286,6 +295,10 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
   };
 
   const visible = records;
+  const detailLog = detailRecord ? matchLog(detailRecord, status.logs) : undefined;
+  const detailError = detailRecord?.errorKind || detailLog?.errorKind || (detailLog && ["error", "cancelled"].includes(detailLog.streamState) ? `stream_${detailLog.streamState}` : null);
+  const detailStatus = detailRecord?.httpStatus ?? detailLog?.status ?? null;
+  const detailTransport = detailRecord?.transport || detailLog?.transport || null;
 
   return (
     <div className="usage-records">
@@ -479,14 +492,14 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
             <div className="modal__body record-detail">
               <div className="record-detail__status">
                 <strong>{unpricedLabel(detailRecord).label}</strong>
-                <span>{detailRecord.state}</span>
+                <span>{stateLabel(detailRecord.state)}</span>
               </div>
               <dl className="record-detail__grid">
                 <div><dt>模型</dt><dd>{detailRecord.sentModel || detailRecord.requestedModel || "—"}</dd></div>
                 <div><dt>上游响应模型</dt><dd>{detailRecord.responseModel || "—"}</dd></div>
-                <div><dt>HTTP 状态</dt><dd>{detailRecord.httpStatus ?? "—"}</dd></div>
-                <div><dt>错误类型 / 错误码</dt><dd className={detailRecord.errorKind ? "record-detail__error" : undefined}>{detailRecord.errorKind || "—"}</dd></div>
-                <div><dt>传输方式</dt><dd>{detailRecord.transport || "—"}</dd></div>
+                <div><dt>HTTP 状态</dt><dd>{detailStatus ?? "—"}</dd></div>
+                <div><dt>错误类型 / 错误码</dt><dd className={detailError ? "record-detail__error" : undefined}>{detailError || "—"}</dd></div>
+                <div><dt>传输方式</dt><dd>{detailTransport || "—"}</dd></div>
                 <div><dt>用量来源</dt><dd>{detailRecord.usageSource || "—"}</dd></div>
                 <div><dt>输入 tokens</dt><dd>{detailRecord.inputTokens ?? "—"}</dd></div>
                 <div><dt>输出 tokens</dt><dd>{detailRecord.outputTokens ?? "—"}</dd></div>
