@@ -536,14 +536,17 @@ export default function App() {
               </div>
             ))}
           </dl>
-          {vmIdentity && <div className="field">
-            <label>
+          {vmIdentity && <div className="vm-environment">
+            <div className="vm-environment__top">
+              <div className="vm-environment__title"><span className="vm-environment__dot" aria-hidden="true" /><span>模型环境</span><small>{vmIdentity.environment?.autoRegion ?? true ? "随代理出口自动同步" : "手动设置"}</small></div>
+              <label className="vm-environment__toggle">
               <input type="checkbox" checked={vmIdentity.environment?.autoRegion ?? true} disabled={fwd.busy !== null}
                 onChange={event => void fwd.saveVmIdentity({ platform: vmIdentity.platform, environment: {
                   timezone: "", locale: "", region: "", ...vmIdentity.environment, autoRegion: event.target.checked,
-                } })} /> 自动根据代理地区设置时区与语言
-            </label>
-            <p className="panel__hint">通过当前代理出口查询 IP 地区与时区，语言取该地区的默认值。探测失败保留上次结果；关闭自动选择可手动设置。日期按所选时区计算，实际执行命令的路径和 Shell 保持真实值。</p>
+                } })} /> 自动探测
+              </label>
+            </div>
+            <p className="vm-environment__hint">根据代理出口 IP 同步时区与语言，日期随时区计算。</p>
             {!(vmIdentity.environment?.autoRegion ?? true) && ([
               ["timezone", "IANA 时区", "Asia/Tokyo"],
               ["locale", "语言区域", "zh-CN"],
