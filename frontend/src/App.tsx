@@ -494,12 +494,26 @@ export default function App() {
               <span className="section-icon"><Monitor size={19} /></span>
               <div>
                 <h2>虚拟设备</h2>
-                <p>{vmIdentity?.userAgent ?? "上游看到的 Codex CLI 身份"}</p>
+                <p>{vmIdentity?.enabled ? vmIdentity.userAgent : "设备和环境信息原样透传"}</p>
               </div>
             </div>
             <span className="vm-identity__id">Installation {vmIdentity?.installationId ?? "—"}</span>
           </header>
           {bindingNote}
+          {vmIdentity && <div className="vm-mode">
+            <label className="vm-mode__toggle">
+              <input
+                type="checkbox"
+                checked={vmIdentity.enabled}
+                disabled={fwd.busy !== null}
+                onChange={event => void fwd.saveVmIdentity({ platform: vmIdentity.platform, enabled: event.target.checked })}
+              />
+              <span>
+                <strong>启用虚拟设备模拟</strong>
+                <small>{vmIdentity.enabled ? "改写设备指纹和模型环境" : "关闭后纯透传客户端的设备和环境"}</small>
+              </span>
+            </label>
+          </div>}
           <div className="field">
             <span>系统</span>
             <div className="proxy-mode vm-platforms" role="group" aria-label="系统">
@@ -508,7 +522,7 @@ export default function App() {
                   key={id}
                   type="button"
                   aria-pressed={vmIdentity?.platform === id}
-                  disabled={fwd.busy !== null}
+                  disabled={fwd.busy !== null || !vmIdentity?.enabled}
                   onMouseDown={(event) => event.preventDefault()}
                   onClick={async () => {
                     if (!vmIdentity || vmIdentity.platform === id) return;
@@ -544,22 +558,22 @@ export default function App() {
           </dl>
           {vmIdentity && <div className="vm-environment">
             <div className="vm-environment__top">
-              <div className="vm-environment__title"><span className="vm-environment__dot" aria-hidden="true" /><span>模型环境</span><small>{vmIdentity.environment?.autoRegion ?? true ? "随代理出口自动同步" : "手动设置"}</small></div>
+              <div className="vm-environment__title"><span className="vm-environment__dot" aria-hidden="true" /><span>模型环境</span><small>{vmIdentity.enabled ? (vmIdentity.environment?.autoRegion ?? true ? "随代理出口自动同步" : "手动设置") : "当前透传"}</small></div>
               <label className="vm-environment__toggle">
-              <input type="checkbox" checked={vmIdentity.environment?.autoRegion ?? true} disabled={fwd.busy !== null}
+              <input type="checkbox" checked={vmIdentity.environment?.autoRegion ?? true} disabled={fwd.busy !== null || !vmIdentity.enabled}
                 onChange={event => void fwd.saveVmIdentity({ platform: vmIdentity.platform, environment: {
                   timezone: "", locale: "", region: "", ...vmIdentity.environment, autoRegion: event.target.checked,
                 } })} /> 自动探测
               </label>
             </div>
-            <p className="vm-environment__hint">根据代理出口 IP 同步时区与语言，日期随时区计算。</p>
+            <p className="vm-environment__hint">{vmIdentity.enabled ? "根据代理出口 IP 同步时区与语言，日期随时区计算。" : "已关闭环境模拟，请求中的环境信息会原样发送。"}</p>
             {!(vmIdentity.environment?.autoRegion ?? true) && ([
               ["timezone", "IANA 时区", "Asia/Tokyo"],
               ["locale", "语言区域", "zh-CN"],
             ] as const).map(([key, label, placeholder]) => <label key={key} className="field">
               <span>{label}</span>
               <input key={`${vmIdentity.installationId}-${key}-${vmIdentity.environment?.[key]}`} defaultValue={vmIdentity.environment?.[key] ?? ""}
-                placeholder={placeholder} disabled={fwd.busy !== null}
+                placeholder={placeholder} disabled={fwd.busy !== null || !vmIdentity.enabled}
                 onBlur={event => {
                   const value = event.target.value.trim();
                   if (value === (vmIdentity.environment?.[key] ?? "")) return;
@@ -569,13 +583,13 @@ export default function App() {
                 }} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} />
             </label>)}
           </div>}
-          <p className="panel__hint">系统版本、架构和终端跟随所选系统，与官方 CLI 在该系统上上报的一致；CLI 版本跟随本机安装的 codex，Originator 固定为官方 CLI。</p>
+          <p className="panel__hint">{vmIdentity?.enabled ? "系统版本、架构和终端跟随所选系统，与官方 CLI 在该系统上上报的一致；CLI 版本跟随本机安装的 codex，Originator 固定为官方 CLI。" : "当前为纯透传模式，下面保存的虚拟设备参数不会改写请求。"}</p>
           <div className="vm-identity__actions">
-            <button type="button" className="button button--ghost" disabled={fwd.busy !== null} onClick={() => void fwd.detectVmVersion()}>检测本机 CLI</button>
+            <button type="button" className="button button--ghost" disabled={fwd.busy !== null || !vmIdentity?.enabled} onClick={() => void fwd.detectVmVersion()}>检测本机 CLI</button>
             <button
               type="button"
               className="button button--ghost"
-              disabled={fwd.busy !== null}
+              disabled={fwd.busy !== null || !vmIdentity?.enabled}
               onClick={async () => {
                 const ok = await confirm({
                   title: "换一台新机器？",

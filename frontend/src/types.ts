@@ -28,6 +28,7 @@ export interface LogEntry {
   contentEncoding: string;
   bodyBytes: number;
   errorKind?: string | null;
+  errorMessage?: string | null;
   streamState: "not_tracked" | "awaiting_first_chunk" | "streaming" | "completed" | "error" | "cancelled" | string;
   firstChunkMs?: number | null;
   lastChunkMs?: number | null;
@@ -42,6 +43,7 @@ export interface LogEntry {
 export type DevicePlatform = "mac" | "windows" | "linux";
 
 export interface VmIdentityView {
+  enabled: boolean;
   environment?: VirtualEnvironment;
   installationId: string;
   sessionId: string;
@@ -58,6 +60,7 @@ export interface VmIdentityView {
 export interface VmProfile {
   platform: DevicePlatform;
   environment?: VirtualEnvironment;
+  enabled?: boolean;
 }
 
 export interface VirtualEnvironment {
@@ -238,6 +241,9 @@ export interface BillingUsageTotals {
   requestCount: number;
   measuredRequestCount: number;
   unknownUsageCount: number;
+  interruptedRequestCount?: number;
+  pendingRequestCount?: number;
+  missingUsageCount?: number;
   inputTokens: number;
   cachedInputTokens: number;
   cacheWriteTokens?: number;
@@ -310,6 +316,7 @@ export interface BillingRecord {
   costNanos?: number | null;
   currency?: string | null;
   errorKind?: string | null;
+  errorMessage?: string | null;
 }
 
 export interface BillingQuery {

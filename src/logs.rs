@@ -15,6 +15,13 @@ pub const ROUTE_MANUAL_PROXY: &str = "manual_proxy";
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_LOGS: usize = 80;
 const UNSET_MILLIS: u64 = u64::MAX;
+/// Keep response inspection bounded even when a tool call or output item is
+/// very large.  Real WebSocket events are decoded before forwarding; the SSE
+/// fallback only retains enough head/tail metadata to identify termination.
+const MAX_EVENT_BYTES: usize = 128 * 1024;
+const MAX_EVENT_HEAD_BYTES: usize = 16 * 1024;
+const MAX_EVENT_TAIL_BYTES: usize = 64 * 1024;
+const MAX_LINE_BYTES: usize = 128 * 1024;
 const STREAM_AWAITING: u8 = 0;
 const STREAM_ACTIVE: u8 = 1;
 const STREAM_FINISHING: u8 = 2;
@@ -492,13 +499,16 @@ pub struct ResponseMetrics {
     service_tier: Option<String>,
     downgrade: crate::downgrade::DowngradeSignals,
     line: Vec<u8>,
+    line_tail: VecDeque<u8>,
     data: Vec<u8>,
+    large_tail: Vec<u8>,
     skip_event: bool,
     after_cr: bool,
     is_sse: bool,
     completed: bool,
     terminal_event_seen: bool,
     pub error_kind: Option<&'static str>,
+    error_message: Option<String>,
     sse_events: Vec<(String, u32)>,
 }
 
@@ -606,6 +616,26 @@ impl ResponseBodyMetrics {
         self.sink_mut().metrics.downgrade.observe_headers(headers);
     }
 
+    /// Observe a native upstream WebSocket JSON event before it is converted
+    /// to an SSE line for an HTTP client.  This path deliberately parses the
+    /// complete event: unlike the bounded SSE inspector, the caller already
+    /// owns the frame and the terminal usage object must not be lost merely
+    /// because a tool payload made the frame large.
+    pub fn observe_ws_event(&mut self, json: &str, elapsed_ms: u128) {
+        if self.disabled {
+            return;
+        }
+        let sink = self.sink_mut();
+        sink.metrics.is_sse = true;
+        sink.metrics.observe_event(json.as_bytes(), elapsed_ms);
+    }
+
+    pub fn set_error_message(&mut self, raw: &str) {
+        if !self.disabled {
+            self.sink_mut().metrics.set_error_message(raw);
+        }
+    }
+
     pub fn finish(&mut self, elapsed_ms: u128) {
         if !self.disabled {
             self.sink_mut().metrics.finish(elapsed_ms);
@@ -631,11 +661,10 @@ impl ResponseMetrics {
     pub fn observe(&mut self, chunk: &[u8], elapsed_ms: u128, is_sse: bool) {
         self.is_sse = is_sse;
         if !is_sse {
-            if !self.skip_event && self.data.len() + chunk.len() <= 128 * 1024 {
+            if !self.skip_event && self.data.len() + chunk.len() <= MAX_EVENT_BYTES {
                 self.data.extend_from_slice(chunk);
             } else {
-                self.data.clear();
-                self.skip_event = true;
+                self.begin_large_event(chunk);
             }
             return;
         }
@@ -652,24 +681,37 @@ impl ResponseMetrics {
                     if !self.skip_event {
                         let data = std::mem::take(&mut self.data);
                         self.observe_event(&data, elapsed_ms);
+                    } else {
+                        self.observe_large_event(elapsed_ms);
                     }
                     self.data.clear();
+                    self.large_tail.clear();
                     self.skip_event = false;
                 } else {
                     if let Some(value) = self.line.strip_prefix(b"data:") {
                         let value = value.strip_prefix(b" ").unwrap_or(value);
-                        if self.data.len() + value.len() + 1 <= 128 * 1024 {
-                            self.data.extend_from_slice(value);
+                        let value = value.to_vec();
+                        if self.line_tail.is_empty()
+                            && self.data.len() + value.len() + 1 <= MAX_EVENT_BYTES
+                        {
+                            self.data.extend_from_slice(&value);
                             self.data.push(b'\n');
                         } else {
-                            self.skip_event = true;
+                            self.begin_large_event(&value);
+                            let tail = self.line_tail.iter().copied().collect::<Vec<_>>();
+                            self.append_large_tail(&tail);
                         }
                     }
                     self.line.clear();
+                    self.line_tail.clear();
                 }
-            } else if self.line.len() < 128 * 1024 {
+            } else if self.line.len() < MAX_LINE_BYTES {
                 self.line.push(byte);
             } else {
+                self.line_tail.push_back(byte);
+                if self.line_tail.len() > MAX_EVENT_TAIL_BYTES {
+                    self.line_tail.pop_front();
+                }
                 self.skip_event = true;
             }
         }
@@ -681,6 +723,72 @@ impl ResponseMetrics {
         } else if !self.skip_event {
             let data = std::mem::take(&mut self.data);
             self.observe_event(&data, elapsed_ms);
+        } else {
+            self.observe_large_event(elapsed_ms);
+        }
+    }
+
+    /// Start retaining only bounded metadata for an event that exceeded the
+    /// normal inspection limit. The head is used only to identify a protocol
+    /// event; complete usage/error objects are decoded on the native WS path.
+    fn begin_large_event(&mut self, extra: &[u8]) {
+        // `skip_event` is set as soon as a line crosses the bound, before the
+        // line reaches the delimiter where its head/tail are assembled.
+        if !self.skip_event || self.large_tail.is_empty() {
+            let existing = std::mem::take(&mut self.data);
+            self.data
+                .extend_from_slice(&existing[..existing.len().min(MAX_EVENT_HEAD_BYTES)]);
+            if self.data.is_empty() {
+                self.data
+                    .extend_from_slice(&extra[..extra.len().min(MAX_EVENT_HEAD_BYTES)]);
+            }
+            self.large_tail.clear();
+            self.append_large_tail(&existing);
+            self.skip_event = true;
+        }
+        self.append_large_tail(extra);
+    }
+
+    fn append_large_tail(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.large_tail.extend_from_slice(bytes);
+        if self.large_tail.len() > MAX_EVENT_TAIL_BYTES {
+            let excess = self.large_tail.len() - MAX_EVENT_TAIL_BYTES;
+            self.large_tail.drain(..excess);
+        }
+    }
+
+    /// Decode only small metadata fragments from an oversized JSON event.
+    /// Output/tool payloads are intentionally never retained or parsed.
+    fn observe_large_event(&mut self, elapsed_ms: u128) {
+        let head = self.data.clone();
+        let event_type = find_event_type(&head);
+        if let Some(event_type) = event_type.as_deref() {
+            self.record_sse_event_type(event_type);
+            if matches!(
+                event_type,
+                "response.completed"
+                    | "response.done"
+                    | "response.failed"
+                    | "response.incomplete"
+                    | "response.cancelled"
+                    | "response.canceled"
+            ) {
+                self.terminal_event_seen = true;
+            }
+            if event_type == "response.completed" {
+                self.completed = true;
+            }
+            self.error_kind = match event_type {
+                "response.failed" | "error" => Some("response_failed"),
+                "response.incomplete" => Some("response_incomplete"),
+                _ => self.error_kind,
+            };
+            if self.first_token_ms.is_none() && large_event_has_visible_output(event_type) {
+                self.first_token_ms = Some(elapsed_ms);
+            }
         }
     }
 
@@ -747,6 +855,22 @@ impl ResponseMetrics {
     /// `response.failed`, or `response.incomplete` to terminate a response.
     pub fn terminal_event_seen(&self) -> bool {
         self.terminal_event_seen
+    }
+
+    /// Bounded protocol error details. Only fields under the provider's
+    /// error envelope are retained; output/tool/user text is never inspected.
+    pub fn error_message(&self) -> Option<&str> {
+        self.error_message.as_deref()
+    }
+
+    /// Retain a bounded transport error supplied by the forwarding layer.
+    /// The full error is never needed for metrics, and this keeps provider or
+    /// socket messages from growing a durable record without limit.
+    pub fn set_error_message(&mut self, raw: &str) {
+        let message = safe_text(raw, 512);
+        if !message.is_empty() {
+            self.error_message = Some(message);
+        }
     }
 
     pub fn sse_event_summary(&self) -> Option<String> {
@@ -848,6 +972,16 @@ impl ResponseMetrics {
             Some("response.incomplete") => Some("response_incomplete"),
             _ => self.error_kind,
         };
+        if let Some(event_type) = json.get("type").and_then(serde_json::Value::as_str) {
+            if matches!(
+                event_type,
+                "response.failed" | "error" | "response.incomplete"
+            ) {
+                if let Some(details) = protocol_error_message(&json, event_type) {
+                    self.error_message = Some(details);
+                }
+            }
+        }
         if self.is_sse && self.first_token_ms.is_none() && has_visible_output(&json) {
             self.first_token_ms = Some(elapsed_ms);
         }
@@ -960,6 +1094,101 @@ fn has_visible_output(value: &serde_json::Value) -> bool {
         });
     }
     false
+}
+
+fn large_event_has_visible_output(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.output_text.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.audio_transcript.delta"
+            | "response.refusal.delta"
+            | "response.function_call_arguments.delta"
+            | "response.custom_tool_call_input.delta"
+            | "response.image_generation_call.partial_image"
+            | "response.output_text.done"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.done"
+            | "response.audio_transcript.done"
+            | "response.function_call_arguments.done"
+            | "response.custom_tool_call_input.done"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+    )
+}
+
+/// The SSE fallback may have only the beginning of an oversized event.  Read
+/// `type` only when it is an early top-level field so output/tool strings
+/// cannot be mistaken for protocol metadata.
+fn find_event_type(fragment: &[u8]) -> Option<String> {
+    let start = fragment
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())?;
+    if fragment.get(start) != Some(&b'{') {
+        return None;
+    }
+    let prefix = &fragment[start..fragment.len().min(start + 1024)];
+    let needle = br#""type""#;
+    let key = prefix
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    let mut cursor = key + needle.len();
+    while prefix.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if prefix.get(cursor) != Some(&b':') {
+        return None;
+    }
+    cursor += 1;
+    while prefix.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let string_start = cursor;
+    if prefix.get(string_start) != Some(&b'"') {
+        return None;
+    }
+    cursor += 1;
+    let mut escaped = false;
+    while let Some(&byte) = prefix.get(cursor) {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return serde_json::from_slice(&prefix[string_start..=cursor]).ok();
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn protocol_error_message(value: &serde_json::Value, event_type: &str) -> Option<String> {
+    let error = value
+        .get("error")
+        .or_else(|| value.pointer("/response/error"))
+        .filter(|error| error.is_object());
+    let incomplete = value
+        .pointer("/response/incomplete_details")
+        .filter(|details| details.is_object());
+    let mut details = Vec::new();
+    for object in [error, incomplete].into_iter().flatten() {
+        for key in ["code", "type", "reason", "message"] {
+            if let Some(raw) = object.get(key).and_then(serde_json::Value::as_str) {
+                let text = safe_text(raw, 160);
+                if !text.is_empty() {
+                    details.push(format!("{key}={text}"));
+                }
+            }
+        }
+    }
+    if details.is_empty() {
+        // Keep a stable marker for a protocol error with no provider details.
+        return (event_type == "response.incomplete").then(|| "incomplete".into());
+    }
+    Some(safe_text(&details.join("; "), 512))
 }
 
 fn find_usage_tokens(usage: &serde_json::Value, keys: &[&str]) -> Option<u64> {
@@ -1293,10 +1522,28 @@ data: {"type":"response.completed","response":{"service_tier":"priority","usage"
     fn metrics_recover_from_oversized_events_and_keep_memory_bounded() {
         let mut metrics = ResponseMetrics::default();
         metrics.observe(&vec![b'x'; 512 * 1024], 10, true);
-        assert!(metrics.line.len() <= 128 * 1024);
+        assert!(metrics.line.len() <= MAX_LINE_BYTES);
         metrics.observe(b"\n\ndata: {\"usage\":{\"output_tokens\":0}}\n\n", 20, true);
         assert_eq!(metrics.output_tokens(), Some(0));
         assert_eq!(metrics.first_token_ms(), None);
+    }
+
+    #[test]
+    fn metrics_extract_usage_from_oversized_completed_event() {
+        let large_output = "x".repeat(MAX_LINE_BYTES + 32 * 1024);
+        let event = format!(
+            "{{\"type\":\"response.completed\",\"response\":{{\"output\":\"{large_output}\",\"usage\":{{\"input_tokens\":900,\"output_tokens\":80,\"input_tokens_details\":{{\"cached_tokens\":500}}}},\"model\":\"gpt-6-astra\"}}}}"
+        );
+        let mut metrics = ResponseBodyMetrics::new("identity");
+        metrics.observe_ws_event(&event, 42);
+        metrics.finish(50);
+
+        assert!(metrics.terminal_event_seen());
+        assert!(metrics.completed());
+        assert_eq!(metrics.input_tokens(), Some(900));
+        assert_eq!(metrics.output_tokens(), Some(80));
+        assert_eq!(metrics.cached_input_tokens(), Some(500));
+        assert_eq!(metrics.upstream_response_model(), Some("gpt-6-astra"));
     }
 
     #[test]
@@ -1377,7 +1624,25 @@ data: {"type":"response.completed","response":{"service_tier":"priority","usage"
             true,
         );
         assert_eq!(metrics.error_kind, Some("response_failed"));
+        assert_eq!(metrics.error_message(), Some("message=private"));
         assert_eq!(metrics.first_token_ms(), None);
+    }
+
+    #[test]
+    fn metrics_keeps_only_bounded_protocol_error_details() {
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(
+            br#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}},"error":{"code":"too_many_tokens","type":"server_error","message":"provider detail"}}
+
+"#,
+            10,
+            true,
+        );
+        assert_eq!(metrics.error_kind, Some("response_incomplete"));
+        assert_eq!(
+            metrics.error_message(),
+            Some("code=too_many_tokens; type=server_error; message=provider detail; reason=max_output_tokens")
+        );
     }
 
     #[test]

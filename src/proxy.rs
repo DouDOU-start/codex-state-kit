@@ -12,9 +12,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, Mutex, Notify};
+use tokio::sync::{oneshot, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use url::Url;
 
@@ -58,22 +58,29 @@ fn business_stream_idle_timeout(chunks: u64) -> Duration {
     }
 }
 
-fn debug_log(msg: &str) {
+async fn debug_log(msg: String) {
     eprintln!("{}", msg);
     let path = crate::settings::home_dir().join(if cfg!(debug_assertions) {
         ".codex-state-kit-dev-debug.log"
     } else {
         ".codex-state-kit-debug.log"
     });
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let ts = chrono::Local::now().format("%H:%M:%S%.3f");
-        let _ = writeln!(f, "[{}] {}", ts, msg);
-    }
+    // Keep request forwarding off the synchronous filesystem path. The debug
+    // line is best-effort and can be dropped if the runtime is shutting down.
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let ts = chrono::Local::now().format("%H:%M:%S%.3f");
+                let _ = writeln!(f, "[{}] {}", ts, msg);
+            }
+        })
+        .await;
+    });
 }
 
 const HOP_BY_HOP: &[&str] = &[
@@ -129,12 +136,43 @@ pub struct App {
     pub login_http: reqwest::Client,
     leftover_restored: AtomicBool,
     proxy_error: Mutex<Option<String>>,
-    /// Serializes identity and settings transitions.
-    transition: Mutex<()>,
+    /// Coordinates identity reads with exclusive settings/route transitions.
+    transition: RwLock<()>,
+    /// Cached auth snapshot for concurrent forwarding. The transition lock
+    /// still makes account/settings changes linearizable; file stamps avoid
+    /// reparsing both auth JSON files for every request.
+    request_identity_cache: Mutex<Option<RequestIdentityCache>>,
     http: Mutex<PooledUpstream>,
     pub sidecar_wake: Notify,
     vm_identity: Mutex<VmIdentity>,
     ws_upstream: WsUpstreamPool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthFileStamp {
+    modified: Option<SystemTime>,
+    len: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct RequestIdentityCache {
+    home: std::path::PathBuf,
+    kit: AuthFileStamp,
+    official: AuthFileStamp,
+    value: Option<(login::ChatGptCredentials, bool)>,
+}
+
+fn auth_file_stamp(path: &Path) -> AuthFileStamp {
+    match std::fs::metadata(path) {
+        Ok(metadata) => AuthFileStamp {
+            modified: metadata.modified().ok(),
+            len: Some(metadata.len()),
+        },
+        Err(_) => AuthFileStamp {
+            modified: None,
+            len: None,
+        },
+    }
 }
 
 impl App {
@@ -176,7 +214,8 @@ impl App {
             login_http: crate::login::http_client()?,
             leftover_restored: AtomicBool::new(false),
             proxy_error: Mutex::new(None),
-            transition: Mutex::new(()),
+            transition: RwLock::new(()),
+            request_identity_cache: Mutex::new(None),
             http: Mutex::new(http),
             sidecar_wake: Notify::new(),
             vm_identity: Mutex::new(if cfg!(test) {
@@ -194,8 +233,25 @@ impl App {
         &self,
         home: &Path,
     ) -> Option<(login::ChatGptCredentials, bool)> {
-        let _transition = self.transition.lock().await;
-        login::request_credentials(home).ok()
+        let _transition = self.transition.read().await;
+        let kit = auth_file_stamp(&login::kit_auth_path(home));
+        let official = auth_file_stamp(&home.join("auth.json"));
+        {
+            let cache = self.request_identity_cache.lock().await;
+            if let Some(cached) = cache.as_ref().filter(|cached| {
+                cached.home == home && cached.kit == kit && cached.official == official
+            }) {
+                return cached.value.clone();
+            }
+        }
+        let value = login::request_credentials(home).ok();
+        *self.request_identity_cache.lock().await = Some(RequestIdentityCache {
+            home: home.to_path_buf(),
+            kit,
+            official,
+            value: value.clone(),
+        });
+        value
     }
 
     async fn sync_logged_in_account(&self) {
@@ -559,7 +615,10 @@ impl ProxyHandle {
             }
             #[cfg(not(test))]
             {
-                let auto_region = self.app.vm_identity.lock().await.environment.auto_region;
+                let auto_region = {
+                    let vm = self.app.vm_identity.lock().await;
+                    vm.enabled && vm.environment.auto_region
+                };
                 if auto_region {
                     let template = resolved_proxy(&settings, &self.app.mihomo);
                     if template.trim().is_empty() {
@@ -611,7 +670,9 @@ impl ProxyHandle {
                     .iter()
                     .map(|g| (&g.name, &g.now))
                     .eq(mihomo.groups.iter().map(|g| (&g.name, &g.now)));
-            if let Some(geo) = detected_geo.filter(|_| vm.environment.auto_region && same_node) {
+            if let Some(geo) =
+                detected_geo.filter(|_| vm.enabled && vm.environment.auto_region && same_node)
+            {
                 let mut environment = vm.environment.clone();
                 environment.region = geo.country_code.unwrap_or_default().to_ascii_uppercase();
                 environment.timezone = geo.timezone.unwrap_or_default();
@@ -791,7 +852,7 @@ impl ProxyHandle {
             || old.mihomo_node != next.mihomo_node;
         // A route change must not interleave with a request picking its identity.
         let transition = if route_changed {
-            Some(self.app.transition.lock().await)
+            Some(self.app.transition.write().await)
         } else {
             None
         };
@@ -1189,10 +1250,11 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                                 }
                             }
                         }
-                        Some(Err(_)) => {
+                        Some(Err(error)) => {
                             if let Some(lifecycle) = &tracker.lifecycle {
                                 lifecycle.error();
                             }
+                            tracker.metrics.set_error_message(&error.to_string());
                             tracker.entry.error_kind = Some("response_body".into());
                             tracker.finished = true;
                         }
@@ -1262,6 +1324,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                     finished_at: Some(chrono::Utc::now().to_rfc3339()),
                     http_status: details.response_status,
                     error_kind: details.error_kind.clone(),
+                    error_message: Some(logs::safe_text(&err.to_string(), 512)),
                     ..UsageOutcome::default()
                 });
             }
@@ -1398,6 +1461,7 @@ impl ResponseLogTracker {
                 .usage_seen()
                 .then(|| "provider_response".into()),
             error_kind: self.entry.error_kind.clone(),
+            error_message: self.metrics.error_message().map(str::to_owned),
             service_tier: self.metrics.service_tier().map(str::to_owned),
             first_token_ms: self.metrics.first_token_ms().map(|ms| ms as u64),
             transport: Some(self.entry.transport.clone()),
@@ -1512,6 +1576,7 @@ impl Drop for ResponseLogTracker {
                         .error_kind
                         .clone()
                         .or_else(|| Some("client_cancelled".into())),
+                    error_message: self.metrics.error_message().map(str::to_owned),
                     ..UsageOutcome::default()
                 });
             }
@@ -1733,13 +1798,14 @@ async fn forward_http_tracked(
     } else {
         "http".into()
     };
-    debug_log(&format!(
+    debug_log(format!(
         "[proxy] {} {} body={}bytes encoding={}",
         parts.method,
         path,
         bytes.len(),
         details.content_encoding,
-    ));
+    ))
+    .await;
 
     let request_identity = app.sync_request_identity(Path::new(&home)).await;
     let billing_identity_matches =
@@ -1842,14 +1908,34 @@ async fn forward_http_tracked(
     {
         *activity = Some(app.traffic.begin(account, Instant::now()));
     }
-    let vm = app.vm_identity.lock().await.clone();
-    match identity::rewrite_client_metadata_in_body(&bytes, content_encoding.as_deref(), &vm) {
-        Ok(rewritten) => {
-            bytes = rewritten.into();
-            details.body_bytes = bytes.len();
-        }
-        Err(err) => {
-            eprintln!("[identity] 请求体身份改写失败，保留原正文: {err}");
+    let root_vm = app.vm_identity.lock().await.clone();
+    let mut request_context =
+        identity::request_context_from_body(&bytes, content_encoding.as_deref())
+            .unwrap_or_default();
+    merge_request_context_from_headers(&mut request_context, &parts.headers);
+    // Scope the generated session/window IDs to this client task. A request
+    // without source metadata gets a unique HTTP scope; a request carrying a
+    // Codex session/window deterministically reuses that virtual scope.
+    let request_scope = format!("http:{}", uuid::Uuid::new_v4());
+    let vm = root_vm.scoped_for_request(&request_context, &request_scope);
+    if vm.enabled {
+        match identity::rewrite_client_metadata_in_body_with_context(
+            &bytes,
+            content_encoding.as_deref(),
+            &vm,
+            Some(&request_context),
+        ) {
+            Ok(rewritten) => {
+                bytes = rewritten.into();
+                request_context =
+                    identity::request_context_from_body(&bytes, content_encoding.as_deref())
+                        .unwrap_or(request_context);
+                merge_request_context_from_headers(&mut request_context, &parts.headers);
+                details.body_bytes = bytes.len();
+            }
+            Err(err) => {
+                eprintln!("[identity] 请求体身份改写失败，保留原正文: {err}");
+            }
         }
     }
     // HTTP clients stay on the native HTTP SSE path.  The HTTP→WebSocket
@@ -1877,26 +1963,50 @@ async fn forward_http_tracked(
         .body(bytes);
     for (name, value) in &parts.headers {
         if is_hop(name)
-            || identity::is_vm_identity_header(name.as_str())
+            || (vm.enabled && identity::is_vm_identity_header(name.as_str()))
             || name.as_str().eq_ignore_ascii_case("x-codex-turn-state")
         {
             continue;
         }
         builder = builder.header(name, value);
     }
-    builder = builder
-        .header("user-agent", vm.user_agent())
-        .header("originator", &vm.originator)
-        .header("version", &vm.cli_version)
-        .header("x-codex-installation-id", &vm.installation_id)
-        .header("x-codex-window-id", &vm.window_id)
-        .header("session_id", &vm.session_id);
-    if let Some(model) = request_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty() && !model.chars().any(char::is_control))
-    {
-        builder = builder.header("x-codex-routing-hint", vm.routing_hint(model));
+    if vm.enabled {
+        builder = builder
+            .header("user-agent", vm.user_agent())
+            .header("originator", &vm.originator)
+            .header("version", &vm.cli_version)
+            .header("x-codex-installation-id", &vm.installation_id)
+            .header("x-codex-window-id", &vm.window_id)
+            // `session-id`/`thread-id` are the official Codex headers.
+            .header("session-id", &vm.session_id);
+        let thread_id = request_context
+            .thread_id
+            .as_deref()
+            .unwrap_or(vm.thread_id.as_str());
+        builder = builder
+            .header("thread-id", thread_id)
+            .header("x-client-request-id", thread_id);
+        if let Some(parent_thread_id) = request_context.parent_thread_id.as_deref() {
+            builder = builder.header("x-codex-parent-thread-id", parent_thread_id);
+        }
+        if let Some(subagent) = request_context.subagent.as_deref() {
+            builder = builder.header("x-openai-subagent", subagent);
+        }
+        if let Some(turn_metadata) = request_context.turn_metadata.as_deref() {
+            if turn_metadata.len() <= 8192
+                && turn_metadata.is_ascii()
+                && !turn_metadata.chars().any(char::is_control)
+            {
+                builder = builder.header("x-codex-turn-metadata", turn_metadata);
+            }
+        }
+        if let Some(model) = request_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && !model.chars().any(char::is_control))
+        {
+            builder = builder.header("x-codex-routing-hint", vm.routing_hint(model));
+        }
     }
     let upstream_resp = match builder.send().await {
         Ok(response) => response,
@@ -1974,15 +2084,25 @@ async fn forward_responses_over_ws(
 ) -> Result<Response> {
     let mut frame =
         ws_bridge::http_body_to_ws_request(bytes).map_err(|err| anyhow::anyhow!(err))?;
-    let identity = app.vm_identity.lock().await.clone();
-    identity::rewrite_client_metadata_value(&mut frame, &identity);
+    let mut request_context = identity::request_context_from_value(&frame);
+    merge_request_context_from_headers(&mut request_context, headers);
+    let root_identity = app.vm_identity.lock().await.clone();
+    let request_scope = format!("http-ws:{}", uuid::Uuid::new_v4());
+    let identity = root_identity.scoped_for_request(&request_context, &request_scope);
+    identity::rewrite_client_metadata_value_with_context(
+        &mut frame,
+        &identity,
+        Some(&request_context),
+    );
+    let mut request_context = identity::request_context_from_value(&frame);
+    merge_request_context_from_headers(&mut request_context, headers);
     let model = frame
         .get("model")
         .and_then(|value| value.as_str())
         .unwrap_or("");
     // The pool's sticky `{session}`, so turns reuse the same connections.
     let proxy = app.ws_upstream.resolve_proxy(proxy, None).await?;
-    let dial = ws_dial(target, &proxy, headers, &identity, model)?;
+    let dial = ws_dial(target, &proxy, headers, &identity, model, &request_context)?;
     let (rx, handshake) = app.ws_upstream.open_turn(dial, frame).await?;
     let header_ms = started.elapsed().as_millis();
     details.transport = "http_to_ws".into();
@@ -2031,24 +2151,62 @@ fn ws_dial(
     headers: &HeaderMap,
     identity: &VmIdentity,
     model: &str,
+    request_context: &identity::RequestContext,
 ) -> Result<WsDial> {
     let url = ws_bridge::upstream_to_ws_url(target).map_err(|err| anyhow::anyhow!(err))?;
-    let mut extra_headers = vec![
-        ("user-agent".into(), identity.user_agent()),
-        ("originator".into(), identity.originator.clone()),
-        ("version".into(), identity.cli_version.clone()),
-        (
-            "x-codex-installation-id".into(),
-            identity.installation_id.clone(),
-        ),
-        ("x-codex-window-id".into(), identity.window_id.clone()),
-        ("session_id".into(), identity.session_id.clone()),
-        ("thread-id".into(), identity.thread_id.clone()),
-        ("x-client-request-id".into(), identity.thread_id.clone()),
-    ];
-    let model = model.trim();
-    if !model.is_empty() && !model.chars().any(char::is_control) {
-        extra_headers.push(("x-codex-routing-hint".into(), identity.routing_hint(model)));
+    let mut extra_headers = if identity.enabled {
+        let thread_id = request_context
+            .thread_id
+            .as_deref()
+            .unwrap_or(identity.thread_id.as_str());
+        vec![
+            ("user-agent".into(), identity.user_agent()),
+            ("originator".into(), identity.originator.clone()),
+            ("version".into(), identity.cli_version.clone()),
+            (
+                "x-codex-installation-id".into(),
+                identity.installation_id.clone(),
+            ),
+            ("x-codex-window-id".into(), identity.window_id.clone()),
+            ("session-id".into(), identity.session_id.clone()),
+            ("thread-id".into(), thread_id.to_string()),
+            ("x-client-request-id".into(), thread_id.to_string()),
+        ]
+    } else {
+        headers
+            .iter()
+            .filter(|(name, _)| !is_ws_passthrough_excluded(name))
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .filter(|value| !value.chars().any(char::is_control))
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect()
+    };
+    if identity.enabled {
+        if let Some(parent_thread_id) = request_context.parent_thread_id.as_deref() {
+            extra_headers.push((
+                "x-codex-parent-thread-id".into(),
+                parent_thread_id.to_string(),
+            ));
+        }
+        if let Some(subagent) = request_context.subagent.as_deref() {
+            extra_headers.push(("x-openai-subagent".into(), subagent.to_string()));
+        }
+        if let Some(turn_metadata) = request_context.turn_metadata.as_deref() {
+            if turn_metadata.len() <= 8192
+                && turn_metadata.is_ascii()
+                && !turn_metadata.chars().any(char::is_control)
+            {
+                extra_headers.push(("x-codex-turn-metadata".into(), turn_metadata.to_string()));
+            }
+        }
+        let model = model.trim();
+        if !model.is_empty() && !model.chars().any(char::is_control) {
+            extra_headers.push(("x-codex-routing-hint".into(), identity.routing_hint(model)));
+        }
     }
     Ok(WsDial {
         url,
@@ -2056,7 +2214,21 @@ fn ws_dial(
         authorization: header_string(headers, "authorization"),
         account_id: header_string(headers, "chatgpt-account-id"),
         extra_headers,
+        preserve_client_identity: !identity.enabled,
     })
+}
+
+fn is_ws_passthrough_excluded(name: &HeaderName) -> bool {
+    is_hop(name)
+        || matches!(
+            name.as_str().to_ascii_lowercase().as_str(),
+            "authorization"
+                | "chatgpt-account-id"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "sec-websocket-extensions"
+                | "sec-websocket-protocol"
+        )
 }
 
 fn header_string(headers: &HeaderMap, name: &str) -> String {
@@ -2066,6 +2238,71 @@ fn header_string(headers: &HeaderMap, name: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty() && value.is_ascii() && !value.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+}
+
+fn merge_request_context_from_headers(context: &mut identity::RequestContext, headers: &HeaderMap) {
+    if context.session_id.is_none() {
+        context.session_id =
+            header_value(headers, "session-id").or_else(|| header_value(headers, "session_id"));
+    }
+    if context.window_id.is_none() {
+        context.window_id = header_value(headers, "x-codex-window-id")
+            .or_else(|| header_value(headers, "window_id"));
+    }
+    if context.thread_id.is_none() {
+        context.thread_id = header_value(headers, "thread-id")
+            .or_else(|| header_value(headers, "x-client-request-id"));
+    }
+    if context.parent_thread_id.is_none() {
+        context.parent_thread_id = header_value(headers, "x-codex-parent-thread-id");
+    }
+    if context.subagent.is_none() {
+        context.subagent = header_value(headers, "x-openai-subagent");
+    }
+    if context.turn_metadata.is_none() {
+        if let Some(value) = header_value(headers, "x-codex-turn-metadata") {
+            if let Ok(serde_json::Value::Object(snapshot)) =
+                serde_json::from_str::<serde_json::Value>(&value)
+            {
+                context.turn_metadata = Some(value);
+                if context.thread_id.is_none() {
+                    context.thread_id = snapshot
+                        .get("thread_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                }
+                if context.turn_id.is_none() {
+                    context.turn_id = snapshot
+                        .get("turn_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                }
+                if context.parent_thread_id.is_none() {
+                    context.parent_thread_id = snapshot
+                        .get("parent_thread_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                }
+                if context.subagent.is_none() {
+                    context.subagent = snapshot
+                        .get("subagent_kind")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                }
+            }
+        }
+    }
 }
 
 async fn proxy_ws(app: Arc<App>, req: Request<Body>) -> Response {
@@ -2086,6 +2323,10 @@ async fn client_ws_session(
     client_headers: HeaderMap,
     mut socket: WebSocket,
 ) -> Result<()> {
+    // Frames without session/window metadata still belong to this client
+    // WebSocket. Keep one fallback scope for the socket instead of sharing the
+    // process-wide runtime IDs with other windows.
+    let socket_scope = format!("ws:{}", uuid::Uuid::new_v4());
     loop {
         let message = match socket.recv().await {
             Some(Ok(message)) => message,
@@ -2098,7 +2339,17 @@ async fn client_ws_session(
             WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => continue,
         };
         let started = Instant::now();
-        let (frame, client_model) = prepare_client_ws_frame(&app, &text).await?;
+        let mut header_context = identity::RequestContext::default();
+        merge_request_context_from_headers(&mut header_context, &client_headers);
+        let root_identity = app.vm_identity.lock().await.clone();
+        let (frame, client_model, scoped_identity) = prepare_client_ws_frame(
+            &app,
+            &text,
+            Some(&header_context),
+            &root_identity,
+            &socket_scope,
+        )
+        .await?;
         let model = frame
             .get("model")
             .and_then(|value| value.as_str())
@@ -2129,10 +2380,21 @@ async fn client_ws_session(
                     .map(str::to_string),
             )
         });
-        let dial = match current_ws_dial(&app, &client_headers, &model).await {
+        let mut request_context = identity::request_context_from_value(&frame);
+        merge_request_context_from_headers(&mut request_context, &client_headers);
+        let dial = match current_ws_dial(
+            &app,
+            &client_headers,
+            &model,
+            &request_context,
+            &scoped_identity,
+        )
+        .await
+        {
             Ok(dial) => dial,
             Err(err) => {
                 let mut metrics = logs::ResponseBodyMetrics::new("");
+                let error_message = err.to_string();
                 finish_client_ws_turn(
                     &app,
                     account.as_ref(),
@@ -2141,6 +2403,8 @@ async fn client_ws_session(
                     billing,
                     &mut metrics,
                     true,
+                    None,
+                    Some(error_message.as_str()),
                     Some(&diag_req),
                 )
                 .await;
@@ -2153,6 +2417,7 @@ async fn client_ws_session(
             Ok(opened) => opened,
             Err(err) => {
                 let mut metrics = logs::ResponseBodyMetrics::new("");
+                let error_message = err.to_string();
                 finish_client_ws_turn(
                     &app,
                     account.as_ref(),
@@ -2161,6 +2426,8 @@ async fn client_ws_session(
                     billing,
                     &mut metrics,
                     true,
+                    None,
+                    Some(error_message.as_str()),
                     Some(&diag_req),
                 )
                 .await;
@@ -2172,18 +2439,25 @@ async fn client_ws_session(
         let mut metrics = logs::ResponseBodyMetrics::new("");
         metrics.observe_headers(&handshake);
         let mut failed = false;
+        let mut failure_kind = None;
+        let mut failure_message = None;
         while let Some(event) = rx.recv().await {
             match event {
                 Ok(json) => {
-                    let line = ws_bridge::ws_event_to_sse_line(&json);
-                    metrics.observe(line.as_bytes(), started.elapsed().as_millis(), true);
-                    if socket.send(WsMessage::text(json)).await.is_err() {
+                    // Native WS frames are already complete JSON events. Parse
+                    // them before forwarding so a large terminal frame cannot
+                    // be discarded by the bounded SSE inspector.
+                    metrics.observe_ws_event(&json, started.elapsed().as_millis());
+                    if let Err(error) = socket.send(WsMessage::text(json)).await {
                         failed = true;
+                        failure_kind = Some("client_send");
+                        failure_message = Some(error.to_string());
                         break;
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     failed = true;
+                    failure_message = Some(error.to_string());
                     let fail = serde_json::json!({"type":"response.incomplete"});
                     let _ = socket.send(WsMessage::text(fail.to_string())).await;
                     break;
@@ -2199,6 +2473,8 @@ async fn client_ws_session(
             billing,
             &mut metrics,
             failed,
+            failure_kind,
+            failure_message.as_deref(),
             Some(&diag_req),
         )
         .await;
@@ -2210,7 +2486,10 @@ async fn client_ws_session(
 async fn prepare_client_ws_frame(
     app: &App,
     text: &str,
-) -> Result<(serde_json::Value, Option<String>)> {
+    request_context: Option<&identity::RequestContext>,
+    root_identity: &VmIdentity,
+    fallback_scope: &str,
+) -> Result<(serde_json::Value, Option<String>, VmIdentity)> {
     let mut frame: serde_json::Value =
         serde_json::from_str(text).context("客户端 WebSocket 帧不是 JSON")?;
     let client_model = frame
@@ -2226,9 +2505,37 @@ async fn prepare_client_ws_frame(
     if frame.get("type").is_none() {
         frame["type"] = serde_json::json!("response.create");
     }
-    let identity = app.vm_identity.lock().await.clone();
-    identity::rewrite_client_metadata_value(&mut frame, &identity);
-    Ok((frame, client_model))
+    let mut frame_context = identity::request_context_from_value(&frame);
+    if let Some(request_context) = request_context {
+        if frame_context.session_id.is_none() {
+            frame_context.session_id = request_context.session_id.clone();
+        }
+        if frame_context.window_id.is_none() {
+            frame_context.window_id = request_context.window_id.clone();
+        }
+        if frame_context.thread_id.is_none() {
+            frame_context.thread_id = request_context.thread_id.clone();
+        }
+        if frame_context.turn_id.is_none() {
+            frame_context.turn_id = request_context.turn_id.clone();
+        }
+        if frame_context.parent_thread_id.is_none() {
+            frame_context.parent_thread_id = request_context.parent_thread_id.clone();
+        }
+        if frame_context.subagent.is_none() {
+            frame_context.subagent = request_context.subagent.clone();
+        }
+        if frame_context.turn_metadata.is_none() {
+            frame_context.turn_metadata = request_context.turn_metadata.clone();
+        }
+    }
+    let identity = root_identity.scoped_for_request(&frame_context, fallback_scope);
+    identity::rewrite_client_metadata_value_with_context(
+        &mut frame,
+        &identity,
+        Some(&frame_context),
+    );
+    Ok((frame, client_model, identity))
 }
 
 /// Who a WebSocket turn is billed to and logged as.
@@ -2254,8 +2561,14 @@ async fn ws_billing_account(app: &App, client_headers: &HeaderMap) -> Option<Bil
     })
 }
 
-async fn current_ws_dial(app: &App, client_headers: &HeaderMap, model: &str) -> Result<WsDial> {
-    business_ws_dial(app, client_headers, model, false).await
+async fn current_ws_dial(
+    app: &App,
+    client_headers: &HeaderMap,
+    model: &str,
+    request_context: &identity::RequestContext,
+    identity: &VmIdentity,
+) -> Result<WsDial> {
+    business_ws_dial(app, client_headers, model, request_context, identity, false).await
 }
 
 /// The dial the pool keeps warm: Kit's own login, since there is no client
@@ -2270,13 +2583,24 @@ async fn warm_ws_dial(app: &App) -> Result<WsDial> {
         .forced_model()
         .map(str::to_string)
         .unwrap_or_else(|| app.ws_upstream.last_model());
-    business_ws_dial(app, &HeaderMap::new(), &model, true).await
+    let identity = app.vm_identity.lock().await.clone();
+    business_ws_dial(
+        app,
+        &HeaderMap::new(),
+        &model,
+        &identity::RequestContext::default(),
+        &identity,
+        true,
+    )
+    .await
 }
 
 async fn business_ws_dial(
     app: &App,
     client_headers: &HeaderMap,
     model: &str,
+    request_context: &identity::RequestContext,
+    identity: &VmIdentity,
     require_login: bool,
 ) -> Result<WsDial> {
     let settings = app.settings.lock().await.clone();
@@ -2305,8 +2629,14 @@ async fn business_ws_dial(
         );
     }
     let proxy = app.ws_upstream.resolve_proxy(&template, None).await?;
-    let identity = app.vm_identity.lock().await.clone();
-    ws_dial(&settings.upstream, &proxy, &headers, &identity, model)
+    ws_dial(
+        &settings.upstream,
+        &proxy,
+        &headers,
+        &identity,
+        model,
+        request_context,
+    )
 }
 
 async fn finish_client_ws_turn(
@@ -2317,14 +2647,31 @@ async fn finish_client_ws_turn(
     billing: Option<BillingRequest>,
     metrics: &mut logs::ResponseBodyMetrics,
     failed: bool,
+    failure_kind: Option<&str>,
+    failure_message: Option<&str>,
     diag_req: Option<&diag::Request>,
 ) {
+    // A protocol terminal event is a completed WebSocket exchange at the
+    // transport layer. Keep its HTTP-compatible 200 status while preserving
+    // the protocol error kind; only a broken socket is a 502 transport error.
+    let error_kind = metrics
+        .error_kind
+        .map(str::to_owned)
+        .or_else(|| failure_kind.map(str::to_owned))
+        .or_else(|| failed.then(|| "ws_upstream".into()));
+    let error_message = metrics
+        .error_message()
+        .map(str::to_owned)
+        .or_else(|| failure_message.map(str::to_owned));
+    let status = if failed { 502 } else { 200 };
     diag::emit(
         "ws_finish",
         diag_req,
         json!({
-            "status": if failed { 502 } else { 200 },
-            "failed": failed,
+            "status": status,
+            "failed": error_kind.is_some(),
+            "error": error_kind,
+            "errorMessage": error_message,
             "usageSeen": metrics.usage_seen(),
             "inputTokens": metrics.input_tokens(),
             "outputTokens": metrics.output_tokens(),
@@ -2338,7 +2685,7 @@ async fn finish_client_ws_turn(
             && metrics.input_tokens().is_some()
             && metrics.output_tokens().is_some();
         request.settle(UsageOutcome {
-            state: if failed {
+            state: if error_kind.is_some() {
                 UsageState::Interrupted
             } else if usage_complete {
                 UsageState::Measured
@@ -2346,11 +2693,12 @@ async fn finish_client_ws_turn(
                 UsageState::MissingUsage
             },
             finished_at: Some(chrono::Utc::now().to_rfc3339()),
-            http_status: Some(if failed { 502 } else { 200 }),
+            http_status: Some(status),
             response_model: metrics.upstream_response_model().map(str::to_owned),
             usage: metrics.token_usage(),
             usage_source: metrics.usage_seen().then(|| "provider_response".into()),
-            error_kind: failed.then(|| "ws_upstream".into()),
+            error_kind: error_kind.clone(),
+            error_message: error_message.clone(),
             service_tier: metrics.service_tier().map(str::to_owned),
             first_token_ms: metrics.first_token_ms().map(|ms| ms as u64),
             transport: Some("ws_to_ws".into()),
@@ -2374,17 +2722,10 @@ async fn finish_client_ws_turn(
     details.account_id = account.map(|account| account.id.clone());
     details.account_email = account.and_then(|account| account.email.clone());
     details.in_progress = false;
-    if failed {
-        details.error_kind = Some("ws_upstream".into());
-    }
-    app.record(
-        "WS",
-        "/responses",
-        if failed { 502 } else { 200 },
-        started,
-        details,
-    )
-    .await;
+    details.error_kind = error_kind.clone();
+    details.diag = diag_req.cloned();
+    app.record("WS", "/responses", status, started, details)
+        .await;
 }
 
 fn is_hop(name: &HeaderName) -> bool {
@@ -2579,6 +2920,15 @@ mod tests {
             .unwrap(),
         );
         let identity = app.vm_identity.lock().await.clone();
+        let expected_identity = identity.scoped_for_request(
+            &identity::RequestContext {
+                session_id: Some("client-session".into()),
+                window_id: Some("client-window".into()),
+                thread_id: Some("thread-keep".into()),
+                ..Default::default()
+            },
+            "test-http",
+        );
         let server = tokio::spawn(async move {
             axum::serve(listener, upstream).await.unwrap();
         });
@@ -2611,9 +2961,12 @@ mod tests {
         assert_eq!(headers["user-agent"], identity.user_agent());
         assert_eq!(headers["originator"], identity.originator);
         assert_eq!(headers["version"], identity.cli_version);
-        assert_eq!(headers["session_id"], identity.session_id);
+        assert_eq!(headers["session-id"], expected_identity.session_id);
+        assert!(headers.get("session_id").is_none());
         assert_eq!(headers["x-codex-installation-id"], identity.installation_id);
-        assert_eq!(headers["x-codex-window-id"], identity.window_id);
+        assert_eq!(headers["x-codex-window-id"], expected_identity.window_id);
+        assert_eq!(headers["thread-id"], "thread-keep");
+        assert_eq!(headers["x-client-request-id"], "thread-keep");
         assert_eq!(headers["x-codex-routing-hint"], "model=gpt-test");
         assert!(headers.get("x-codex-turn-metadata").is_none());
         assert!(headers.get(header::COOKIE).is_none());
@@ -2624,10 +2977,68 @@ mod tests {
             metadata["x-codex-installation-id"],
             identity.installation_id
         );
-        assert_eq!(metadata["session_id"], identity.session_id);
-        assert_eq!(metadata["x-codex-window-id"], identity.window_id);
+        assert_eq!(metadata["session_id"], expected_identity.session_id);
+        assert_eq!(metadata["x-codex-window-id"], expected_identity.window_id);
         assert_eq!(metadata["thread_id"], "thread-keep");
         assert_eq!(metadata["turn_id"], "turn-keep");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn business_forward_passes_client_identity_when_vm_is_disabled() {
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<(HeaderMap, Vec<u8>)>();
+        let upstream = axum::Router::new().fallback(move |req: Request<Body>| {
+            let sent = sent.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap();
+                sent.send((parts.headers, bytes.to_vec())).unwrap();
+                "ok"
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = Arc::new(
+            App::new(Settings {
+                upstream: format!("http://{}", listener.local_addr().unwrap()),
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        app.vm_identity.lock().await.enabled = false;
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let body = br#"{"model":"gpt-test","client_metadata":{"x-codex-installation-id":"client-install","session_id":"client-session","x-codex-window-id":"client-window","thread_id":"thread-keep"}}"#;
+        let response = proxy_http(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("user-agent", "client-ua")
+                .header("originator", "client-origin")
+                .header("version", "9.9.9")
+                .header("session_id", "client-session")
+                .header("x-codex-installation-id", "client-install")
+                .header("x-codex-window-id", "client-window")
+                .header("x-codex-routing-hint", "model=client")
+                .body(Body::from(body.to_vec()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let (headers, forwarded) = received.recv().await.unwrap();
+        assert_eq!(headers["user-agent"], "client-ua");
+        assert_eq!(headers["originator"], "client-origin");
+        assert_eq!(headers["version"], "9.9.9");
+        assert_eq!(headers["session_id"], "client-session");
+        assert_eq!(headers["x-codex-installation-id"], "client-install");
+        assert_eq!(headers["x-codex-window-id"], "client-window");
+        assert_eq!(headers["x-codex-routing-hint"], "model=client");
+        assert_eq!(forwarded, body);
         server.abort();
     }
 
@@ -2645,8 +3056,10 @@ mod tests {
             &headers,
             &identity,
             "gpt-test",
+            &identity::RequestContext::default(),
         )
         .unwrap();
+        assert!(!dial.preserve_client_identity);
         let extra = |name: &str| {
             dial.extra_headers
                 .iter()
@@ -2658,12 +3071,48 @@ mod tests {
         assert_eq!(dial.account_id, "acct");
         assert_eq!(extra("user-agent"), identity.user_agent());
         assert_eq!(extra("x-codex-installation-id"), identity.installation_id);
-        assert_eq!(extra("session_id"), identity.session_id);
+        assert_eq!(extra("session-id"), identity.session_id);
         assert_eq!(extra("x-codex-window-id"), identity.window_id);
         assert_eq!(extra("thread-id"), identity.thread_id);
         assert_eq!(extra("x-client-request-id"), identity.thread_id);
         assert_eq!(extra("x-codex-routing-hint"), "model=gpt-test");
         assert!(!extra("user-agent").contains("client-ua"));
+    }
+
+    #[test]
+    fn ws_dial_passes_client_identity_when_vm_is_disabled() {
+        let mut identity = VmIdentity::ephemeral();
+        identity.enabled = false;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        headers.insert("chatgpt-account-id", "acct".parse().unwrap());
+        headers.insert("user-agent", "client-ua".parse().unwrap());
+        headers.insert("originator", "client-origin".parse().unwrap());
+        headers.insert("version", "9.9.9".parse().unwrap());
+        headers.insert("x-codex-installation-id", "client-install".parse().unwrap());
+        headers.insert("x-codex-routing-hint", "model=client".parse().unwrap());
+        let dial = ws_dial(
+            "https://chatgpt.com/backend-api/codex/responses",
+            "",
+            &headers,
+            &identity,
+            "gpt-test",
+            &identity::RequestContext::default(),
+        )
+        .unwrap();
+        let extra = |name: &str| {
+            dial.extra_headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert!(dial.preserve_client_identity);
+        assert_eq!(extra("user-agent"), Some("client-ua"));
+        assert_eq!(extra("originator"), Some("client-origin"));
+        assert_eq!(extra("version"), Some("9.9.9"));
+        assert_eq!(extra("x-codex-installation-id"), Some("client-install"));
+        assert_eq!(extra("x-codex-routing-hint"), Some("model=client"));
+        assert!(extra("session-id").is_none());
     }
 
     #[tokio::test]
@@ -2674,20 +3123,37 @@ mod tests {
         })
         .unwrap();
         let identity = app.vm_identity.lock().await.clone();
-        let (frame, client_model) = prepare_client_ws_frame(
+        let root_identity = app.vm_identity.lock().await.clone();
+        let (frame, client_model, _) = prepare_client_ws_frame(
             &app,
             r#"{"type":"response.create","model":"gpt-test","client_metadata":{"x-codex-installation-id":"client","session_id":"client","x-codex-window-id":"client","thread_id":"keep","turn_id":"turn"}}"#,
+            None,
+            &root_identity,
+            "test-ws",
         )
         .await
         .unwrap();
+        let expected_identity = identity.scoped_for_request(
+            &identity::RequestContext {
+                session_id: Some("client".into()),
+                window_id: Some("client".into()),
+                thread_id: Some("keep".into()),
+                turn_id: Some("turn".into()),
+                ..Default::default()
+            },
+            "test-ws",
+        );
         assert_eq!(
             frame["client_metadata"]["x-codex-installation-id"],
             identity.installation_id
         );
-        assert_eq!(frame["client_metadata"]["session_id"], identity.session_id);
+        assert_eq!(
+            frame["client_metadata"]["session_id"],
+            expected_identity.session_id
+        );
         assert_eq!(
             frame["client_metadata"]["x-codex-window-id"],
-            identity.window_id
+            expected_identity.window_id
         );
         assert_eq!(frame["client_metadata"]["thread_id"], "keep");
         assert_eq!(frame["client_metadata"]["turn_id"], "turn");
@@ -2993,5 +3459,133 @@ mod tests {
         let record = app.billing.get_by_id(&event.request_id).unwrap().unwrap();
         assert!(record.downgrade.is_some());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_protocol_errors_preserve_200_and_bill_as_interrupted() {
+        for event_type in ["error", "response.failed", "response.incomplete"] {
+            let app = Arc::new(App::new(Settings::default()).unwrap());
+            let account = BillingAccount {
+                id: "account-protocol".into(),
+                email: Some("protocol@example.com".into()),
+            };
+            let billing = app
+                .begin_ws_billing(
+                    Instant::now(),
+                    &account,
+                    Some("gpt-test"),
+                    Some("gpt-test"),
+                    None,
+                )
+                .unwrap();
+            let request_id = billing.request_id.clone();
+            let mut metrics = logs::ResponseBodyMetrics::new("");
+            let event = match event_type {
+                "error" => r#"data: {"type":"error","error":{"message":"provider rejected"}}
+
+"#
+                .to_string(),
+                "response.failed" => {
+                    r#"data: {"type":"response.failed","error":{"code":"rate_limit","message":"try later"}}
+
+"#
+                        .to_string()
+                }
+                _ => {
+                    r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"timeout"}}}
+
+"#
+                        .to_string()
+                }
+            };
+            metrics.observe(event.as_bytes(), 1, true);
+            metrics.finish(2);
+
+            finish_client_ws_turn(
+                &app,
+                Some(&account),
+                "gpt-test",
+                Instant::now(),
+                Some(billing),
+                &mut metrics,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+            let record = app.billing.get_by_id(&request_id).unwrap().unwrap();
+            let expected_error = if event_type == "response.incomplete" {
+                "response_incomplete"
+            } else {
+                "response_failed"
+            };
+            let expected_message = match event_type {
+                "error" => Some("message=provider rejected"),
+                "response.failed" => Some("code=rate_limit; message=try later"),
+                _ => Some("reason=timeout"),
+            };
+            assert_eq!(record.state, UsageState::Interrupted, "{event_type}");
+            assert_eq!(record.http_status, Some(200), "{event_type}");
+            assert_eq!(
+                record.error_kind.as_deref(),
+                Some(expected_error),
+                "{event_type}"
+            );
+            assert_eq!(
+                record.error_message.as_deref(),
+                expected_message,
+                "{event_type}"
+            );
+            let entry = app.logs.lock().await.back().unwrap().snapshot();
+            assert_eq!(entry.status, 200, "{event_type}");
+            assert_eq!(
+                entry.error_kind.as_deref(),
+                Some(expected_error),
+                "{event_type}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_transport_failure_remains_502_and_ws_upstream() {
+        let app = Arc::new(App::new(Settings::default()).unwrap());
+        let account = BillingAccount {
+            id: "account-transport".into(),
+            email: None,
+        };
+        let billing = app
+            .begin_ws_billing(
+                Instant::now(),
+                &account,
+                Some("gpt-test"),
+                Some("gpt-test"),
+                None,
+            )
+            .unwrap();
+        let request_id = billing.request_id.clone();
+        let mut metrics = logs::ResponseBodyMetrics::new("");
+        finish_client_ws_turn(
+            &app,
+            Some(&account),
+            "gpt-test",
+            Instant::now(),
+            Some(billing),
+            &mut metrics,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let record = app.billing.get_by_id(&request_id).unwrap().unwrap();
+        assert_eq!(record.state, UsageState::Interrupted);
+        assert_eq!(record.http_status, Some(502));
+        assert_eq!(record.error_kind.as_deref(), Some("ws_upstream"));
+        let entry = app.logs.lock().await.back().unwrap().snapshot();
+        assert_eq!(entry.status, 502);
+        assert_eq!(entry.error_kind.as_deref(), Some("ws_upstream"));
     }
 }

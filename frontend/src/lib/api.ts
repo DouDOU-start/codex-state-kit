@@ -58,6 +58,7 @@ const defaultStatus = (): Status => ({
     error: null,
   },
   vmIdentity: {
+    enabled: true,
     installationId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     sessionId: "11111111-2222-4333-8444-555555555555",
     platform: "mac",
@@ -275,7 +276,12 @@ function mockUserAgent(identity: VmIdentityView): string {
 
 export async function updateVmIdentity(profile: VmProfile): Promise<Status> {
   if (isTauri) return invoke<Status>("update_vm_identity", { profile });
-  const vmIdentity = { ...mockStatus.vmIdentity, platform: profile.platform, ...MOCK_PLATFORMS[profile.platform] };
+  const vmIdentity = {
+    ...mockStatus.vmIdentity,
+    ...(profile.enabled === undefined ? {} : { enabled: profile.enabled }),
+    platform: profile.platform,
+    ...MOCK_PLATFORMS[profile.platform],
+  };
   if (profile.environment) vmIdentity.environment = profile.environment;
   mockStatus = { ...mockStatus, vmIdentity: { ...vmIdentity, userAgent: mockUserAgent(vmIdentity) } };
   return cloneStatus();

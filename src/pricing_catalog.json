@@ -1,6 +1,6 @@
 {
- "source_sha256": "b746b9d7c04703f4ddeed8a8ba606d358b60e152398578936e17672d3059722b",
- "fetched_at": "2026-09-23T15:58:30.707Z",
+ "source_sha256": "94280ea5783a8203e6258d4e35e8ad0f32e94c84fc99a2ed6efae9f0409992d7",
+ "fetched_at": "2026-09-24T15:36:01.070Z",
  "models": {
   "codex-auto-review": {
    "cache_creation_input_token_cost": 2.5e-7,

@@ -3,11 +3,15 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(test))]
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Mutex, OnceLock};
 
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+#[cfg(not(test))]
+static WRITE_QUEUE: OnceLock<SyncSender<String>> = OnceLock::new();
 
 pub fn path() -> PathBuf {
     crate::settings::home_dir().join(if crate::settings::is_dev_mode() {
@@ -62,6 +66,31 @@ pub fn emit(stage: &str, req: Option<&Request>, extra: Value) {
 }
 
 fn write_line(line: &str) {
+    // Diagnostics must never hold up a forwarding task on filesystem I/O.
+    // Tests keep the synchronous path so assertions can inspect the file
+    // immediately; production uses one bounded writer thread.
+    #[cfg(not(test))]
+    {
+        let sender = WRITE_QUEUE.get_or_init(|| {
+            let (sender, receiver) = sync_channel::<String>(2048);
+            std::thread::Builder::new()
+                .name("codex-state-kit-diag".into())
+                .spawn(move || {
+                    while let Ok(line) = receiver.recv() {
+                        write_line_sync(&line);
+                    }
+                })
+                .expect("spawn diagnostics writer");
+            sender
+        });
+        let _ = sender.try_send(line.to_owned());
+        return;
+    }
+    #[cfg(test)]
+    write_line_sync(line);
+}
+
+fn write_line_sync(line: &str) {
     let _guard = WRITE_LOCK.get_or_init(|| Mutex::new(())).lock();
     let path = path();
     if let Ok(meta) = fs::metadata(&path) {

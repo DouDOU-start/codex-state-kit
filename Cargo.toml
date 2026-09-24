@@ -39,11 +39,12 @@ base64 = "0.22"
 serde_yaml = "0.9"
 url = "2"
 rand = "0.9"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5", "v7"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 flate2 = "1"
 zstd = "0.13"
+fs2 = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }

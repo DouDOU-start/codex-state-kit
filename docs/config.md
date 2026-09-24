@@ -43,9 +43,12 @@ openai_base_url = "http://127.0.0.1:8787"
 | 使用记录 | `~/.codex-state-kit-billing.sqlite3` | `~/.codex-state-kit-dev-billing.sqlite3` |
 | 模型价格缓存 | `~/.codex-state-kit-pricing.json` | `~/.codex-state-kit-dev-pricing.json` |
 | 虚拟设备 | `~/.codex-state-kit-vm.json` | `~/.codex-state-kit-dev-vm.json` |
+| 虚拟设备 installation ID | `~/.codex-state-kit-installation_id` | `~/.codex-state-kit-dev-installation_id` |
 | 本机代理端口 | `8787` | `8788` |
 
 账号相关文件保存在所选工作目录中，见[账号与登录](accounts.md#登录文件)。订阅内核的数据位于系统应用数据目录下的 `mihomo/`（开发版为 `dev/mihomo/`）。旧版的 Turn-State 缓存文件 `~/.codex-state-kit-token.json` 和内置 WARP 的数据目录（应用数据目录下的 `warp/`）已不再使用，启动时会自动删除。
+
+虚拟设备配置文件由界面维护。字段 `enabled` 控制是否模拟设备和模型环境，默认值为 `true`；关闭后请求中的客户端设备与环境信息原样透传。旧文件没有该字段时仍按 `true` 读取。多窗口请求按来源 session/window 映射到稳定的虚拟作用域；没有来源标识的 HTTP 请求按请求隔离，WebSocket 按连接隔离。持久化的 `installation_id` 同时写入独立的 sidecar 文件，并在写入时加锁和同步，避免并发启动时生成多个设备身份。
 
 同一版本只能运行一个 Kit：再次启动时会直接切到已打开的窗口。开发版与正式版的应用数据分开保存，但默认 Codex 工作目录相同，不要让两者同时管理同一个工作目录。
 

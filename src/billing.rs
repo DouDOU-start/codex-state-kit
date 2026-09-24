@@ -96,7 +96,12 @@ pub struct UsageOutcome {
     pub response_model: Option<String>,
     pub usage: TokenUsage,
     pub usage_source: Option<String>,
+    /// Stable category for grouping/compatibility. Keep provider-specific
+    /// details in `error_message` so this field remains low-cardinality.
     pub error_kind: Option<String>,
+    /// Human-readable forwarding failure detail retained for diagnostics.
+    #[serde(default)]
+    pub error_message: Option<String>,
     /// `service_tier` reported by the response.
     #[serde(default)]
     pub service_tier: Option<String>,
@@ -168,10 +173,11 @@ pub struct UsageRecord {
     pub cost_nanos: Option<i64>,
     pub currency: Option<String>,
     pub error_kind: Option<String>,
+    pub error_message: Option<String>,
 }
 
 /// Columns read by [`row_to_record`], in order.
-const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos,u.first_token_ms,u.transport,u.downgrade";
+const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.error_message,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos,u.first_token_ms,u.transport,u.downgrade";
 
 /// (state, source, provider, sent_model, started_at, requested_service_tier)
 type PendingRow = (
@@ -231,6 +237,9 @@ pub struct UsageTotals {
     pub request_count: u64,
     pub measured_request_count: u64,
     pub unknown_usage_count: u64,
+    pub interrupted_request_count: u64,
+    pub pending_request_count: u64,
+    pub missing_usage_count: u64,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_write_tokens: u64,
@@ -253,6 +262,9 @@ impl Default for UsageTotals {
             request_count: 0,
             measured_request_count: 0,
             unknown_usage_count: 0,
+            interrupted_request_count: 0,
+            pending_request_count: 0,
+            missing_usage_count: 0,
             input_tokens: 0,
             cached_input_tokens: 0,
             cache_write_tokens: 0,
@@ -404,7 +416,7 @@ impl BillingStore {
                source TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, state TEXT NOT NULL,\
                http_status INTEGER, requested_model TEXT, sent_model TEXT, response_model TEXT,\
                input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER, usage_source TEXT,\
-               pricing_rule_id INTEGER REFERENCES pricing_rules(id), cost_nanos INTEGER, currency TEXT, error_kind TEXT\
+               pricing_rule_id INTEGER REFERENCES pricing_rules(id), cost_nanos INTEGER, currency TEXT, error_kind TEXT, error_message TEXT\
              );\
              CREATE INDEX IF NOT EXISTS usage_by_account_time ON usage_records(account_id, started_at);\
              CREATE INDEX IF NOT EXISTS usage_by_state_time ON usage_records(state, started_at);\
@@ -450,6 +462,19 @@ impl BillingStore {
         }
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)",
+            [],
+        )?;
+        // Version 3: retain the provider's diagnostic text separately from
+        // the stable, low-cardinality error_kind.
+        let existing: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('usage_records')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !existing.iter().any(|name| name == "error_message") {
+            conn.execute_batch("ALTER TABLE usage_records ADD COLUMN error_message TEXT")?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)",
             [],
         )?;
         Ok(())
@@ -566,8 +591,8 @@ impl BillingStore {
             Verdict::Suspected => "suspected",
         });
         tx.execute(
-            "UPDATE usage_records SET finished_at=?2, state=?3, http_status=?4, response_model=?5, input_tokens=?6, cached_input_tokens=?7, output_tokens=?8, usage_source=?9, pricing_rule_id=?10, cost_nanos=?11, currency=?12, error_kind=?13, cache_write_tokens=?14, reasoning_tokens=?15, pricing_model=?16, service_tier=?17, long_context=?18, input_cost_nanos=?19, cache_read_cost_nanos=?20, cache_write_cost_nanos=?21, output_cost_nanos=?22, first_token_ms=?23, transport=?24, downgrade=?25, downgrade_verdict=?26, reported_service_tier=?27 WHERE request_id=?1",
-            params![request_id, outcome.finished_at, state.as_str(), outcome.http_status.map(i64::from), outcome.response_model, tokens(outcome.usage.input_tokens), tokens(outcome.usage.cached_input_tokens), tokens(outcome.usage.output_tokens), outcome.usage_source, priced.rule_id, priced.total, priced.currency, outcome.error_kind, tokens(outcome.usage.cache_write_tokens), tokens(outcome.usage.reasoning_tokens), priced.model, priced.tier.map(ServiceTier::as_str), priced.long_context, priced.input, priced.cache_read, priced.cache_write, priced.output, tokens(outcome.first_token_ms), outcome.transport, downgrade_json, downgrade_verdict, outcome.service_tier],
+            "UPDATE usage_records SET finished_at=?2, state=?3, http_status=?4, response_model=?5, input_tokens=?6, cached_input_tokens=?7, output_tokens=?8, usage_source=?9, pricing_rule_id=?10, cost_nanos=?11, currency=?12, error_kind=?13, error_message=?14, cache_write_tokens=?15, reasoning_tokens=?16, pricing_model=?17, service_tier=?18, long_context=?19, input_cost_nanos=?20, cache_read_cost_nanos=?21, cache_write_cost_nanos=?22, output_cost_nanos=?23, first_token_ms=?24, transport=?25, downgrade=?26, downgrade_verdict=?27, reported_service_tier=?28 WHERE request_id=?1",
+            params![request_id, outcome.finished_at, state.as_str(), outcome.http_status.map(i64::from), outcome.response_model, tokens(outcome.usage.input_tokens), tokens(outcome.usage.cached_input_tokens), tokens(outcome.usage.output_tokens), outcome.usage_source, priced.rule_id, priced.total, priced.currency, outcome.error_kind, outcome.error_message, tokens(outcome.usage.cache_write_tokens), tokens(outcome.usage.reasoning_tokens), priced.model, priced.tier.map(ServiceTier::as_str), priced.long_context, priced.input, priced.cache_read, priced.cache_write, priced.output, tokens(outcome.first_token_ms), outcome.transport, downgrade_json, downgrade_verdict, outcome.service_tier],
         )?;
         tx.commit()?;
         drop(conn);
@@ -749,6 +774,7 @@ impl BillingStore {
                 finished_at,
                 http_status: status,
                 error_kind: error.map(str::to_owned),
+                error_message: error.map(str::to_owned),
                 ..UsageOutcome::default()
             },
         )
@@ -768,6 +794,7 @@ impl BillingStore {
                 finished_at,
                 http_status: status,
                 error_kind: error.map(str::to_owned),
+                error_message: error.map(str::to_owned),
                 ..UsageOutcome::default()
             },
         )
@@ -967,6 +994,24 @@ fn add_totals(
             .unknown_usage_count
             .saturating_add(count.max(0) as u64);
     }
+    match state {
+        "interrupted" => {
+            target.interrupted_request_count = target
+                .interrupted_request_count
+                .saturating_add(count.max(0) as u64);
+        }
+        "pending" => {
+            target.pending_request_count = target
+                .pending_request_count
+                .saturating_add(count.max(0) as u64);
+        }
+        "missing_usage" => {
+            target.missing_usage_count = target
+                .missing_usage_count
+                .saturating_add(count.max(0) as u64);
+        }
+        _ => {}
+    }
     target.input_tokens = target.input_tokens.saturating_add(input);
     target.cached_input_tokens = target.cached_input_tokens.saturating_add(cached);
     target.cache_write_tokens = target.cache_write_tokens.saturating_add(cache_write);
@@ -1016,25 +1061,26 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         cost_nanos: row.get(17)?,
         currency: row.get(18)?,
         error_kind: row.get(19)?,
+        error_message: row.get(20)?,
         cache_write_tokens: row
-            .get::<_, Option<i64>>(20)?
-            .and_then(|v| u64::try_from(v).ok()),
-        reasoning_tokens: row
             .get::<_, Option<i64>>(21)?
             .and_then(|v| u64::try_from(v).ok()),
-        pricing_model: row.get(22)?,
-        service_tier: row.get(23)?,
-        long_context: row.get::<_, Option<bool>>(24)?.unwrap_or(false),
-        input_cost_nanos: row.get(25)?,
-        cache_read_cost_nanos: row.get(26)?,
-        cache_write_cost_nanos: row.get(27)?,
-        output_cost_nanos: row.get(28)?,
-        first_token_ms: row
-            .get::<_, Option<i64>>(29)?
+        reasoning_tokens: row
+            .get::<_, Option<i64>>(22)?
             .and_then(|v| u64::try_from(v).ok()),
-        transport: row.get(30)?,
+        pricing_model: row.get(23)?,
+        service_tier: row.get(24)?,
+        long_context: row.get::<_, Option<bool>>(25)?.unwrap_or(false),
+        input_cost_nanos: row.get(26)?,
+        cache_read_cost_nanos: row.get(27)?,
+        cache_write_cost_nanos: row.get(28)?,
+        output_cost_nanos: row.get(29)?,
+        first_token_ms: row
+            .get::<_, Option<i64>>(30)?
+            .and_then(|v| u64::try_from(v).ok()),
+        transport: row.get(31)?,
         downgrade: row
-            .get::<_, Option<String>>(31)?
+            .get::<_, Option<String>>(32)?
             .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
@@ -1180,7 +1226,7 @@ mod tests {
                 .mark_missing_usage(
                     "r1",
                     Some(200),
-                    None,
+                    Some("provider usage unavailable: upstream timed out"),
                     Some("2026-01-01T00:00:01.000Z".into()),
                 )
                 .unwrap();
@@ -1190,6 +1236,10 @@ mod tests {
         assert_eq!(record.account_id, "account-a");
         assert_eq!(record.state, UsageState::MissingUsage);
         assert_eq!(
+            record.error_message.as_deref(),
+            Some("provider usage unavailable: upstream timed out")
+        );
+        assert_eq!(
             reopened
                 .account_summaries(UsageFilter::default())
                 .unwrap()
@@ -1198,6 +1248,48 @@ mod tests {
                 .unknown_usage_count,
             1
         );
+        assert_eq!(
+            reopened
+                .account_summaries(UsageFilter::default())
+                .unwrap()
+                .accounts[0]
+                .total
+                .missing_usage_count,
+            1
+        );
+    }
+
+    #[test]
+    fn totals_classify_pending_interrupted_and_missing_usage() {
+        let store = BillingStore::open_in_memory().unwrap();
+        store.begin_request(start("pending", "a")).unwrap();
+        store.begin_request(start("interrupted", "a")).unwrap();
+        store.begin_request(start("missing", "a")).unwrap();
+        store
+            .mark_interrupted(
+                "interrupted",
+                Some(502),
+                Some("upstream reset"),
+                Some("2026-01-01T00:00:01.000Z".into()),
+            )
+            .unwrap();
+        store
+            .mark_missing_usage(
+                "missing",
+                Some(200),
+                Some("usage field absent"),
+                Some("2026-01-01T00:00:02.000Z".into()),
+            )
+            .unwrap();
+        let totals = &store
+            .account_summaries(UsageFilter::default())
+            .unwrap()
+            .accounts[0]
+            .total;
+        assert_eq!(totals.pending_request_count, 1);
+        assert_eq!(totals.interrupted_request_count, 1);
+        assert_eq!(totals.missing_usage_count, 1);
+        assert_eq!(totals.unknown_usage_count, 3);
     }
 
     #[test]

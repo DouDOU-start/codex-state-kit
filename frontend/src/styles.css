@@ -214,6 +214,11 @@ svg { flex-shrink: 0; }
 .proxy-mode button { display: flex; flex: 1; align-items: center; justify-content: center; gap: 7px; padding: 7px 6px; border: 1px solid transparent; border-radius: 7px; font-size: 11px; color: var(--muted); background: transparent; cursor: pointer; }
 .proxy-mode button[aria-pressed="true"] { color: var(--accent-strong); background: #fffefa; border-color: #dbe4ef; box-shadow: 0 2px 4px #273d5408; font-weight: 600; }
 .vm-panel > header { align-items: flex-start; }
+.vm-mode { margin: 2px 0 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #f7fafc; }
+.vm-mode__toggle { display: inline-flex; align-items: center; gap: 9px; color: var(--text-soft); font-size: 11px; cursor: pointer; }
+.vm-mode__toggle input { width: 15px; height: 15px; }
+.vm-mode__toggle span { display: grid; gap: 2px; }
+.vm-mode__toggle small { color: var(--muted); font-size: 9px; font-weight: 400; }
 .vm-identity__id { max-width: 280px; color: var(--muted); font: 10px/1.5 var(--font-mono); text-align: right; overflow-wrap: anywhere; }
 .vm-identity__grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 12px; }
 .vm-identity__grid { margin: 0 0 8px; }

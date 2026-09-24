@@ -52,15 +52,51 @@ pub struct WsDial {
     pub authorization: String,
     pub account_id: String,
     pub extra_headers: Vec<(String, String)>,
+    /// Client identity headers must select their own pooled connection when
+    /// virtual-device simulation is disabled.
+    pub preserve_client_identity: bool,
 }
 
 impl WsDial {
     fn key(&self) -> String {
-        format!(
-            "{}\n{}\n{}\n{}",
-            self.url, self.proxy, self.authorization, self.account_id
-        )
+        // Turn metadata is deliberately excluded: it describes one request,
+        // while a WebSocket belongs to a window/thread scope.  Keep the rest
+        // deterministic so header ordering or casing cannot create a second
+        // socket for the same scope.
+        let mut headers: Vec<_> = self
+            .extra_headers
+            .iter()
+            .filter_map(|(name, value)| {
+                let name = name.trim().to_ascii_lowercase();
+                let value = value.trim();
+                if name.is_empty() || value.is_empty() || is_turn_only_header(&name) {
+                    return None;
+                }
+                Some((name, value.to_string()))
+            })
+            .collect();
+        headers.sort_unstable();
+        let base = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            self.url.trim(),
+            self.proxy.trim(),
+            self.authorization.trim(),
+            self.account_id.trim(),
+            headers
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        base
     }
+}
+
+fn is_turn_only_header(name: &str) -> bool {
+    matches!(
+        name,
+        "x-codex-turn-metadata" | "x-codex-turn-id" | "turn-id" | "x-turn-id"
+    )
 }
 
 #[derive(Clone, Default)]
@@ -93,14 +129,24 @@ struct Slot {
     conn: Arc<Mutex<Option<Live>>>,
     /// Response ids produced on the current connection, newest last.
     responses: std::sync::Mutex<VecDeque<String>>,
+    response_scope: std::sync::Mutex<Option<String>>,
 }
 
 impl Slot {
-    fn owns(&self, response_id: &str) -> bool {
+    fn owns(&self, key: &str, response_id: &str) -> bool {
+        let scope = lock(&self.response_scope);
+        if scope.as_deref() != Some(key) {
+            return false;
+        }
         lock(&self.responses).iter().any(|id| id == response_id)
     }
 
-    fn remember(&self, response_id: &str) {
+    fn remember(&self, key: &str, response_id: &str) {
+        let mut scope = lock(&self.response_scope);
+        if scope.as_deref() != Some(key) {
+            *scope = Some(key.to_string());
+            lock(&self.responses).clear();
+        }
         let mut responses = lock(&self.responses);
         if responses.back().is_some_and(|last| last == response_id) {
             return;
@@ -112,6 +158,7 @@ impl Slot {
     }
 
     fn forget(&self) {
+        *lock(&self.response_scope) = None;
         lock(&self.responses).clear();
     }
 }
@@ -224,7 +271,7 @@ impl WsUpstreamPool {
         {
             *lock(&self.shared.last_model) = model.to_string();
         }
-        let (slot, mut conn) = self.pick_slot(&payload).await;
+        let (slot, mut conn) = self.pick_slot(&dial, &payload).await;
         let had_connection = conn.is_some();
         self.ensure(&mut conn, &slot, &dial).await?;
         if send_frame(&mut conn, &payload).await.is_err() {
@@ -268,9 +315,21 @@ impl WsUpstreamPool {
             let Some(live) = conn.as_mut() else {
                 continue;
             };
-            let outdated = live.key != key
-                || live.generation != generation
-                || live.connected_at.elapsed() >= REFRESH_AGE;
+            // A warm run must not evict another healthy window/thread merely
+            // because its key differs. Ping other scopes as well so an idle
+            // window does not silently expire while a different one is active.
+            if live.key != key {
+                let expired = live.generation != generation
+                    || live.connected_at.elapsed() >= MAX_AGE
+                    || (warm && live.idle_since.elapsed() >= SPARE_IDLE);
+                if expired || ping(live).await.is_err() {
+                    close(&mut conn).await;
+                    slot.forget();
+                }
+                continue;
+            }
+            let outdated =
+                live.generation != generation || live.connected_at.elapsed() >= REFRESH_AGE;
             let spare = warm && live.idle_since.elapsed() >= SPARE_IDLE;
             if outdated || spare || ping(live).await.is_err() {
                 close(&mut conn).await;
@@ -313,35 +372,48 @@ impl WsUpstreamPool {
         Some((slot, conn))
     }
 
-    /// The connection for a turn: the one that produced its
-    /// `previous_response_id`, else an idle one (open connections first), else
-    /// a new one, else whichever frees up first.
-    async fn pick_slot(&self, payload: &Value) -> (Arc<Slot>, ConnGuard) {
+    /// The connection for a turn: the one in this scope that produced its
+    /// `previous_response_id`, else a matching idle connection, then an empty
+    /// slot/new connection, else an idle connection from another scope when
+    /// the pool is full.
+    async fn pick_slot(&self, dial: &WsDial, payload: &Value) -> (Arc<Slot>, ConnGuard) {
+        let key = dial.key();
         let previous = payload
             .get("previous_response_id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|id| !id.is_empty());
         let slots = lock(&self.shared.slots).clone();
-        if let Some(owner) = previous.and_then(|id| slots.iter().find(|slot| slot.owns(id))) {
+        if let Some(owner) = previous.and_then(|id| slots.iter().find(|slot| slot.owns(&key, id))) {
             let conn = owner.conn.clone().lock_owned().await;
             return (owner.clone(), conn);
         }
+        let mut matching = None;
         let mut empty = None;
+        let mut other_idle = None;
         for slot in &slots {
             if let Ok(conn) = slot.conn.clone().try_lock_owned() {
-                if conn.is_some() {
-                    return (slot.clone(), conn);
-                }
-                if empty.is_none() {
+                if conn.as_ref().is_some_and(|live| live.key == key) {
+                    if matching.is_none() {
+                        matching = Some((slot.clone(), conn));
+                    }
+                } else if conn.is_some() && other_idle.is_none() {
+                    other_idle = Some((slot.clone(), conn));
+                } else if conn.is_none() && empty.is_none() {
                     empty = Some((slot.clone(), conn));
                 }
             }
+        }
+        if let Some(found) = matching {
+            return found;
         }
         if let Some(found) = empty {
             return found;
         }
         if let Some(found) = self.idle_slot() {
+            return found;
+        }
+        if let Some(found) = other_idle {
             return found;
         }
         let waiting = slots
@@ -441,7 +513,7 @@ impl WsUpstreamPool {
                         continue;
                     }
                     if let Some(id) = response_id(&text) {
-                        slot.remember(&id);
+                        slot.remember(&dial.key(), &id);
                     }
                     let terminal = ws_bridge::is_terminal_event(&text);
                     saw_event = true;
@@ -888,6 +960,25 @@ mod tests {
         assert!(!connection_fresh(Duration::from_secs(56 * 60)));
     }
 
+    #[test]
+    fn scope_key_is_ordered_and_ignores_turn_metadata() {
+        let mut first = local_dial("127.0.0.1:1".parse().unwrap());
+        first.extra_headers = vec![
+            ("X-Codex-Turn-Metadata".into(), "turn-a".into()),
+            ("X-Codex-Window-Id".into(), "window-1".into()),
+            ("Thread-Id".into(), "thread-1".into()),
+        ];
+        let mut second = first.clone();
+        second.extra_headers.reverse();
+        second
+            .extra_headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-codex-turn-metadata"))
+            .unwrap()
+            .1 = "turn-b".into();
+        assert_eq!(first.key(), second.key());
+    }
+
     #[tokio::test]
     #[allow(clippy::result_large_err)] // tungstenite's handshake callback signature
     async fn round_trip_against_local_websocket() {
@@ -928,6 +1019,7 @@ mod tests {
                     authorization: "Bearer test".into(),
                     account_id: "acct".into(),
                     extra_headers: vec![("originator".into(), "codex_cli_rs".into())],
+                    preserve_client_identity: false,
                 },
                 json!({"type":"response.create","model":"m"}),
             )
@@ -980,6 +1072,7 @@ mod tests {
                     authorization: String::new(),
                     account_id: String::new(),
                     extra_headers: vec![],
+                    preserve_client_identity: false,
                 },
                 json!({"type":"response.create"}),
             )
@@ -1019,6 +1112,7 @@ mod tests {
                     authorization: String::new(),
                     account_id: String::new(),
                     extra_headers: vec![],
+                    preserve_client_identity: false,
                 },
                 json!({"type":"response.create","model":"m"}),
             )
@@ -1076,7 +1170,27 @@ mod tests {
             authorization: "Bearer test".into(),
             account_id: "acct".into(),
             extra_headers: vec![],
+            preserve_client_identity: false,
         }
+    }
+
+    fn scoped_dial(
+        addr: std::net::SocketAddr,
+        window: &str,
+        thread: &str,
+        turn_metadata: &str,
+    ) -> WsDial {
+        let mut dial = local_dial(addr);
+        dial.extra_headers = vec![
+            ("user-agent".into(), "codex/0.1".into()),
+            ("x-codex-installation-id".into(), "install-1".into()),
+            ("x-codex-window-id".into(), window.into()),
+            ("session-id".into(), "session-1".into()),
+            ("thread-id".into(), thread.into()),
+            ("x-client-request-id".into(), thread.into()),
+            ("x-codex-turn-metadata".into(), turn_metadata.into()),
+        ];
+        dial
     }
 
     /// A local upstream: every connection answers each `response.create`
@@ -1199,6 +1313,108 @@ mod tests {
         )
         .await;
         assert_eq!(follow_up, "resp_1_2");
+    }
+
+    #[tokio::test]
+    async fn same_thread_continuation_reuses_socket_when_turn_metadata_changes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let release = Arc::new(Notify::new());
+        let accepted = spawn_upstream(listener, release, None);
+        let pool = WsUpstreamPool::new();
+        let first_dial = scoped_dial(addr, "window-1", "thread-1", "turn-a");
+        let first = completed_id(
+            &pool,
+            first_dial,
+            json!({"type":"response.create","model":"m"}),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let continuation = completed_id(
+            &pool,
+            scoped_dial(addr, "window-1", "thread-1", "turn-b"),
+            json!({
+                "type":"response.create",
+                "model":"m",
+                "previous_response_id": first
+            }),
+        )
+        .await;
+        assert_eq!(continuation, "resp_0_2");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn previous_response_id_cannot_take_over_another_window() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = spawn_upstream(listener, Arc::new(Notify::new()), None);
+        let pool = WsUpstreamPool::new();
+        let first = completed_id(
+            &pool,
+            scoped_dial(addr, "window-1", "thread-1", "turn-a"),
+            json!({"type":"response.create","model":"m"}),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = completed_id(
+            &pool,
+            scoped_dial(addr, "window-2", "thread-2", "turn-b"),
+            json!({
+                "type":"response.create",
+                "model":"m",
+                "previous_response_id": first
+            }),
+        )
+        .await;
+        assert_eq!(second, "resp_1_1");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_windows_keep_separate_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let release = Arc::new(Notify::new());
+        let accepted = spawn_upstream(listener, release.clone(), None);
+        let pool = WsUpstreamPool::new();
+        let (mut slow, _) = pool
+            .open_turn(
+                scoped_dial(addr, "window-1", "thread-1", "turn-a"),
+                json!({"type":"response.create","model":"slow"}),
+            )
+            .await
+            .unwrap();
+        let fast = completed_id(
+            &pool,
+            scoped_dial(addr, "window-2", "thread-2", "turn-b"),
+            json!({"type":"response.create","model":"m"}),
+        )
+        .await;
+        assert_eq!(fast, "resp_1_1");
+        release.notify_one();
+        assert_eq!(
+            response_id(&slow.recv().await.unwrap().unwrap()).as_deref(),
+            Some("resp_0_1")
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn maintain_preserves_other_window_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = spawn_upstream(listener, Arc::new(Notify::new()), None);
+        let pool = WsUpstreamPool::new();
+        let first = scoped_dial(addr, "window-1", "thread-1", "turn-a");
+        let second = scoped_dial(addr, "window-2", "thread-2", "turn-a");
+        pool.maintain(&first).await;
+        pool.maintain(&second).await;
+        assert_eq!(pool.open_connections(), 2);
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        pool.maintain(&first).await;
+        assert_eq!(pool.open_connections(), 2);
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

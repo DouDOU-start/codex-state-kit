@@ -422,7 +422,12 @@ export function useCodexStateKit() {
     try {
       const next = await updateVmIdentity(profile);
       setStatus(next);
-      setBanner({ kind: "ok", text: "虚拟设备身份已保存，之后的请求都使用这份指纹" });
+      setBanner({
+        kind: "ok",
+        text: profile.enabled === false
+          ? "已关闭虚拟设备模拟，之后的请求将原样透传设备和环境"
+          : "虚拟设备身份已保存，之后的请求都使用这份指纹",
+      });
       return next;
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });

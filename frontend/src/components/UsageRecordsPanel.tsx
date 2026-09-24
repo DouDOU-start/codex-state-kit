@@ -49,13 +49,17 @@ function formatMoney(costNanos: number | null | undefined): string {
 }
 
 function unpricedLabel(record: BillingRecord): { label: string; title: string } {
-  if (record.state === "missing_usage" || record.inputTokens == null || record.outputTokens == null) {
-    return { label: "缺少用量", title: "上游没有返回完整的输入/输出 token，暂时无法计算费用。" };
+  if (record.state === "pending") {
+    return { label: "处理中", title: "请求仍在转发，等待上游返回最终状态。" };
   }
   if (record.state === "interrupted") {
-    return { label: "请求未完成", title: "请求在返回完整用量前中断，暂时无法计算费用。" };
+    const reason = record.errorMessage || record.errorKind;
+    return { label: "转发错误", title: reason ? `转发失败：${reason}` : "请求在转发过程中未完成；历史记录未保存具体错误原因。" };
   }
-  return { label: "未定价", title: "已有完整用量，但当前价格目录没有匹配的模型价格。" };
+  if (record.state === "missing_usage" || record.inputTokens == null || record.outputTokens == null) {
+    return { label: "缺少用量", title: "请求已返回，但上游没有提供完整的输入/输出 token，暂时无法计算费用。" };
+  }
+  return { label: "价格未匹配", title: "已有完整用量，但当前价格目录没有匹配的模型价格。" };
 }
 
 function stateLabel(state: BillingRecord["state"]): string {
@@ -63,7 +67,7 @@ function stateLabel(state: BillingRecord["state"]): string {
     pending: "处理中",
     measured: "已计量",
     missing_usage: "缺少用量",
-    interrupted: "请求中断",
+    interrupted: "转发错误",
   } as Record<string, string>)[state] ?? state;
 }
 
@@ -296,7 +300,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
 
   const visible = records;
   const detailLog = detailRecord ? matchLog(detailRecord, status.logs) : undefined;
-  const detailError = detailRecord?.errorKind || detailLog?.errorKind || (detailLog && ["error", "cancelled"].includes(detailLog.streamState) ? `stream_${detailLog.streamState}` : null);
+  const detailError = detailRecord?.errorMessage || detailRecord?.errorKind || detailLog?.errorKind || (detailLog && ["error", "cancelled"].includes(detailLog.streamState) ? `stream_${detailLog.streamState}` : null);
   const detailStatus = detailRecord?.httpStatus ?? detailLog?.status ?? null;
   const detailTransport = detailRecord?.transport || detailLog?.transport || null;
 

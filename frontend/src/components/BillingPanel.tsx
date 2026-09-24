@@ -5,7 +5,7 @@ import { RefreshControl } from "@/components/RefreshControl";
 import { usePolling } from "@/hooks/usePolling";
 import { getBillingRecords, getBillingRevision, getBillingSummary, isTauri } from "@/lib/api";
 import { accountLabel } from "@/components/UsageRecordsPanel";
-import type { BillingRecord, BillingSummary, SavedAccount } from "@/types";
+import type { BillingRecord, BillingSummary, BillingUsageTotals, SavedAccount } from "@/types";
 
 interface BillingPanelProps {
   currentAccountId?: string | null;
@@ -57,9 +57,19 @@ function formatDay(iso?: string | null): string {
   return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
 }
 
-/** Totals only cover priced requests; say how many are left out. */
-function unpricedNote(count: number): string {
-  return count > 0 ? ` · ${count} 条未计价` : "";
+/** Show failed and active requests separately from missing usage and prices. */
+function unpricedNote(totals?: BillingUsageTotals): string {
+  if (!totals) return "";
+  const errors = Math.max(0, totals.interruptedRequestCount ?? 0);
+  const pending = Math.max(0, totals.pendingRequestCount ?? 0);
+  const missing = Math.max(0, totals.missingUsageCount ?? (totals.unknownUsageCount - errors - pending));
+  const unpriced = Math.max(0, totals.unpricedCount - totals.unknownUsageCount);
+  const parts: string[] = [];
+  if (errors > 0) parts.push(`${errors} 条转发错误`);
+  if (pending > 0) parts.push(`${pending} 条处理中`);
+  if (missing > 0) parts.push(`${missing} 条缺少用量`);
+  if (unpriced > 0) parts.push(`${unpriced} 条价格未匹配`);
+  return parts.length ? ` · ${parts.join(" · ")}` : "";
 }
 
 function formatTokens(value: number): string {
@@ -224,9 +234,9 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
             <article>
               <span>累计成本</span>
               <strong>{formatMoney(allTime ? allTime.total.pricedCostNanos : null)}</strong>
-              <small>{allTime ? `自 ${formatDay(allTime.firstSeenAt)} · ${new Intl.NumberFormat("zh-CN").format(allTime.total.requestCount)} 次请求${unpricedNote(allTime.total.unpricedCount)}` : "还没有记录"}</small>
+              <small>{allTime ? `自 ${formatDay(allTime.firstSeenAt)} · ${new Intl.NumberFormat("zh-CN").format(allTime.total.requestCount)} 次请求${unpricedNote(allTime.total)}` : "还没有记录"}</small>
             </article>
-            <article><span>30 天总成本</span><strong>{formatMoney(recentCost)}</strong><small>{`已计价请求${unpricedNote(selected?.total.unpricedCount ?? 0)}`}</small></article>
+            <article><span>30 天总成本</span><strong>{formatMoney(recentCost)}</strong><small>{`已计价请求${unpricedNote(selected?.total)}`}</small></article>
             <article><span>30 天总请求</span><strong>{new Intl.NumberFormat("zh-CN").format(requestCount)}</strong><small>累计调用</small></article>
             <article><span>日均成本</span><strong>{formatMoney(dailyCost)}</strong><small>基于 {activeDays} 个有数据的日期</small></article>
             <article><span>日均请求</span><strong>{dailyRequests ? dailyRequests.toFixed(0) : "0"}</strong><small>日均使用量</small></article>
