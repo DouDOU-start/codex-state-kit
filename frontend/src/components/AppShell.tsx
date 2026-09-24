@@ -16,7 +16,9 @@ async function windowAction(action: "minimize" | "maximize" | "close") {
   const window = getCurrentWindow();
   if (action === "minimize") await window.minimize();
   if (action === "maximize") await window.toggleMaximize();
-  if (action === "close") await window.close();
+  // Keep the proxy and tray process alive when the title-bar X is clicked.
+  // The tray menu remains the explicit way to exit the application.
+  if (action === "close") await window.hide();
 }
 
 export function AppShell({ children }: PropsWithChildren) {
@@ -81,7 +83,7 @@ export function AppShell({ children }: PropsWithChildren) {
           <button type="button" aria-label="最大化" onClick={() => void windowAction("maximize")}>
             <Square size={13} />
           </button>
-          <button className="window-controls__close" type="button" aria-label="关闭" disabled={updates.phase === "installing"} onClick={() => void windowAction("close")}>
+          <button className="window-controls__close" type="button" aria-label="隐藏到后台" title="隐藏到后台" disabled={updates.phase === "installing"} onClick={() => void windowAction("close")}>
             <X size={17} />
           </button>
         </div>

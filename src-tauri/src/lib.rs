@@ -4,7 +4,7 @@ mod state;
 mod tray;
 mod window_shape;
 
-use tauri::{Manager, RunEvent};
+use tauri::{Manager, RunEvent, WindowEvent};
 
 use codex_state_kit::mihomo::MihomoPaths;
 use state::AppState;
@@ -99,6 +99,20 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build Codex State Kit")
         .run(|app, event| {
+            if let RunEvent::WindowEvent {
+                label,
+                event: WindowEvent::CloseRequested { api, .. },
+                ..
+            } = &event
+            {
+                // Keep accidental Alt+F4/native close actions consistent with
+                // the custom title-bar X: hide the window and leave the proxy
+                // and tray process running. The tray's Quit item still exits.
+                api.prevent_close();
+                if let Some(window) = app.get_webview_window(label) {
+                    let _ = window.hide();
+                }
+            }
             if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
                 let state = app.state::<AppState>();
                 state.restore_once();

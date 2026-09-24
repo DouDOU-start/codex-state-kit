@@ -497,6 +497,7 @@ pub struct ResponseMetrics {
     after_cr: bool,
     is_sse: bool,
     completed: bool,
+    terminal_event_seen: bool,
     pub error_kind: Option<&'static str>,
     sse_events: Vec<(String, u32)>,
 }
@@ -741,6 +742,13 @@ impl ResponseMetrics {
         self.completed
     }
 
+    /// Returns true when the SSE stream contained a protocol terminal event.
+    /// This is broader than `completed()`: providers may use `response.done`,
+    /// `response.failed`, or `response.incomplete` to terminate a response.
+    pub fn terminal_event_seen(&self) -> bool {
+        self.terminal_event_seen
+    }
+
     pub fn sse_event_summary(&self) -> Option<String> {
         if self.sse_events.is_empty() {
             return None;
@@ -799,6 +807,9 @@ impl ResponseMetrics {
                     | "response.canceled"
             )
         );
+        if terminal {
+            self.terminal_event_seen = true;
+        }
         // Read only provider metadata, never model-shaped fields in generated
         // text, output items or tool arguments. Keep the first declaration;
         // a terminal event overrides it, as in sub2api's model observer.
@@ -1057,6 +1068,19 @@ mod tests {
             }
             assert_eq!(metrics.upstream_response_model(), Some(expected));
         }
+    }
+
+    #[test]
+    fn sse_terminal_event_tracking_distinguishes_truncated_streams() {
+        let mut truncated = ResponseMetrics::default();
+        truncated.observe(b"data: {\"type\":\"response.created\"}\n\n", 10, true);
+        truncated.finish(20);
+        assert!(!truncated.terminal_event_seen());
+
+        let mut complete = ResponseMetrics::default();
+        complete.observe(b"data: {\"type\":\"response.done\"}\n\n", 10, true);
+        complete.finish(20);
+        assert!(complete.terminal_event_seen());
     }
 
     #[test]

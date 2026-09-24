@@ -1031,7 +1031,8 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                         .as_ref()
                         .map(|lifecycle| lifecycle.snapshot().stream_chunks)
                         .unwrap_or(0);
-                    let next = match tokio::time::timeout(
+                    let mut upstream_eof_incomplete = false;
+                    let mut next = match tokio::time::timeout(
                         business_stream_idle_timeout(chunks),
                         stream.next(),
                     )
@@ -1096,11 +1097,38 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                             tracker
                                 .metrics
                                 .finish(tracker.started.elapsed().as_millis());
-                            if let Some(lifecycle) = &tracker.lifecycle {
-                                lifecycle.complete();
+                            // A successful SSE response must carry a protocol
+                            // terminal event. An HTTP EOF alone is ambiguous:
+                            // it can otherwise be recorded as a successful
+                            // 200 response even though the provider truncated
+                            // the stream before `response.completed` (or an
+                            // explicit failure/incomplete event).
+                            let truncated_sse = is_sse
+                                && !tracker.metrics.terminal_event_seen()
+                                && tracker.metrics.error_kind.is_none();
+                            if truncated_sse {
+                                if let Some(lifecycle) = &tracker.lifecycle {
+                                    lifecycle.error();
+                                }
+                                tracker.entry.error_kind = Some("upstream_eof".into());
+                                tracker.finished = true;
+                                upstream_eof_incomplete = true;
+                            } else {
+                                if let Some(lifecycle) = &tracker.lifecycle {
+                                    lifecycle.complete();
+                                }
+                                tracker.finished = true;
                             }
-                            tracker.finished = true;
                         }
+                    }
+                    if upstream_eof_incomplete {
+                        let incomplete = Bytes::from_static(SSE_IDLE_TIMEOUT_EVENT);
+                        tracker.metrics.observe(
+                            incomplete.as_ref(),
+                            tracker.started.elapsed().as_millis(),
+                            true,
+                        );
+                        next = Some(Ok(incomplete));
                     }
                     if tracker.finished {
                         tracker.settle_billing();
