@@ -142,7 +142,7 @@ export interface SettingsPatch {
 }
 
 export type OutboundMode = "manual" | "mihomo";
-export type ProbeKind = "manual" | "mihomo";
+export type ProbeKind = "manual" | "mihomo" | "mihomo_codex";
 
 export interface LatencySample {
   name: string;

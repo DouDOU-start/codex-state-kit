@@ -393,7 +393,8 @@ export default function App() {
                 group={group}
                 probing={fwd.probingGroup === group.name || fwd.probingGroup === "*"}
                 onSelect={(node) => void fwd.selectMihomoNode(group.name, node)}
-                onProbe={() => void fwd.probeMihomoGroup(group.name)}
+                onProbe={() => { if (group.now) void fwd.probeMihomoGroup(group.name, group.now); }}
+                onProbeAll={() => void fwd.probeMihomoGroup(group.name)}
               />
             ))}
             {shownMihomoGroups.length > 0 ? null : (
@@ -429,6 +430,12 @@ export default function App() {
                 </div>
               </>
             )}
+            <div className="field-row">
+              <span className="panel__hint">Codex 链路检测</span>
+              <LatencyProbe probing={fwd.probing === "mihomo_codex"} disabled={fwd.probing !== null || fwd.status.mihomo?.phase !== "connected"}
+                sample={fwd.latency.mihomo_codex?.samples[0]} onProbe={() => void fwd.probeLatency("mihomo_codex")} />
+            </div>
+            <p className="panel__hint">节点测速使用轻量 204 地址，包含连接与 HTTPS 握手；Codex 链路单独检测上游 HTTP 响应，不代表模型首字速度。</p>
             <p className="panel__hint">
               {fwd.status.mihomo?.phase === "connected"
                 ? `已连接${fwd.status.mihomo.selected ? ` · ${fwd.status.mihomo.selected}` : ""}${fwd.status.mihomo.proxyUrl ? ` · ${fwd.status.mihomo.proxyUrl}` : ""}`

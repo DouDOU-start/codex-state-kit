@@ -8,11 +8,13 @@ export function MihomoGroupPanel({
   probing,
   onSelect,
   onProbe,
+  onProbeAll,
 }: {
   group: ProxyGroup;
   probing: boolean;
   onSelect: (node: string) => void;
   onProbe: () => void;
+  onProbeAll: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -61,6 +63,7 @@ export function MihomoGroupPanel({
         </button>
         <LatencyProbe
           probing={probing}
+          disabled={!group.now}
           sample={current?.delay != null ? { name: current.name, delayMs: current.delay, error: null } : null}
           onProbe={onProbe}
         />
@@ -82,6 +85,7 @@ export function MihomoGroupPanel({
             <div>
               <h2>选择节点</h2>
               <p>{group.name} · {group.all.length} 个</p>
+              <button type="button" className="button button--ghost" disabled={probing} onClick={onProbeAll}>{probing ? "正在测速…" : "测全部节点"}</button>
             </div>
             <button type="button" className="network-log-close" aria-label="关闭" onClick={() => setOpen(false)}>
               <X size={16} />

@@ -932,7 +932,11 @@ impl ProxyHandle {
         proxy: Option<String>,
     ) -> Result<crate::latency::LatencyReport> {
         let settings = self.app.settings.lock().await.clone();
-        let target = crate::latency::probe_target(&settings.upstream)?;
+        let target = if kind == "mihomo" {
+            crate::latency::NODE_PROBE_TARGET.to_string()
+        } else {
+            crate::latency::probe_target(&settings.upstream)?
+        };
         let samples = match kind {
             "manual" => {
                 let raw = proxy
@@ -944,6 +948,13 @@ impl ProxyHandle {
                 )]
             }
             "mihomo" => self.app.mihomo.probe_delays(&target).await?,
+            "mihomo_codex" => {
+                let proxy = resolved_proxy(&settings, &self.app.mihomo);
+                vec![crate::latency::sample_from_result(
+                    "Codex 链路",
+                    crate::latency::probe_through_proxy(&proxy, &target).await,
+                )]
+            }
             _ => anyhow::bail!("未知的检测对象"),
         };
         Ok(crate::latency::LatencyReport { target, samples })

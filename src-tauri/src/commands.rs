@@ -78,9 +78,22 @@ pub async fn detect_vm_cli_version(state: State<'_, AppState>) -> CommandResult<
 pub async fn mihomo_group_delay(
     state: State<'_, AppState>,
     group: String,
+    node: Option<String>,
 ) -> CommandResult<Vec<codex_state_kit::latency::LatencySample>> {
-    let settings = state.proxy.app().settings.lock().await.clone();
-    let target = command(codex_state_kit::latency::probe_target(&settings.upstream))?;
+    let target = codex_state_kit::latency::NODE_PROBE_TARGET;
+    if let Some(node) = node {
+        let group = group.clone();
+        let node = node.clone();
+        return command(
+            state
+                .proxy
+                .app()
+                .mihomo
+                .probe_node_delay(&group, &node, target)
+                .await,
+        )
+        .map(|sample| vec![sample]);
+    }
     command(
         state
             .proxy

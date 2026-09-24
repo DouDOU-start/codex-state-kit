@@ -249,11 +249,11 @@ export async function mihomoSelect(group: string, node: string): Promise<void> {
   mockStatus.mihomo.selected = node;
 }
 
-export async function mihomoGroupDelay(group: string): Promise<LatencySample[]> {
-  if (isTauri) return invoke<LatencySample[]>("mihomo_group_delay", { group });
+export async function mihomoGroupDelay(group: string, node?: string): Promise<LatencySample[]> {
+  if (isTauri) return invoke<LatencySample[]>("mihomo_group_delay", { group, node });
   await new Promise((resolve) => window.setTimeout(resolve, 300));
   const target = mockStatus.mihomo.groups.find((item) => item.name === group);
-  const names = target?.all.map((node) => node.name) ?? mockStatus.mihomo.nodes;
+  const names = node ? [node] : target?.all.map((node) => node.name) ?? mockStatus.mihomo.nodes;
   return names.map((name, index) => {
     const delayMs = index === names.length - 1 && names.length > 1 ? null : 90 + index * 40;
     const node = target?.all.find((item) => item.name === name);

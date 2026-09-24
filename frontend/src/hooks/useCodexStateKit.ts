@@ -272,10 +272,10 @@ export function useCodexStateKit() {
     }
   }, []);
 
-  const probeMihomoGroup = useCallback(async (group: string) => {
+  const probeMihomoGroup = useCallback(async (group: string, node?: string) => {
     setProbingGroup(group);
     try {
-      await mihomoGroupDelay(group);
+      await mihomoGroupDelay(group, node);
       setStatus(await getStatus());
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });

@@ -9,6 +9,17 @@ use crate::outbound;
 use crate::settings::normalize_proxy;
 
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+pub const NODE_PROBE_TARGET: &str = "https://www.gstatic.com/generate_204";
+
+pub fn node_delay_url(controller: &str, node: &str, target: &str) -> Result<reqwest::Url> {
+    let node = encode_path_segment(node);
+    let mut url = reqwest::Url::parse(&format!("http://{controller}/proxies/{node}/delay"))?;
+    url.query_pairs_mut()
+        .append_pair("url", target)
+        .append_pair("timeout", "4000")
+        .append_pair("expected", "*");
+    Ok(url)
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -138,6 +149,20 @@ pub async fn probe_through_proxy(proxy: &str, target: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_probe_encodes_names_and_uses_short_timeout() {
+        let url = node_delay_url("127.0.0.1:19090", "日本 / A?#", NODE_PROBE_TARGET).unwrap();
+        assert_eq!(
+            url.path(),
+            "/proxies/%E6%97%A5%E6%9C%AC%20%2F%20A%3F%23/delay"
+        );
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(query["timeout"], "4000");
+        assert_eq!(query["url"], NODE_PROBE_TARGET);
+        assert_eq!(query["expected"], "*");
+        assert!(url.fragment().is_none());
+    }
 
     #[test]
     fn probe_target_keeps_the_configured_upstream() {

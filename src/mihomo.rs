@@ -130,19 +130,53 @@ impl MihomoRuntime {
     }
 
     pub async fn probe_delays(&self, target: &str) -> Result<Vec<crate::latency::LatencySample>> {
-        let group = {
-            let inner = self.inner.lock().expect("mihomo state");
-            inner
-                .view
-                .groups
-                .iter()
-                .find(|group| group.group_type == "select" || group.group_type == "url-test")
-                .map(|group| group.name.clone())
-                .unwrap_or_else(|| GROUP.to_string())
-        };
-        self.probe_group_delays(&group, target).await
+        let node = self.status().selected.context("尚未选择节点")?;
+        Ok(vec![self.probe_node_delay(GROUP, &node, target).await?])
     }
 
+    pub async fn probe_node_delay(
+        &self,
+        group: &str,
+        node: &str,
+        target: &str,
+    ) -> Result<crate::latency::LatencySample> {
+        let (controller, secret) = self.controller_auth()?;
+        anyhow::ensure!(
+            self.status()
+                .groups
+                .iter()
+                .any(|g| g.name == group && g.all.iter().any(|n| n.name == node)),
+            "节点不在当前分组中"
+        );
+        let url = crate::latency::node_delay_url(&controller, node, target)?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(6))
+            .build()?;
+        let result = async {
+            let response = client
+                .get(url)
+                .bearer_auth(&secret)
+                .send()
+                .await
+                .context("节点检测失败")?;
+            anyhow::ensure!(response.status().is_success(), "节点超时或不可达");
+            let body: JsonValue = response.json().await.context("节点返回无效结果")?;
+            body.get("delay")
+                .and_then(JsonValue::as_u64)
+                .filter(|n| *n > 0)
+                .context("节点超时或不可达")
+        }
+        .await;
+        let sample = crate::latency::sample_from_result(node, result);
+        if self
+            .controller_auth()
+            .is_ok_and(|auth| auth == (controller, secret))
+        {
+            self.apply_delay_samples(group, std::slice::from_ref(&sample));
+        }
+        Ok(sample)
+    }
     pub async fn list_groups(&self) -> Result<Vec<ProxyGroup>> {
         self.refresh_groups().await
     }
@@ -180,27 +214,22 @@ impl MihomoRuntime {
         if names.is_empty() {
             bail!("订阅里没有可用节点");
         }
-        let url = crate::latency::group_delay_url(&controller, group, target)?;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(12))
-            .build()
-            .context("无法创建节点检测客户端")?;
-        let response = client
-            .get(url)
-            .header("Authorization", format!("Bearer {secret}"))
-            .send()
-            .await
-            .context("无法检测节点延迟")?;
-        if !response.status().is_success() {
-            bail!("节点延迟检测失败");
+        use futures_util::{stream, StreamExt};
+        let _ = (controller, secret);
+        let group = group.to_string();
+        let target = target.to_string();
+        let mut pending = stream::iter(names.into_iter().map(|node| {
+            let group = group.clone();
+            let target = target.clone();
+            async move { self.probe_node_delay(&group, &node, &target).await }
+        }))
+        .buffer_unordered(4);
+        let mut samples = Vec::new();
+        while let Some(result) = pending.next().await {
+            samples.push(result?);
         }
-        let body = response.json().await.context("无法读取延迟结果")?;
-        let samples = crate::latency::samples_from_group_delays(&names, &body);
-        self.apply_delay_samples(group, &samples);
         Ok(samples)
     }
-
     fn controller_auth(&self) -> Result<(String, String)> {
         let inner = self.inner.lock().expect("mihomo state");
         if inner.view.phase != "connected" {
