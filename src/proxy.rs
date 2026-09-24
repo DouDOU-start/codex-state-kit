@@ -10,6 +10,7 @@ use serde_json::json;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -20,6 +21,7 @@ use url::Url;
 
 use crate::accounts::{self, AccountEnvironment, NetworkProfile};
 use crate::attach::{self, is_attached};
+use crate::basispoints;
 use crate::billing::{BillingStore, RequestStart, UsageOutcome, UsageState};
 use crate::diag;
 use crate::downgrade;
@@ -30,7 +32,7 @@ use crate::logs::ObservedStream;
 use crate::logs::{self, LogEntry, NetworkLogDetails, StreamLifecycle};
 use crate::mihomo::{MihomoRuntime, MihomoStatus};
 use crate::outbound;
-use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch};
+use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch, UpstreamMode};
 use crate::traffic::{AccountTraffic, RequestActivity, TrafficTracker};
 use crate::ws_bridge;
 use crate::ws_upstream::{WsDial, WsUpstreamPool};
@@ -101,6 +103,7 @@ const HOP_BY_HOP: &[&str] = &[
 pub struct Status {
     pub proxy_listen: String,
     pub upstream: String,
+    pub upstream_mode: UpstreamMode,
     pub codex_home: String,
     pub proxy_ok: bool,
     pub attached: bool,
@@ -146,6 +149,7 @@ pub struct App {
     pub sidecar_wake: Notify,
     vm_identity: Mutex<VmIdentity>,
     ws_upstream: WsUpstreamPool,
+    basispoints: Arc<Mutex<basispoints::BpsState>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -224,6 +228,7 @@ impl App {
                 VmIdentity::load_or_create()
             }),
             ws_upstream: WsUpstreamPool::new(),
+            basispoints: Arc::new(Mutex::new(basispoints::BpsState::default())),
         })
     }
 
@@ -279,6 +284,7 @@ impl App {
         Status {
             proxy_listen: settings.proxy_listen,
             upstream: settings.upstream,
+            upstream_mode: settings.upstream_mode,
             codex_home: settings.codex_home,
             proxy_ok: self.proxy_ok.load(Ordering::Relaxed),
             attached,
@@ -1039,9 +1045,86 @@ async fn bind_listen(addr: SocketAddr) -> Result<TcpListener> {
 
 async fn proxy(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
     if is_websocket(&req) {
+        if app.settings.lock().await.upstream_mode == UpstreamMode::Basispoints {
+            return proxy_bps_ws(app, req).await;
+        }
         return proxy_ws(app, req).await;
     }
     proxy_http(app, req).await
+}
+
+/// Accept a Codex WebSocket client while keeping the BPS leg on HTTP SSE.
+/// This lets the existing Codex attachment continue to work when the client
+/// elects its native WebSocket transport.
+async fn proxy_bps_ws(app: Arc<App>, req: Request<Body>) -> Response {
+    let headers = req.headers().clone();
+    let (mut parts, _body) = req.into_parts();
+    match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(upgrade) => upgrade.on_upgrade(move |socket| async move {
+            if let Err(error) = client_bps_ws_session(app, headers, socket).await {
+                eprintln!("[bps-ws] 客户端会话结束: {error:#}");
+            }
+        }),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+async fn client_bps_ws_session(
+    app: Arc<App>,
+    client_headers: HeaderMap,
+    mut socket: WebSocket,
+) -> Result<()> {
+    while let Some(message) = socket.recv().await {
+        let message = message.context("读取 BPS WebSocket 客户端消息")?;
+        let text = match message {
+            WsMessage::Text(text) => text.to_string(),
+            WsMessage::Close(_) => return Ok(()),
+            WsMessage::Ping(payload) => {
+                socket.send(WsMessage::Pong(payload)).await.ok();
+                continue;
+            }
+            WsMessage::Pong(_) | WsMessage::Binary(_) => continue,
+        };
+        let mut builder = Request::builder()
+            .method(http::Method::POST)
+            .uri("/responses");
+        for (name, value) in &client_headers {
+            if is_hop(name) || name.as_str().eq_ignore_ascii_case("upgrade") {
+                continue;
+            }
+            builder = builder.header(name, value);
+        }
+        builder = builder.header(header::ACCEPT, "text/event-stream");
+        let request = builder
+            .body(Body::from(text))
+            .context("构造 BPS HTTP 请求")?;
+        let response = proxy_http(app.clone(), request).await;
+        let status = response.status();
+        let mut body = response.into_body().into_data_stream();
+        if !status.is_success() {
+            let mut error_body = Vec::new();
+            while let Some(chunk) = body.next().await {
+                error_body.extend_from_slice(&chunk.context("读取 BPS 错误响应")?);
+            }
+            let payload = String::from_utf8_lossy(&error_body).to_string();
+            socket.send(WsMessage::text(payload)).await.ok();
+            continue;
+        }
+        let mut pending = Vec::new();
+        while let Some(chunk) = body.next().await {
+            pending.extend_from_slice(&chunk.context("读取 BPS SSE")?);
+            while let Some(pos) = pending.windows(2).position(|pair| pair == b"\n\n") {
+                let block: Vec<u8> = pending.drain(..pos + 2).collect();
+                if let Some(data) = String::from_utf8_lossy(&block)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:").map(str::trim))
+                {
+                    socket.send(WsMessage::text(data.to_string())).await.ok();
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_websocket(req: &Request<Body>) -> bool {
@@ -1184,8 +1267,13 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 last_diag_chunks: 0,
             };
             let (parts, body) = resp.into_parts();
+            let stream: Pin<
+                Box<dyn futures_util::Stream<Item = Result<Bytes, axum::Error>> + Send>,
+            > = Box::pin(body.into_data_stream().map(|result| {
+                result.map_err(|error| axum::Error::new(std::io::Error::other(error.to_string())))
+            }));
             let stream = futures_util::stream::unfold(
-                (body.into_data_stream(), tracker),
+                (stream, tracker),
                 move |(mut stream, mut tracker)| async move {
                     if tracker.finished {
                         return None;
@@ -1740,7 +1828,11 @@ async fn forward_http_tracked(
         let settings = app.settings.lock().await;
         let business_proxy = resolved_proxy(&settings, &app.mihomo);
         (
-            settings.upstream.clone(),
+            if settings.upstream_mode == UpstreamMode::Basispoints {
+                basispoints::DEFAULT_ENDPOINT.to_string()
+            } else {
+                settings.upstream.clone()
+            },
             settings.codex_home.clone(),
             business_proxy,
             settings.clone(),
@@ -1759,7 +1851,11 @@ async fn forward_http_tracked(
         );
     }
     let (mut parts, body) = req.into_parts();
-    let target = join_upstream(&upstream, &parts.uri)?;
+    let target = if request_settings.upstream_mode == UpstreamMode::Basispoints {
+        basispoints::DEFAULT_ENDPOINT.to_string()
+    } else {
+        join_upstream(&upstream, &parts.uri)?
+    };
     let path = parts.uri.path();
 
     // 先读取 body，以便从中提取或改写 model 字段
@@ -1808,13 +1904,22 @@ async fn forward_http_tracked(
     .await;
 
     let request_identity = app.sync_request_identity(Path::new(&home)).await;
+    if request_settings.upstream_mode == UpstreamMode::Basispoints && request_identity.is_none() {
+        anyhow::bail!("Basispoints 模式需要先登录 ChatGPT");
+    }
     let billing_identity_matches =
         request_identity
             .as_ref()
             .is_some_and(|(creds, override_headers)| {
                 *override_headers || !login::credentials_conflict_headers(&parts.headers, creds)
             });
-    if let Some((creds, true)) = &request_identity {
+    if request_settings.upstream_mode == UpstreamMode::Basispoints {
+        if let Some((creds, _)) = &request_identity {
+            if !login::apply_chatgpt_credentials_headers(&mut parts.headers, creds) {
+                anyhow::bail!("无法应用 ChatGPT 鉴权请求头");
+            }
+        }
+    } else if let Some((creds, true)) = &request_identity {
         if !login::apply_chatgpt_credentials_headers(&mut parts.headers, creds) {
             anyhow::bail!("无法应用 ChatGPT 鉴权请求头");
         }
@@ -1836,6 +1941,15 @@ async fn forward_http_tracked(
         details.account_id = effective_account
             .as_deref()
             .map(|id| logs::safe_text(id, 128));
+    }
+    if request_settings.upstream_mode == UpstreamMode::Basispoints {
+        if let Some((creds, _)) = &request_identity {
+            details.account_id = Some(logs::safe_text(&creds.account_id, 128));
+            details.account_email = creds
+                .email
+                .as_deref()
+                .map(|email| logs::safe_text(email, 254));
+        }
     }
     let request_model = crate::body_model::extract_model_from_body(&bytes);
     details.model = request_model
@@ -1946,12 +2060,20 @@ async fn forward_http_tracked(
     // still use the upstream WebSocket path in `proxy_ws` below.
     // WebSocket 链式续跑才认 previous_response_id；走 HTTP 时必须去掉，
     // 否则上游返回 "Invalid previous_response_id"。
+    let mut bps_lineage = None;
     if parts.method == http::Method::POST && path.contains("/responses") {
         let stripped =
             crate::body_model::strip_previous_response_id(&bytes, content_encoding.as_deref());
         if stripped.as_slice() != bytes.as_ref() {
             bytes = stripped.into();
             details.body_bytes = bytes.len();
+        }
+        if request_settings.upstream_mode == UpstreamMode::Basispoints {
+            let prepared = basispoints::prepare_request(&app.basispoints, &bytes).await?;
+            bytes = prepared.body.into();
+            bps_lineage = Some(prepared.lineage);
+            details.body_bytes = bytes.len();
+            parts.headers.remove(header::CONTENT_ENCODING);
         }
     }
     let http = app.business_client(&resolved_proxy).await?;
@@ -1963,6 +2085,7 @@ async fn forward_http_tracked(
         .body(bytes);
     for (name, value) in &parts.headers {
         if is_hop(name)
+            || name.as_str().starts_with("sec-websocket-")
             || (vm.enabled && identity::is_vm_identity_header(name.as_str()))
             || name.as_str().eq_ignore_ascii_case("x-codex-turn-state")
         {
@@ -2007,6 +2130,16 @@ async fn forward_http_tracked(
         {
             builder = builder.header("x-codex-routing-hint", vm.routing_hint(model));
         }
+    }
+    if request_settings.upstream_mode == UpstreamMode::Basispoints {
+        let account_id = parts
+            .headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        builder = builder
+            .header("x-openai-account-id", account_id)
+            .header("x-basispoints-auth-mode", "chatgpt");
     }
     let upstream_resp = match builder.send().await {
         Ok(response) => response,
@@ -2065,7 +2198,16 @@ async fn forward_http_tracked(
         let lifecycle = Arc::new(StreamLifecycle::new(started, response_header_ms));
         details.stream_lifecycle = Some(lifecycle.clone());
     }
-    let body = Body::from_stream(upstream_resp.bytes_stream());
+    let body_stream = upstream_resp.bytes_stream();
+    let body = if let Some(lineage) = bps_lineage {
+        Body::from_stream(basispoints::sse_stream(
+            body_stream,
+            app.basispoints.clone(),
+            lineage,
+        ))
+    } else {
+        Body::from_stream(body_stream)
+    };
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;

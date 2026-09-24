@@ -78,6 +78,7 @@ export interface Status {
   accountTraffic: { concurrentRequests: number; rpm: number };
   proxyListen: string;
   upstream: string;
+  upstreamMode: UpstreamMode;
   codexHome: string;
   proxyOk: boolean;
   attached: boolean;
@@ -136,6 +137,7 @@ export interface SettingsPatch {
   forcedModel: string;
   proxyListen: string;
   upstream: string;
+  upstreamMode: UpstreamMode;
   codexHome: string;
   outboundProxy: string;
   outboundMode: OutboundMode;
@@ -145,6 +147,7 @@ export interface SettingsPatch {
 }
 
 export type OutboundMode = "manual" | "mihomo";
+export type UpstreamMode = "chatgpt" | "basispoints";
 export type ProbeKind = "manual" | "mihomo" | "mihomo_codex";
 
 export interface LatencySample {

@@ -25,7 +25,7 @@ import { useNotice, useNotify } from "@/components/Notifier";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
 import { SHOW_SUSPECTED_DOWNGRADE_UI } from "@/lib/uiFlags";
-import type { DevicePlatform, SavedAccount, Status } from "@/types";
+import type { DevicePlatform, SavedAccount, Status, UpstreamMode } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -85,6 +85,7 @@ export default function App() {
   const [mihomoSubscription, setMihomoSubscription] = useState("");
   const [mihomoNode, setMihomoNode] = useState("");
   const [forcedModel, setForcedModel] = useState("");
+  const [upstreamMode, setUpstreamMode] = useState<UpstreamMode>("chatgpt");
   const [addAccountOpen, setAddAccountOpen] = useState(false);
   /** The saved account the login dialog re-authorizes; null adds a new one. */
   const [reauthTarget, setReauthTarget] = useState<SavedAccount | null>(null);
@@ -143,6 +144,7 @@ export default function App() {
     setMihomoSubscription(fwd.status.mihomoSubscription ?? "");
     setMihomoNode(fwd.status.mihomoNode ?? "");
     setForcedModel(fwd.status.forcedModel ?? "");
+    setUpstreamMode(fwd.status.upstreamMode ?? "chatgpt");
   }, [fwd.status]);
 
   // Switching accounts swaps the bound outbound line and virtual device on
@@ -467,6 +469,24 @@ export default function App() {
           <header>
             <div className="section-heading"><span className="section-icon"><Settings2 size={19} /></span><div><h2>转发设置</h2><p>本机 Codex 目录与上游模型</p></div></div>
           </header>
+          <label className="field">
+            <span>上游模式</span>
+            <Select
+              variant="compact"
+              ariaLabel="选择上游模式"
+              value={upstreamMode}
+              options={[
+                { value: "chatgpt", label: "ChatGPT 官方上游" },
+                { value: "basispoints", label: "Basispoints（Excel Responses）" },
+              ]}
+              onChange={(next) => {
+                const mode = next as UpstreamMode;
+                setUpstreamMode(mode);
+                void fwd.saveUpstreamMode(mode);
+              }}
+            />
+          </label>
+          <p className="panel__hint">Basispoints 会复用当前 ChatGPT 登录凭据；工具请求通过代理协议转换，不执行 OfficeJS。</p>
           <label className="field">
             <span>Codex 工作目录</span>
             <input spellCheck={false} disabled={fwd.busy !== null} value={codexHome} onChange={(event) => setCodexHome(event.target.value)}

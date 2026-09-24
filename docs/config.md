@@ -60,6 +60,7 @@ openai_base_url = "http://127.0.0.1:8787"
 | --- | --- |
 | `proxy_listen` | 本机监听地址，默认 `127.0.0.1:8787`；开发版为 `8788` |
 | `upstream` | 上游地址，默认 `https://chatgpt.com/backend-api/codex` |
+| `upstream_mode` | `chatgpt`（默认）或 `basispoints`；后者固定使用 Basispoints Responses HTTP SSE，复用当前 ChatGPT 登录，并通过 `run_officejs` 协议转换客户端工具调用，不执行 OfficeJS |
 | `codex_home` | Codex 配置目录的完整路径 |
 | `outbound_mode` | `manual`（默认）或 `mihomo`；旧值 `warp` 按 `manual` 读取 |
 | `outbound_proxy` | 手动代理 URL；切换模式时保留。可把出口写成 `{session}`，见[出站代理](outbound.md) |
