@@ -1074,6 +1074,7 @@ async fn client_bps_ws_session(
     client_headers: HeaderMap,
     mut socket: WebSocket,
 ) -> Result<()> {
+    let mut history = basispoints::WsHistory::default();
     while let Some(message) = socket.recv().await {
         let message = message.context("读取 BPS WebSocket 客户端消息")?;
         let text = match message {
@@ -1085,6 +1086,27 @@ async fn client_bps_ws_session(
             }
             WsMessage::Pong(_) | WsMessage::Binary(_) => continue,
         };
+        let request_body = match history.expand(&text) {
+            Ok(body) => body,
+            Err(_) => {
+                socket.send(WsMessage::text(json!({"type":"error", "status":400, "error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"Send a full response.create request without previous_response_id"}}).to_string())).await?;
+                continue;
+            }
+        };
+        if request_body
+            .get("generate")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        {
+            let response = json!({"id":format!("resp_{}",uuid::Uuid::new_v4().simple()),"object":"response","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}});
+            history.remember(&request_body, &response);
+            socket
+                .send(WsMessage::text(
+                    json!({"type":"response.completed","response":response}).to_string(),
+                ))
+                .await?;
+            continue;
+        }
         let mut builder = Request::builder()
             .method(http::Method::POST)
             .uri("/responses");
@@ -1096,7 +1118,7 @@ async fn client_bps_ws_session(
         }
         builder = builder.header(header::ACCEPT, "text/event-stream");
         let request = builder
-            .body(Body::from(text))
+            .body(Body::from(serde_json::to_vec(&request_body)?))
             .context("构造 BPS HTTP 请求")?;
         let response = proxy_http(app.clone(), request).await;
         let status = response.status();
@@ -1119,7 +1141,16 @@ async fn client_bps_ws_session(
                     .lines()
                     .find_map(|line| line.strip_prefix("data:").map(str::trim))
                 {
-                    socket.send(WsMessage::text(data.to_string())).await.ok();
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
+                        if event.get("type").and_then(serde_json::Value::as_str)
+                            == Some("response.completed")
+                        {
+                            if let Some(response) = event.get("response") {
+                                history.remember(&request_body, response);
+                            }
+                        }
+                    }
+                    socket.send(WsMessage::text(data.to_string())).await?;
                 }
             }
         }
@@ -1828,11 +1859,7 @@ async fn forward_http_tracked(
         let settings = app.settings.lock().await;
         let business_proxy = resolved_proxy(&settings, &app.mihomo);
         (
-            if settings.upstream_mode == UpstreamMode::Basispoints {
-                basispoints::DEFAULT_ENDPOINT.to_string()
-            } else {
-                settings.upstream.clone()
-            },
+            settings.upstream.clone(),
             settings.codex_home.clone(),
             business_proxy,
             settings.clone(),
@@ -1853,7 +1880,11 @@ async fn forward_http_tracked(
     let (mut parts, body) = req.into_parts();
     let target = if request_settings.upstream_mode == UpstreamMode::Basispoints
         && parts.method == http::Method::POST
-        && parts.uri.path().contains("/responses")
+        && parts
+            .uri
+            .path()
+            .trim_end_matches('/')
+            .ends_with("/responses")
     {
         basispoints::DEFAULT_ENDPOINT.to_string()
     } else {
@@ -2077,6 +2108,11 @@ async fn forward_http_tracked(
             bps_lineage = Some(prepared.lineage);
             details.body_bytes = bytes.len();
             parts.headers.remove(header::CONTENT_ENCODING);
+            parts.headers.remove(header::CONTENT_LENGTH);
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
         }
     }
     let http = app.business_client(&resolved_proxy).await?;
@@ -2220,7 +2256,9 @@ async fn forward_http_tracked(
         details.stream_lifecycle = Some(lifecycle.clone());
     }
     let body_stream = upstream_resp.bytes_stream();
-    let body = if let Some(lineage) = bps_lineage {
+    let body = if let Some(lineage) =
+        bps_lineage.filter(|_| status.is_success() && details.transport == "http_sse")
+    {
         Body::from_stream(basispoints::sse_stream(
             body_stream,
             app.basispoints.clone(),

@@ -25,6 +25,8 @@ struct ToolSpec {
     kind: String,
     namespace: Option<String>,
     schema: Value,
+    description: Value,
+    format: Value,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -151,6 +153,8 @@ fn collect_tools(
                 kind: kind.to_owned(),
                 namespace: namespace.map(str::to_owned),
                 schema,
+                description: tool.get("description").cloned().unwrap_or(Value::Null),
+                format: tool.get("format").cloned().unwrap_or(Value::Null),
             },
         );
     }
@@ -162,7 +166,7 @@ fn developer_catalog(tools: &HashMap<String, ToolSpec>) -> String {
     keys.sort();
     for key in keys {
         let tool = &tools[key];
-        entries.push(json!({"name": key, "tool": tool.name, "namespace": tool.namespace, "type": tool.kind, "parameters": tool.schema}));
+        entries.push(json!({"name": key, "tool": tool.name, "namespace": tool.namespace, "type": tool.kind, "parameters": tool.schema, "description": tool.description, "format": tool.format}));
     }
     format!(
         "This request is relayed through the Basispoints Responses API. Client tools are available through the native {TRANSPORT_NAME} transport; it never executes OfficeJS. Call {TRANSPORT_NAME} exactly once per client tool request. Its code field is JSON text containing one object with name and arguments (or input for custom tools). Do not put JavaScript or another transport envelope in code. Available client tools: {}",
@@ -303,11 +307,8 @@ fn normalize_input_item(
             if let Some(object) = output.as_object_mut() {
                 object.insert("type".into(), json!("function_call_output"));
                 if let Some(call_id) = call_id.as_deref() {
-                    if let Some(native) = calls.get(call_id) {
-                        if let Some(id) = native.item.get("id") {
-                            object.insert("id".into(), id.clone());
-                        }
-                    }
+                    let _ = calls.get(call_id);
+                    object.insert("id".into(), json!(format!("fc_{call_id}")));
                 }
             }
             Some(output)
@@ -316,11 +317,8 @@ fn normalize_input_item(
             let mut output = item;
             if let Some(object) = output.as_object_mut() {
                 if let Some(call_id) = string_field(object.get("call_id")) {
-                    if let Some(native) = calls.get(&call_id) {
-                        if let Some(id) = native.item.get("id") {
-                            object.insert("id".into(), id.clone());
-                        }
-                    }
+                    let _ = calls.get(&call_id);
+                    object.insert("id".into(), json!(format!("fc_{call_id}")));
                 }
             }
             Some(output)
@@ -340,8 +338,20 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
         .as_object_mut()
         .ok_or_else(|| anyhow!("BPS 请求体必须是 JSON 对象"))?;
     let effort = basispoints_effort(object);
+    let instructions = object
+        .get("instructions")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
     let mut tools = HashMap::new();
-    collect_tools(object.get("tools"), None, &mut tools);
+    if object
+        .get("tool_choice")
+        .and_then(Value::as_str)
+        .map(|value| value != "none")
+        .unwrap_or(true)
+    {
+        collect_tools(object.get("tools"), None, &mut tools);
+    }
     let mut guard = state.lock().await;
     if guard.lineages.len() > MAX_LINEAGES {
         if let Some(oldest) = guard.lineages.keys().next().cloned() {
@@ -351,7 +361,7 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
         }
     }
     let entry = guard.lineages.entry(lineage.clone()).or_default();
-    if !tools.is_empty() {
+    if object.contains_key("tools") {
         entry.tools = tools.clone();
     }
     let tools = entry.tools.clone();
@@ -362,7 +372,11 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
     let iteration = input
         .as_array()
         .map(|items| {
-            items
+            let last_user = items
+                .iter()
+                .rposition(|item| item.get("role").and_then(Value::as_str) == Some("user"));
+            let start = last_user.map(|index| index + 1).unwrap_or(0);
+            items[start..]
                 .iter()
                 .filter(|item| {
                     matches!(
@@ -383,7 +397,7 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
                 .filter_map(|item| normalize_input_item(item, &entry.calls, &entry.tools))
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| input.as_str().map(|text| vec![json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]})]).unwrap_or_default());
     object.insert("input".into(), Value::Array(translated_input));
     object.remove("tools");
     object.remove("tool_choice");
@@ -422,12 +436,8 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
         object.remove(key);
     }
     let mut prefix = vec![message(developer_catalog(&tools))];
-    if let Some(instructions) = object
-        .get("instructions")
-        .and_then(Value::as_str)
-        .filter(|v| !v.trim().is_empty())
-    {
-        prefix.insert(0, message(instructions.to_owned()));
+    if let Some(instructions) = instructions {
+        prefix.insert(0, message(instructions));
     }
     let current_input = object.remove("input").unwrap_or_else(|| json!([]));
     let mut all = prefix;
@@ -439,6 +449,21 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
         other => all.push(other),
     }
     object.insert("input".into(), Value::Array(all));
+    object.insert("stream".into(), json!(true));
+    object.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "model"
+                | "model_selection"
+                | "reasoning_effort"
+                | "store"
+                | "stream"
+                | "input"
+                | "context_management"
+                | "metadata"
+                | "prompt_cache_key"
+        )
+    });
     Ok(PreparedRequest {
         body: serde_json::to_vec(&body)?,
         lineage,
@@ -506,9 +531,13 @@ fn translated_item(native: &Value, spec: &ToolSpec, payload: &Value) -> Value {
         .unwrap_or_else(|| json!(format!("fc_{}", call_id.as_str().unwrap_or("unknown"))));
     let args = serde_json::to_string(payload).unwrap_or_else(|_| "{}".into());
     if spec.kind == "custom" {
-        json!({"type":"custom_tool_call","id":id,"call_id":call_id,"name":spec.name,"input":args,"status":"completed"})
+        json!({"type":"custom_tool_call","id":id,"call_id":call_id,"name":spec.name,"input":payload.as_str().unwrap_or_default(),"status":"completed"})
     } else {
-        json!({"type":"function_call","id":id,"call_id":call_id,"name":spec.name,"arguments":args,"status":"completed"})
+        let mut item = json!({"type":"function_call","id":id,"call_id":call_id,"name":spec.name,"arguments":args,"status":"completed"});
+        if let Some(namespace) = &spec.namespace {
+            item["namespace"] = json!(namespace);
+        }
+        item
     }
 }
 
@@ -525,7 +554,23 @@ pub async fn transform_event(
         kind,
         "response.completed" | "response.failed" | "response.incomplete" | "error"
     ) {
-        return Some(vec![event.clone()]);
+        let mut terminal = event.clone();
+        if let Some(items) = terminal
+            .pointer_mut("/response/output")
+            .and_then(Value::as_array_mut)
+        {
+            let guard = state.lock().await;
+            if let Some(l) = guard.lineages.get(lineage) {
+                for item in items {
+                    if let Some((name, payload)) = transport_arguments(item) {
+                        if let Some(spec) = l.tools.get(&name) {
+                            *item = translated_item(item, spec, &payload);
+                        }
+                    }
+                }
+            }
+        }
+        return Some(vec![terminal]);
     }
     let item = event
         .get("item")
@@ -554,18 +599,30 @@ pub async fn transform_event(
             return Some(Vec::new());
         }
     }
-    if kind == "response.function_call_arguments.done" || kind == "response.output_item.done" {
+    if kind.contains("function_call_arguments") {
+        let guard = state.lock().await;
+        let pending = event
+            .get("item_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| {
+                guard
+                    .lineages
+                    .get(lineage)
+                    .is_some_and(|l| l.pending.contains_key(id))
+            });
+        return Some(if pending { vec![] } else { vec![event.clone()] });
+    }
+    if kind == "response.output_item.done" {
         let key = string_field(event.get("item_id"))
             .or_else(|| item.and_then(|v| string_field(v.get("id"))));
         let mut native = {
             let mut guard = state.lock().await;
             let lineage_state = guard.lineages.entry(lineage.to_owned()).or_default();
             let key = key.or_else(|| item.and_then(|v| string_field(v.get("call_id"))));
-            key.and_then(|key| lineage_state.pending.remove(&key))
-                .or_else(|| {
-                    item.filter(|v| v.get("name").and_then(Value::as_str) == Some(TRANSPORT_NAME))
-                        .cloned()
-                })
+            let pending = key.and_then(|key| lineage_state.pending.remove(&key));
+            item.filter(|v| v.get("name").and_then(Value::as_str) == Some(TRANSPORT_NAME))
+                .cloned()
+                .or(pending)
         }?;
         if let Some(arguments) = event.get("arguments").and_then(Value::as_str) {
             native["arguments"] = json!(arguments);
@@ -796,5 +853,75 @@ mod tests {
         assert!(input.iter().all(|item| item["type"] != "reasoning"));
         assert!(input.iter().all(|item| item["type"] != "item_reference"));
         assert_eq!(input.last().unwrap()["type"], "function_call_output");
+    }
+
+    #[test]
+    fn websocket_history_expands_incremental_response_create() {
+        let mut history = WsHistory::default();
+        let first = json!({"type":"response.create","input":[{"role":"user","content":[{"type":"input_text","text":"one"}]}]});
+        let response = json!({"id":"resp_1","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]});
+        history.remember(&first, &response);
+        let expanded = history
+            .expand(r#"{"type":"response.create","previous_response_id":"resp_1","input":[{"role":"user","content":[{"type":"input_text","text":"two"}]}]}"#)
+            .unwrap();
+        assert!(expanded.get("previous_response_id").is_none());
+        assert_eq!(expanded["input"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn websocket_history_rejects_unknown_previous_response() {
+        let history = WsHistory::default();
+        let error = history
+            .expand(r#"{"type":"response.create","previous_response_id":"missing","input":[]}"#)
+            .unwrap_err();
+        assert!(error.to_string().contains("previous_response_not_found"));
+    }
+}
+
+/// Per-socket history: Codex WS v2 sends only the input delta after a response.
+#[derive(Default)]
+pub struct WsHistory {
+    histories: HashMap<String, Vec<Value>>,
+}
+impl WsHistory {
+    pub fn expand(&self, frame: &str) -> Result<Value> {
+        let mut body: Value = serde_json::from_str(frame)?;
+        if body.get("type").and_then(Value::as_str) != Some("response.create") {
+            anyhow::bail!("unsupported websocket event");
+        }
+        if let Some(previous) = body.get("previous_response_id").and_then(Value::as_str) {
+            let mut history = self
+                .histories
+                .get(previous)
+                .cloned()
+                .ok_or_else(|| anyhow!("previous_response_not_found"))?;
+            history.extend(
+                body.get("input")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            body["input"] = json!(history);
+        }
+        body.as_object_mut().unwrap().remove("previous_response_id");
+        Ok(body)
+    }
+    pub fn remember(&mut self, request: &Value, response: &Value) {
+        if let Some(id) = response.get("id").and_then(Value::as_str) {
+            let mut items = request
+                .get("input")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            items.extend(
+                response
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            self.histories.clear(); // Codex continues from the most recent completed response.
+            self.histories.insert(id.to_owned(), items);
+        }
     }
 }
