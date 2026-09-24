@@ -1111,7 +1111,10 @@ async fn client_bps_ws_session(
             .method(http::Method::POST)
             .uri("/responses");
         for (name, value) in &client_headers {
-            if is_hop(name) || name.as_str().eq_ignore_ascii_case("upgrade") {
+            if is_hop(name)
+                || name.as_str().eq_ignore_ascii_case("upgrade")
+                || name.as_str().starts_with("sec-websocket-")
+            {
                 continue;
             }
             builder = builder.header(name, value);
@@ -1135,8 +1138,18 @@ async fn client_bps_ws_session(
         let mut pending = Vec::new();
         while let Some(chunk) = body.next().await {
             pending.extend_from_slice(&chunk.context("读取 BPS SSE")?);
-            while let Some(pos) = pending.windows(2).position(|pair| pair == b"\n\n") {
-                let block: Vec<u8> = pending.drain(..pos + 2).collect();
+            while let Some((pos, separator_len)) = pending
+                .windows(4)
+                .position(|pair| pair == b"\r\n\r\n")
+                .map(|pos| (pos, 4))
+                .or_else(|| {
+                    pending
+                        .windows(2)
+                        .position(|pair| pair == b"\n\n")
+                        .map(|pos| (pos, 2))
+                })
+            {
+                let block: Vec<u8> = pending.drain(..pos + separator_len).collect();
                 if let Some(data) = String::from_utf8_lossy(&block)
                     .lines()
                     .find_map(|line| line.strip_prefix("data:").map(str::trim))
@@ -2240,7 +2253,11 @@ async fn forward_http_tracked(
         .into(),
     );
 
-    eprintln!("[resp] {} {} → {}", parts.method, path, resp_status_u16);
+    debug_log(format!(
+        "[resp] {} {} → {}",
+        parts.method, path, resp_status_u16
+    ))
+    .await;
 
     let status = StatusCode::from_u16(resp_status_u16)?;
     let mut headers = HeaderMap::new();
@@ -2258,6 +2275,23 @@ async fn forward_http_tracked(
     if details.transport == "http_sse" {
         let lifecycle = Arc::new(StreamLifecycle::new(started, response_header_ms));
         details.stream_lifecycle = Some(lifecycle.clone());
+    }
+    // Preserve the upstream error body and log a bounded, redacted summary.
+    // Without this, a BPS 422 only appeared as a status code in dev logs,
+    // making malformed input and authentication failures indistinguishable.
+    if request_settings.upstream_mode == UpstreamMode::Basispoints && !status.is_success() {
+        let error_body = upstream_resp.bytes().await.unwrap_or_default();
+        let summary = String::from_utf8_lossy(&error_body);
+        let summary = logs::safe_text(summary.trim(), 2048);
+        debug_log(format!(
+            "[bps] upstream error status={} body={}",
+            status, summary
+        ))
+        .await;
+        let mut response = Response::new(Body::from(error_body));
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        return Ok(response);
     }
     let body_stream = upstream_resp.bytes_stream();
     let body = if let Some(lineage) =
