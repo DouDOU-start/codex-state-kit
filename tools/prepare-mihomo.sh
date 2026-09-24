@@ -32,6 +32,26 @@ actual="$(shasum -a 256 "$archive" | awk '{print tolower($1)}')"
 
 tmp="$download_dir/mihomo-darwin-${asset_arch}"
 gzip -dc "$archive" > "$tmp"
+
+# Verify the decompressed executable before it is copied into the bundle. A
+# checksum only proves that we downloaded the expected archive; it does not
+# protect against selecting the wrong architecture during a cross-build.
+binary_info="$(file -b "$tmp")"
+case "$asset_arch" in
+  arm64)
+    [[ "$binary_info" == *"arm64"* ]] || {
+      echo "Mihomo architecture mismatch: expected arm64, got $binary_info" >&2
+      exit 1
+    }
+    ;;
+  amd64)
+    [[ "$binary_info" == *"x86_64"* ]] || {
+      echo "Mihomo architecture mismatch: expected x86_64, got $binary_info" >&2
+      exit 1
+    }
+    ;;
+esac
+
 rm -f "$resource_dir/mihomo" "$resource_dir/mihomo.exe"
 install -m 0755 "$tmp" "$resource_dir/mihomo"
 echo "Bundled mihomo ${version} (Darwin ${asset_arch}); SHA-256 verified."
