@@ -67,7 +67,10 @@ fn string_field(value: Option<&Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn lineage_key(body: &Value, input: &Value) -> String {
+fn lineage_key(body: &Value, input: &Value, account_id: Option<&str>) -> String {
+    let model = string_field(body.get("model")).unwrap_or_else(|| "unknown-model".into());
+    let account = account_id.unwrap_or("unknown-account");
+    let scope = |value: String| format!("account:{account}|model:{model}|{value}");
     for key in [
         "prompt_cache_key",
         "promptCacheKey",
@@ -75,22 +78,22 @@ fn lineage_key(body: &Value, input: &Value) -> String {
         "sessionId",
     ] {
         if let Some(value) = string_field(body.get(key)) {
-            return value;
+            return scope(value);
         }
     }
     for key in ["thread_id", "session_id"] {
         if let Some(value) = body.pointer(&format!("/client_metadata/{key}")) {
             if let Some(value) = string_field(Some(value)) {
-                return value;
+                return scope(value);
             }
         }
     }
     if let Some(items) = input.as_array() {
         if let Some(first) = items.first() {
-            return format!("root:{}", digest(first));
+            return scope(format!("root:{}", digest(first)));
         }
     }
-    "anonymous".into()
+    scope("anonymous".into())
 }
 
 fn turn_fingerprint(input: &Value) -> String {
@@ -327,13 +330,17 @@ fn normalize_input_item(
     }
 }
 
-pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result<PreparedRequest> {
+pub async fn prepare_request(
+    state: &Arc<Mutex<BpsState>>,
+    raw: &[u8],
+    account_id: Option<&str>,
+) -> Result<PreparedRequest> {
     let plain = decode_body(raw)?;
     let mut body: Value =
         serde_json::from_slice(&plain).map_err(|_| anyhow!("BPS 请求体不是 JSON"))?;
     let client_turn = string_field(body.pointer("/client_metadata/turn_id"));
     let input = body.get("input").cloned().unwrap_or_else(|| json!([]));
-    let lineage = lineage_key(&body, &input);
+    let lineage = lineage_key(&body, &input, account_id);
     let object = body
         .as_object_mut()
         .ok_or_else(|| anyhow!("BPS 请求体必须是 JSON 对象"))?;
@@ -750,9 +757,13 @@ mod tests {
     async fn strips_tools_and_injects_catalog() {
         let state = Arc::new(Mutex::new(BpsState::default()));
         let request = json!({"model":"gpt-5.6-sol","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object"}}],"tool_choice":"auto"});
-        let prepared = prepare_request(&state, serde_json::to_vec(&request).unwrap().as_slice())
-            .await
-            .unwrap();
+        let prepared = prepare_request(
+            &state,
+            serde_json::to_vec(&request).unwrap().as_slice(),
+            None,
+        )
+        .await
+        .unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
@@ -767,9 +778,13 @@ mod tests {
     async fn translates_nested_run_officejs_call_and_keeps_native_item() {
         let state = Arc::new(Mutex::new(BpsState::default()));
         let request = json!({"input":[{"role":"user","content":[{"type":"input_text","text":"weather"}]}],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object"}}]});
-        let prepared = prepare_request(&state, serde_json::to_vec(&request).unwrap().as_slice())
-            .await
-            .unwrap();
+        let prepared = prepare_request(
+            &state,
+            serde_json::to_vec(&request).unwrap().as_slice(),
+            None,
+        )
+        .await
+        .unwrap();
         let native = json!({"type":"function_call","id":"fc_native","call_id":"call_native","name":"run_officejs","arguments":serde_json::to_string(&json!({"summary":"weather","code":serde_json::to_string(&json!({"name":"get_weather","arguments":{"city":"Tokyo"}})).unwrap()})).unwrap()});
         let added = transform_event(
             &state,
@@ -790,9 +805,13 @@ mod tests {
         assert_eq!(done[0]["item"]["name"], "get_weather");
         assert_eq!(done[0]["item"]["arguments"], "{\"city\":\"Tokyo\"}");
         let replay = json!({"input":[{"role":"user","content":[{"type":"input_text","text":"weather"}]},{"type":"function_call","id":"fc_native","call_id":"call_native","name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"},{"type":"function_call_output","call_id":"call_native","output":"18C"}],"metadata":{"turn_id":"fixed"}});
-        let replay = prepare_request(&state, serde_json::to_vec(&replay).unwrap().as_slice())
-            .await
-            .unwrap();
+        let replay = prepare_request(
+            &state,
+            serde_json::to_vec(&replay).unwrap().as_slice(),
+            None,
+        )
+        .await
+        .unwrap();
         let replay: Value = serde_json::from_slice(&replay.body).unwrap();
         assert_eq!(replay["metadata"]["agent_iteration"], "2");
         assert_eq!(replay["input"][2]["name"], "run_officejs");
@@ -802,9 +821,13 @@ mod tests {
     async fn maps_max_effort_to_xhigh() {
         let state = Arc::new(Mutex::new(BpsState::default()));
         let request = json!({"reasoning":{"effort":"max"},"input":"hello"});
-        let prepared = prepare_request(&state, serde_json::to_vec(&request).unwrap().as_slice())
-            .await
-            .unwrap();
+        let prepared = prepare_request(
+            &state,
+            serde_json::to_vec(&request).unwrap().as_slice(),
+            None,
+        )
+        .await
+        .unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(body["reasoning_effort"], "xhigh");
         assert!(body.get("reasoning").is_none());
@@ -821,9 +844,13 @@ mod tests {
             "input":"hello",
             "stream":true
         });
-        let prepared = prepare_request(&state, serde_json::to_vec(&request).unwrap().as_slice())
-            .await
-            .unwrap();
+        let prepared = prepare_request(
+            &state,
+            serde_json::to_vec(&request).unwrap().as_slice(),
+            None,
+        )
+        .await
+        .unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(body["model"], "gpt-5.6-sol");
         assert_eq!(body["model_selection"], "explicit");
@@ -845,9 +872,13 @@ mod tests {
                 {"type":"custom_tool_call_output","call_id":"call_x","output":"ok"}
             ]
         });
-        let prepared = prepare_request(&state, serde_json::to_vec(&request).unwrap().as_slice())
-            .await
-            .unwrap();
+        let prepared = prepare_request(
+            &state,
+            serde_json::to_vec(&request).unwrap().as_slice(),
+            None,
+        )
+        .await
+        .unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         let input = body["input"].as_array().unwrap();
         assert!(input.iter().all(|item| item["type"] != "reasoning"));
@@ -875,6 +906,27 @@ mod tests {
             .expand(r#"{"type":"response.create","previous_response_id":"missing","input":[]}"#)
             .unwrap_err();
         assert!(error.to_string().contains("previous_response_not_found"));
+    }
+
+    #[tokio::test]
+    async fn state_lineage_isolated_by_account_and_model() {
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let request = json!({"model":"gpt-6-astra","input":"hello"});
+        let first = prepare_request(
+            &state,
+            serde_json::to_vec(&request).unwrap().as_slice(),
+            Some("account-a"),
+        )
+        .await
+        .unwrap();
+        let second = prepare_request(
+            &state,
+            serde_json::to_vec(&request).unwrap().as_slice(),
+            Some("account-b"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first.lineage, second.lineage);
     }
 }
 

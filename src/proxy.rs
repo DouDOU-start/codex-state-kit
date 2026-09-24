@@ -2103,7 +2103,11 @@ async fn forward_http_tracked(
             details.body_bytes = bytes.len();
         }
         if request_settings.upstream_mode == UpstreamMode::Basispoints {
-            let prepared = basispoints::prepare_request(&app.basispoints, &bytes).await?;
+            let account_id = request_identity
+                .as_ref()
+                .map(|(credentials, _)| credentials.account_id.as_str());
+            let prepared =
+                basispoints::prepare_request(&app.basispoints, &bytes, account_id).await?;
             bytes = prepared.body.into();
             bps_lineage = Some(prepared.lineage);
             details.body_bytes = bytes.len();
