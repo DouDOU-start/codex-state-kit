@@ -260,7 +260,11 @@ fn fallback_transport_call(item: &Value) -> Value {
     })
 }
 
-fn normalize_input_item(item: &Value, calls: &HashMap<String, NativeCall>) -> Option<Value> {
+fn normalize_input_item(
+    item: &Value,
+    calls: &HashMap<String, NativeCall>,
+    tools: &HashMap<String, ToolSpec>,
+) -> Option<Value> {
     let mut item = item.clone();
     if let Some(object) = item.as_object_mut() {
         object.remove("internal_chat_message_metadata_passthrough");
@@ -274,19 +278,22 @@ fn normalize_input_item(item: &Value, calls: &HashMap<String, NativeCall>) -> Op
             }
             let mut kept = Map::new();
             kept.insert("type".into(), json!("reasoning"));
-            kept.insert(
-                "summary".into(),
-                item.get("summary").cloned().unwrap_or_else(|| json!([])),
-            );
+            // Basispoints accepts encrypted reasoning continuity, but not the
+            // richer Codex summary item vocabulary.
+            kept.insert("summary".into(), json!([]));
             kept.insert("encrypted_content".into(), json!(encrypted));
             Some(Value::Object(kept))
         }
         "item_reference" => None,
         "function_call" | "custom_tool_call" => {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
             if let Some(call_id) = string_field(item.get("call_id")) {
                 if let Some(native) = calls.get(&call_id) {
                     return Some(native.item.clone());
                 }
+            }
+            if name == "update_plan" || !tools.contains_key(name) {
+                return Some(item);
             }
             Some(fallback_transport_call(&item))
         }
@@ -373,7 +380,7 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| normalize_input_item(item, &entry.calls))
+                .filter_map(|item| normalize_input_item(item, &entry.calls, &entry.tools))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();

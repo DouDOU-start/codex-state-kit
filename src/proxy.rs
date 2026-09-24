@@ -1851,7 +1851,10 @@ async fn forward_http_tracked(
         );
     }
     let (mut parts, body) = req.into_parts();
-    let target = if request_settings.upstream_mode == UpstreamMode::Basispoints {
+    let target = if request_settings.upstream_mode == UpstreamMode::Basispoints
+        && parts.method == http::Method::POST
+        && parts.uri.path().contains("/responses")
+    {
         basispoints::DEFAULT_ENDPOINT.to_string()
     } else {
         join_upstream(&upstream, &parts.uri)?
