@@ -225,6 +225,103 @@ fn basispoints_effort(object: &Map<String, Value>) -> String {
     }
 }
 
+fn fallback_transport_call(item: &Value) -> Value {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+    let call_id = string_field(item.get("call_id")).unwrap_or_else(|| "call_unknown".into());
+    let mut inner = Map::new();
+    inner.insert("name".into(), json!(name));
+    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+        inner.insert(
+            "input".into(),
+            item.get("input").cloned().unwrap_or_else(|| json!("")),
+        );
+    } else {
+        let arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .unwrap_or_else(|| json!({}));
+        inner.insert("arguments".into(), arguments);
+    }
+    let outer = json!({
+        "summary": format!("Run client tool {name}"),
+        "extended_summary": format!("Relay {name} through the external client"),
+        "code": serde_json::to_string(&Value::Object(inner)).unwrap_or_else(|_| "{}".into()),
+        "destructive": false,
+        "references": [],
+    });
+    json!({
+        "type":"function_call",
+        "id":format!("fc_{call_id}"),
+        "call_id":call_id,
+        "name":TRANSPORT_NAME,
+        "arguments":serde_json::to_string(&outer).unwrap_or_else(|_| "{}".into()),
+        "status":"completed"
+    })
+}
+
+fn normalize_input_item(item: &Value, calls: &HashMap<String, NativeCall>) -> Option<Value> {
+    let mut item = item.clone();
+    if let Some(object) = item.as_object_mut() {
+        object.remove("internal_chat_message_metadata_passthrough");
+    }
+    let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    match kind {
+        "reasoning" => {
+            let encrypted = item.get("encrypted_content").and_then(Value::as_str)?;
+            if encrypted.is_empty() {
+                return None;
+            }
+            let mut kept = Map::new();
+            kept.insert("type".into(), json!("reasoning"));
+            kept.insert(
+                "summary".into(),
+                item.get("summary").cloned().unwrap_or_else(|| json!([])),
+            );
+            kept.insert("encrypted_content".into(), json!(encrypted));
+            Some(Value::Object(kept))
+        }
+        "item_reference" => None,
+        "function_call" | "custom_tool_call" => {
+            if let Some(call_id) = string_field(item.get("call_id")) {
+                if let Some(native) = calls.get(&call_id) {
+                    return Some(native.item.clone());
+                }
+            }
+            Some(fallback_transport_call(&item))
+        }
+        "custom_tool_call_output" => {
+            let call_id = string_field(item.get("call_id"));
+            let mut output = item;
+            if let Some(object) = output.as_object_mut() {
+                object.insert("type".into(), json!("function_call_output"));
+                if let Some(call_id) = call_id.as_deref() {
+                    if let Some(native) = calls.get(call_id) {
+                        if let Some(id) = native.item.get("id") {
+                            object.insert("id".into(), id.clone());
+                        }
+                    }
+                }
+            }
+            Some(output)
+        }
+        "function_call_output" => {
+            let mut output = item;
+            if let Some(object) = output.as_object_mut() {
+                if let Some(call_id) = string_field(object.get("call_id")) {
+                    if let Some(native) = calls.get(&call_id) {
+                        if let Some(id) = native.item.get("id") {
+                            object.insert("id".into(), id.clone());
+                        }
+                    }
+                }
+            }
+            Some(output)
+        }
+        _ => Some(item),
+    }
+}
+
 pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result<PreparedRequest> {
     let plain = decode_body(raw)?;
     let mut body: Value =
@@ -271,23 +368,16 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
         })
         .unwrap_or(1);
 
-    let mut translated_input = input.as_array().cloned().unwrap_or_default();
-    for item in &mut translated_input {
-        let Some(kind) = item.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        if matches!(kind, "function_call" | "custom_tool_call") {
-            if let Some(call_id) = string_field(item.get("call_id")) {
-                if let Some(native) = entry.calls.get(&call_id).map(|call| call.item.clone()) {
-                    *item = native;
-                }
-            }
-        }
-    }
-    object.insert(
-        "input".into(),
-        Value::Array(std::mem::take(&mut translated_input)),
-    );
+    let translated_input = input
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| normalize_input_item(item, &entry.calls))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    object.insert("input".into(), Value::Array(translated_input));
     object.remove("tools");
     object.remove("tool_choice");
     let mut metadata = metadata_string_map(object.get("metadata"));
@@ -678,5 +768,26 @@ mod tests {
         assert!(body.get("instructions").is_none());
         assert!(body.get("client_metadata").is_none());
         assert_eq!(body["context_management"][0]["type"], "compaction");
+    }
+
+    #[tokio::test]
+    async fn filters_codex_history_items_for_bps_replay() {
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let request = json!({
+            "input":[
+                {"type":"reasoning","summary":[]},
+                {"type":"item_reference","id":"old"},
+                {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"custom_tool_call_output","call_id":"call_x","output":"ok"}
+            ]
+        });
+        let prepared = prepare_request(&state, serde_json::to_vec(&request).unwrap().as_slice())
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().all(|item| item["type"] != "reasoning"));
+        assert!(input.iter().all(|item| item["type"] != "item_reference"));
+        assert_eq!(input.last().unwrap()["type"], "function_call_output");
     }
 }
