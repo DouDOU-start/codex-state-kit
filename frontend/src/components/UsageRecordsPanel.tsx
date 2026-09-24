@@ -13,6 +13,7 @@ import { PAGE_SIZES, Pager } from "@/components/Pager";
 import { RefreshControl } from "@/components/RefreshControl";
 import { usePolling } from "@/hooks/usePolling";
 import { useNotify } from "@/components/Notifier";
+import { SHOW_SUSPECTED_DOWNGRADE_UI } from "@/lib/uiFlags";
 import type { BillingRecord, DowngradeReport, LogEntry, SavedAccount, Status } from "@/types";
 
 interface UsageRecordsPanelProps {
@@ -377,7 +378,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                   ? null
                   : (record.inputTokens ?? 0) + (record.outputTokens ?? 0);
                 return (
-                  <tr key={record.requestId} className={record.downgrade ? `usage-row--${record.downgrade.verdict}` : undefined}>
+                  <tr key={record.requestId} className={record.downgrade && (SHOW_SUSPECTED_DOWNGRADE_UI || record.downgrade.verdict !== "suspected") ? `usage-row--${record.downgrade.verdict}` : undefined}>
                     <td className="usage-table__time">
                       <strong>{clock.time}</strong>
                       <small>{clock.date}</small>
@@ -403,7 +404,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                           </span>
                         )}
                       </div>
-                      {record.downgrade ? (
+                      {record.downgrade && (SHOW_SUSPECTED_DOWNGRADE_UI || record.downgrade.verdict !== "suspected") ? (
                         <button
                           type="button"
                           className={`usage-downgrade usage-downgrade--${record.downgrade.verdict}`}

@@ -24,6 +24,7 @@ import { LatencyProbe } from "@/components/LatencyProbe";
 import { useNotice, useNotify } from "@/components/Notifier";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
+import { SHOW_SUSPECTED_DOWNGRADE_UI } from "@/lib/uiFlags";
 import type { DevicePlatform, SavedAccount, Status } from "@/types";
 
 function chipLabel(status: Status) {
@@ -115,8 +116,11 @@ export default function App() {
   const relayError = fwd.status?.outboundMode === "manual" ? fwd.status?.systemProxy?.lastError ?? null : null;
   useNotice("system-proxy-error", relayError, () => ({ kind: "warn", title: "连接代理服务器失败", message: relayError }));
   const lastDowngrade = fwd.status?.lastDowngrade ?? null;
-  useNotice("downgrade", lastDowngrade?.requestId ?? null, () => {
-    const event = lastDowngrade!;
+  const visibleDowngrade = lastDowngrade && (SHOW_SUSPECTED_DOWNGRADE_UI || lastDowngrade.report.verdict !== "suspected")
+    ? lastDowngrade
+    : null;
+  useNotice("downgrade", visibleDowngrade?.requestId ?? null, () => {
+    const event = visibleDowngrade!;
     const report = event.report;
     const who = event.email || event.accountId;
     const time = new Date(event.at).toLocaleTimeString("zh-CN", { hour12: false });
