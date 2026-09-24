@@ -89,7 +89,7 @@ svg { flex-shrink: 0; }
 .field-row { display: flex; align-items: stretch; gap: 8px; }
 .field-row > input, .field-row > .ui-select { flex: 1; min-width: 0; }
 /* 测延迟：未测时显示图标和文字，测过后直接显示结果，颜色按快慢区分，点击重测。 */
-.latency-probe { display: inline-flex; flex-shrink: 0; min-width: 92px; min-height: 36px; align-items: center; justify-content: center; gap: 6px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--text-soft); background: var(--surface); font: 600 11px var(--font-sans); font-variant-numeric: tabular-nums; white-space: nowrap; cursor: pointer; transition: border-color .15s, background .15s, color .15s; }
+.latency-probe { display: inline-flex; flex-shrink: 0; min-width: 76px; min-height: 30px; align-items: center; justify-content: center; gap: 5px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--text-soft); background: var(--surface); font: 600 10px var(--font-sans); font-variant-numeric: tabular-nums; white-space: nowrap; cursor: pointer; transition: border-color .15s, background .15s, color .15s; }
 .latency-probe:not([data-grade]):not(:disabled):hover { border-color: #a9c0d8; color: var(--accent-strong); background: var(--surface-hover); }
 .latency-probe:focus-visible { outline: none; border-color: #83a8d0; box-shadow: 0 0 0 3px #477bb41a; }
 .latency-probe:disabled { cursor: default; opacity: .6; }
@@ -100,7 +100,7 @@ svg { flex-shrink: 0; }
 .latency-probe[data-grade="mid"] { border-color: #f0dcb8; color: var(--warm); background: var(--warm-soft); }
 .latency-probe[data-grade="slow"], .latency-probe[data-grade="bad"] { border-color: #efcfcb; color: var(--red); background: var(--red-soft); }
 .latency-probe[data-grade]:not(:disabled):hover { filter: brightness(.96); }
-.mihomo-picker__actions .latency-probe { min-width: 84px; min-height: 30px; font-size: 10px; }
+.mihomo-picker__actions .latency-probe { min-width: 72px; min-height: 28px; font-size: 10px; }
 .page-nav { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .page-tabs { display: flex; min-width: 0; max-width: 100%; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: #f0f3f7; box-shadow: 0 6px 14px -12px rgba(48, 66, 88, .35); }
 .page-tabs button { position: relative; display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; gap: 7px; min-height: 32px; padding: 0 16px; border: 1px solid transparent; border-radius: 8px; color: var(--muted); background: transparent; font-size: 11px; white-space: nowrap; cursor: pointer; transition: color .15s, background .15s, border-color .15s; }

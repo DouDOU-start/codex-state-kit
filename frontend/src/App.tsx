@@ -393,8 +393,7 @@ export default function App() {
                 group={group}
                 probing={fwd.probingGroup === group.name || fwd.probingGroup === "*"}
                 onSelect={(node) => void fwd.selectMihomoNode(group.name, node)}
-                onProbe={() => { if (group.now) void fwd.probeMihomoGroup(group.name, group.now); }}
-                onProbeAll={() => void fwd.probeMihomoGroup(group.name)}
+                onProbe={() => void fwd.probeMihomoGroup(group.name)}
               />
             ))}
             {shownMihomoGroups.length > 0 ? null : (
