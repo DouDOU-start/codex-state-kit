@@ -276,6 +276,7 @@ function mockUserAgent(identity: VmIdentityView): string {
 export async function updateVmIdentity(profile: VmProfile): Promise<Status> {
   if (isTauri) return invoke<Status>("update_vm_identity", { profile });
   const vmIdentity = { ...mockStatus.vmIdentity, platform: profile.platform, ...MOCK_PLATFORMS[profile.platform] };
+  if (profile.environment) vmIdentity.environment = profile.environment;
   mockStatus = { ...mockStatus, vmIdentity: { ...vmIdentity, userAgent: mockUserAgent(vmIdentity) } };
   return cloneStatus();
 }

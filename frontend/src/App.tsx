@@ -526,6 +526,9 @@ export default function App() {
               ["系统版本", vmIdentity ? `${vmIdentity.osType} ${vmIdentity.osVersion}` : undefined],
               ["架构", vmIdentity?.arch],
               ["终端", vmIdentity?.terminal],
+              ["地区", vmIdentity?.environment?.region || "未识别"],
+              ["模型时区", vmIdentity?.environment?.timezone || "沿用客户端"],
+              ["语言区域", vmIdentity?.environment?.locale || "沿用客户端"],
             ] as const).map(([term, value]) => (
               <div key={term} className="vm-identity__item">
                 <dt>{term}</dt>
@@ -533,6 +536,30 @@ export default function App() {
               </div>
             ))}
           </dl>
+          {vmIdentity && <div className="field">
+            <label>
+              <input type="checkbox" checked={vmIdentity.environment?.autoRegion ?? true} disabled={fwd.busy !== null}
+                onChange={event => void fwd.saveVmIdentity({ platform: vmIdentity.platform, environment: {
+                  timezone: "", locale: "", region: "", ...vmIdentity.environment, autoRegion: event.target.checked,
+                } })} /> 自动根据代理地区设置时区与语言
+            </label>
+            <p className="panel__hint">通过当前代理出口查询 IP 地区与时区，语言取该地区的默认值。探测失败保留上次结果；关闭自动选择可手动设置。日期按所选时区计算，实际执行命令的路径和 Shell 保持真实值。</p>
+            {!(vmIdentity.environment?.autoRegion ?? true) && ([
+              ["timezone", "IANA 时区", "Asia/Tokyo"],
+              ["locale", "语言区域", "zh-CN"],
+            ] as const).map(([key, label, placeholder]) => <label key={key} className="field">
+              <span>{label}</span>
+              <input key={`${vmIdentity.installationId}-${key}-${vmIdentity.environment?.[key]}`} defaultValue={vmIdentity.environment?.[key] ?? ""}
+                placeholder={placeholder} disabled={fwd.busy !== null}
+                onBlur={event => {
+                  const value = event.target.value.trim();
+                  if (value === (vmIdentity.environment?.[key] ?? "")) return;
+                  void fwd.saveVmIdentity({ platform: vmIdentity.platform, environment: {
+                    autoRegion: false, timezone: "", locale: "", region: "", ...vmIdentity.environment, [key]: value,
+                  } });
+                }} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} />
+            </label>)}
+          </div>}
           <p className="panel__hint">系统版本、架构和终端跟随所选系统，与官方 CLI 在该系统上上报的一致；CLI 版本跟随本机安装的 codex，Originator 固定为官方 CLI。</p>
           <div className="vm-identity__actions">
             <button type="button" className="button button--ghost" disabled={fwd.busy !== null} onClick={() => void fwd.detectVmVersion()}>检测本机 CLI</button>

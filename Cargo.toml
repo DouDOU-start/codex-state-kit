@@ -18,6 +18,7 @@ resolver = "2"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono-tz = "0.10"
 futures-util = "0.3"
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks", "gzip", "zstd"] }

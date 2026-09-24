@@ -58,6 +58,7 @@ const IDENTITY_HEADERS: &[&str] = &[
     "x-codex-window-id",
     "x-codex-turn-metadata",
     "x-codex-parent-thread-id",
+    "x-openai-subagent",
     "session_id",
     "originator",
     "version",
@@ -69,6 +70,8 @@ const IDENTITY_HEADERS: &[&str] = &[
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmIdentity {
+    #[serde(default)]
+    pub environment: VirtualEnvironment,
     pub installation_id: String,
     pub cli_version: String,
     pub originator: String,
@@ -89,11 +92,64 @@ pub struct VmIdentity {
 #[serde(rename_all = "camelCase")]
 pub struct VmProfile {
     pub platform: DevicePlatform,
+    pub environment: Option<VirtualEnvironment>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualEnvironment {
+    #[serde(default = "automatic_region")]
+    pub auto_region: bool,
+    #[serde(default)]
+    pub timezone: String,
+    #[serde(default)]
+    pub locale: String,
+    #[serde(default)]
+    pub region: String,
+}
+
+fn automatic_region() -> bool {
+    true
+}
+
+impl Default for VirtualEnvironment {
+    fn default() -> Self {
+        Self {
+            auto_region: true,
+            timezone: String::new(),
+            locale: String::new(),
+            region: String::new(),
+        }
+    }
+}
+
+impl VirtualEnvironment {
+    pub fn validate(&self) -> Result<()> {
+        if !self.timezone.is_empty() {
+            self.timezone
+                .parse::<chrono_tz::Tz>()
+                .context("请输入有效的 IANA 时区，例如 Asia/Tokyo")?;
+        }
+        anyhow::ensure!(
+            self.locale.len() <= 35
+                && self
+                    .locale
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "语言标签只允许字母、数字和连字符"
+        );
+        anyhow::ensure!(
+            self.region.len() <= 2 && self.region.chars().all(|c| c.is_ascii_uppercase()),
+            "地区需使用两位大写国家代码"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmIdentityView {
+    pub environment: VirtualEnvironment,
     pub installation_id: String,
     pub session_id: String,
     pub platform: DevicePlatform,
@@ -153,6 +209,7 @@ impl VmIdentity {
 
     pub fn view(&self) -> VmIdentityView {
         VmIdentityView {
+            environment: self.environment.clone(),
             installation_id: self.installation_id.clone(),
             session_id: self.session_id.clone(),
             platform: self.platform(),
@@ -172,6 +229,9 @@ impl VmIdentity {
 
     pub fn apply_profile(&mut self, profile: VmProfile) {
         self.set_platform(profile.platform);
+        if let Some(environment) = profile.environment {
+            self.environment = environment;
+        }
     }
 
     fn set_platform(&mut self, platform: DevicePlatform) {
@@ -221,6 +281,7 @@ impl VmIdentity {
 
     fn fresh() -> Self {
         let mut identity = Self {
+            environment: VirtualEnvironment::default(),
             installation_id: Uuid::new_v4().to_string(),
             cli_version: DEFAULT_VERSION.into(),
             originator: String::new(),
@@ -269,12 +330,88 @@ pub fn is_vm_identity_header(name: &str) -> bool {
         .any(|header| header.eq_ignore_ascii_case(name))
 }
 
+/// Only a standalone harness environment message is eligible. Never rewrite
+/// instructions, user prose, tool output, paths or the real execution shell.
+fn rewrite_environment(body: &mut Value, identity: &VmIdentity) -> bool {
+    let environment = &identity.environment;
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for message in input.iter_mut().rev() {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for item in content {
+            if item.get("type").and_then(Value::as_str) != Some("input_text") {
+                continue;
+            }
+            let Some(text) = item.get_mut("text") else {
+                continue;
+            };
+            let Some(original) = text.as_str() else {
+                continue;
+            };
+            let trimmed = original.trim();
+            if !trimmed.starts_with("<environment_context>")
+                || !trimmed.ends_with("</environment_context>")
+                || trimmed.matches("<environment_context>").count() != 1
+            {
+                continue;
+            }
+            let mut next = original.to_string();
+            set_context_tag(
+                &mut next,
+                "virtual_device",
+                &format!(
+                    "{} {}; {}; {}",
+                    identity.os_type, identity.os_version, identity.arch, identity.terminal
+                ),
+            );
+            if let Ok(tz) = environment.timezone.parse::<chrono_tz::Tz>() {
+                set_context_tag(&mut next, "timezone", &environment.timezone);
+                let date = chrono::Utc::now()
+                    .with_timezone(&tz)
+                    .format("%Y-%m-%d")
+                    .to_string();
+                set_context_tag(&mut next, "current_date", &date);
+            }
+            if !environment.locale.is_empty() && environment.validate().is_ok() {
+                set_context_tag(&mut next, "locale", &environment.locale);
+            }
+            if next != original {
+                *text = Value::String(next);
+                changed = true;
+            }
+            return changed;
+        }
+    }
+    changed
+}
+
+fn set_context_tag(text: &mut String, name: &str, value: &str) {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    if let Some(start) = text.find(&open) {
+        let start = start + open.len();
+        if let Some(end) = text[start..].find(&close) {
+            text.replace_range(start..start + end, value);
+        }
+    } else if let Some(end) = text.rfind("</environment_context>") {
+        text.insert_str(end, &format!("  {open}{value}{close}\n"));
+    }
+}
+
 pub fn rewrite_client_metadata_value(body: &mut Value, identity: &VmIdentity) -> bool {
+    let environment_changed = rewrite_environment(body, identity);
     let Some(metadata) = body
         .get_mut("client_metadata")
         .and_then(Value::as_object_mut)
     else {
-        return false;
+        return environment_changed;
     };
     metadata.insert(
         "x-codex-installation-id".into(),
@@ -282,11 +419,40 @@ pub fn rewrite_client_metadata_value(body: &mut Value, identity: &VmIdentity) ->
     );
     metadata.insert("session_id".into(), json!(identity.session_id));
     metadata.insert("x-codex-window-id".into(), json!(identity.window_id));
+    for (key, value) in [
+        ("installation_id", &identity.installation_id),
+        ("window_id", &identity.window_id),
+    ] {
+        if metadata.contains_key(key) {
+            metadata.insert(key.into(), json!(value));
+        }
+    }
+    // Newer core versions carry the authoritative snapshot as a JSON string.
+    if let Some(raw) = metadata
+        .get("x-codex-turn-metadata")
+        .and_then(Value::as_str)
+    {
+        if let Ok(Value::Object(mut snapshot)) = serde_json::from_str::<Value>(raw) {
+            for (key, value) in [
+                ("installation_id", &identity.installation_id),
+                ("session_id", &identity.session_id),
+                ("window_id", &identity.window_id),
+            ] {
+                if snapshot.contains_key(key) {
+                    snapshot.insert(key.into(), json!(value));
+                }
+            }
+            metadata.insert(
+                "x-codex-turn-metadata".into(),
+                Value::String(Value::Object(snapshot).to_string()),
+            );
+        }
+    }
     true
 }
 
 /// 解压 JSON 正文，替换 `client_metadata` 里的设备字段，再按原编码写回。
-/// 没有 `client_metadata` 时原样返回。解析失败时返回错误，调用方保留原正文。
+/// 同时改写最近的独立 environment_context。没有适用字段时保留原正文。
 pub fn rewrite_client_metadata_in_body(
     bytes: &[u8],
     encoding: Option<&str>,
@@ -427,6 +593,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn environment_rewrites_only_latest_harness_message_without_metadata() {
+        let mut identity = VmIdentity::ephemeral();
+        identity.environment = VirtualEnvironment {
+            auto_region: false,
+            timezone: "America/Los_Angeles".into(),
+            locale: "en-US".into(),
+            region: "US".into(),
+        };
+        let context = "<environment_context>\n<cwd>E:\\code</cwd><shell>powershell</shell><current_date>2000-01-01</current_date><timezone>UTC</timezone>\n</environment_context>";
+        let mut body = json!({"input": [
+            {"role":"user", "content":[{"type":"input_text", "text":context}]},
+            {"role":"user", "content":[{"type":"input_text", "text":context}]},
+            {"role":"user", "content":[{"type":"input_text", "text":format!("Explain this: {context}")}]},
+            {"type":"function_call_output", "output":context}
+        ]});
+        let original = body.clone();
+        assert!(rewrite_client_metadata_value(&mut body, &identity));
+        assert_eq!(body["input"][0], original["input"][0]);
+        assert_eq!(body["input"][2], original["input"][2]);
+        assert_eq!(body["input"][3], original["input"][3]);
+        let text = body["input"][1]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("<timezone>America/Los_Angeles</timezone>"));
+        assert!(text.contains("<locale>en-US</locale>"));
+        assert!(text.contains("<shell>powershell</shell>"));
+        assert!(text.contains("<virtual_device>Mac OS"));
+        assert!(!text.contains("2000-01-01"));
+        let wire = serde_json::to_vec(&original).unwrap();
+        let compressed = zstd::encode_all(wire.as_slice(), 3).unwrap();
+        let rewritten =
+            rewrite_client_metadata_in_body(&compressed, Some("zstd"), &identity).unwrap();
+        let decoded: Value =
+            serde_json::from_slice(&zstd::decode_all(rewritten.as_slice()).unwrap()).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn environment_validates_and_persists_with_device() {
+        let mut identity = VmIdentity::ephemeral();
+        identity.environment.auto_region = false;
+        identity.environment.timezone = "Asia/Tokyo".into();
+        identity.environment.locale = "zh-CN".into();
+        let reloaded: VmIdentity =
+            serde_json::from_value(serde_json::to_value(&identity).unwrap()).unwrap();
+        let reloaded = reloaded.with_runtime_ids();
+        assert_eq!(reloaded.environment.timezone, "Asia/Tokyo");
+        assert!(!reloaded.environment.auto_region);
+        assert!(reloaded.environment.validate().is_ok());
+        identity.environment.timezone = "Mars/Olympus".into();
+        assert!(identity.environment.validate().is_err());
+        identity.environment.timezone = "UTC".into();
+        identity.environment.locale = "</locale>".into();
+        assert!(identity.environment.validate().is_err());
+    }
+
+    #[test]
+    fn canonical_metadata_and_compatibility_fields_agree() {
+        let identity = VmIdentity::ephemeral();
+        let mut body = json!({"client_metadata": {"installation_id":"old", "window_id":"old", "x-codex-turn-metadata":json!({"installation_id":"old","session_id":"old","window_id":"old","thread_id":"thread","turn_id":"turn"}).to_string()}});
+        rewrite_client_metadata_value(&mut body, &identity);
+        let snapshot: Value = serde_json::from_str(
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["installation_id"], identity.installation_id);
+        assert_eq!(snapshot["session_id"], identity.session_id);
+        assert_eq!(snapshot["thread_id"], "thread");
+        assert_eq!(body["client_metadata"]["window_id"], identity.window_id);
+        assert!(is_vm_identity_header("X-OpenAI-Subagent"));
+    }
+
+    #[test]
     fn user_agent_matches_the_codex_cli_shape() {
         let identity = VmIdentity::ephemeral();
         assert_eq!(
@@ -502,6 +741,7 @@ mod tests {
         let mut identity = VmIdentity::ephemeral();
         identity.apply_profile(VmProfile {
             platform: DevicePlatform::Windows,
+            environment: None,
         });
         assert_eq!(identity.platform(), DevicePlatform::Windows);
         assert_eq!(
@@ -510,6 +750,7 @@ mod tests {
         );
         identity.apply_profile(VmProfile {
             platform: DevicePlatform::Linux,
+            environment: None,
         });
         assert_eq!(
             identity.user_agent(),

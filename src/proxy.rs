@@ -346,6 +346,8 @@ impl App {
 
 #[derive(Clone)]
 pub struct ProxyHandle {
+    #[allow(dead_code)]
+    geo_cache: Arc<Mutex<Option<(String, Instant, Option<outbound::ProxyGeo>)>>>,
     app: Arc<App>,
     stop: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -359,6 +361,7 @@ pub struct ProxyHandle {
 impl ProxyHandle {
     pub fn new(app: Arc<App>) -> Self {
         Self {
+            geo_cache: Arc::new(Mutex::new(None)),
             app,
             stop: Arc::new(Mutex::new(None)),
             task: Arc::new(Mutex::new(None)),
@@ -398,6 +401,9 @@ impl ProxyHandle {
     }
 
     pub async fn update_vm_identity(&self, profile: identity::VmProfile) -> Result<Status> {
+        if let Some(environment) = &profile.environment {
+            environment.validate()?;
+        }
         {
             let mut identity = self.app.vm_identity.lock().await;
             identity.apply_profile(profile);
@@ -535,17 +541,98 @@ impl ProxyHandle {
     }
 
     pub async fn apply_settings(&self, patch: SettingsPatch) -> Result<Status> {
-        let status = self.apply_settings_to(patch.into_settings()?).await?;
+        self.apply_settings_to(patch.into_settings()?).await?;
         // Outbound edits belong to the account that is currently live.
         self.remember_account_environment().await;
-        Ok(status)
+        Ok(self.managed_status().await)
     }
 
     /// The environment Kit is using right now: virtual device and outbound line.
     async fn current_environment(&self) -> AccountEnvironment {
+        let _settings_guard = self.settings_change.lock().await;
         let settings = self.app.settings.lock().await.clone();
-        let vm = self.app.vm_identity.lock().await.clone();
         let mihomo = self.app.mihomo.status();
+        let detected_geo: Option<outbound::ProxyGeo> = {
+            #[cfg(test)]
+            {
+                None
+            }
+            #[cfg(not(test))]
+            {
+                let auto_region = self.app.vm_identity.lock().await.environment.auto_region;
+                if auto_region {
+                    let template = resolved_proxy(&settings, &self.app.mihomo);
+                    if template.trim().is_empty() {
+                        None
+                    } else {
+                        let proxy = self
+                            .app
+                            .ws_upstream
+                            .resolve_proxy(&template, None)
+                            .await
+                            .unwrap_or_default();
+                        let key = format!(
+                            "{}|{:?}|{:?}",
+                            proxy,
+                            mihomo.selected,
+                            mihomo
+                                .groups
+                                .iter()
+                                .map(|g| (&g.name, &g.now))
+                                .collect::<Vec<_>>()
+                        );
+                        let mut cache = self.geo_cache.lock().await;
+                        if let Some((_, _, geo)) = cache.as_ref().filter(|(k, at, geo)| {
+                            *k == key
+                                && at.elapsed()
+                                    < Duration::from_secs(if geo.is_some() { 900 } else { 60 })
+                        }) {
+                            geo.clone()
+                        } else {
+                            let geo = outbound::detect_proxy_geo(&proxy).await.ok();
+                            if geo.is_none() {
+                                eprintln!("[identity] 代理出口地区探测失败，保留现有环境");
+                            }
+                            *cache = Some((key, Instant::now(), geo.clone()));
+                            geo
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        let vm = {
+            let mut vm = self.app.vm_identity.lock().await;
+            let current_mihomo = self.app.mihomo.status();
+            let same_node = current_mihomo.selected == mihomo.selected
+                && current_mihomo
+                    .groups
+                    .iter()
+                    .map(|g| (&g.name, &g.now))
+                    .eq(mihomo.groups.iter().map(|g| (&g.name, &g.now)));
+            if let Some(geo) = detected_geo.filter(|_| vm.environment.auto_region && same_node) {
+                let mut environment = vm.environment.clone();
+                environment.region = geo.country_code.unwrap_or_default().to_ascii_uppercase();
+                environment.timezone = geo.timezone.unwrap_or_default();
+                environment.locale = geo
+                    .languages
+                    .as_deref()
+                    .and_then(|value| value.split(',').next())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.replace('_', "-"))
+                    .unwrap_or_default();
+                if environment.validate().is_ok() {
+                    vm.environment = environment;
+                }
+            }
+            #[cfg(not(test))]
+            if let Err(err) = vm.save() {
+                eprintln!("[identity] 保存环境失败: {err:#}");
+            }
+            vm.clone()
+        };
         let mihomo_selections =
             if settings.outbound_mode == OutboundMode::Mihomo && mihomo.phase == "connected" {
                 mihomo
@@ -631,7 +718,7 @@ impl ProxyHandle {
         let live = match plan.target {
             Some(target) if !target.same_as(&current) => {
                 self.apply_environment(&target).await?;
-                target
+                self.current_environment().await
             }
             Some(target) => target,
             None => current,
@@ -812,6 +899,7 @@ impl ProxyHandle {
     }
 
     pub async fn run_sidecar_supervisor(&self) {
+        let mut last_environment_refresh = Instant::now();
         loop {
             let mode = self.app.settings.lock().await.outbound_mode;
             let mut wait = Duration::from_secs(20);
@@ -826,6 +914,10 @@ impl ProxyHandle {
                         let _ = self.app.refresh_business_http().await;
                     }
                 }
+            }
+            if last_environment_refresh.elapsed() >= Duration::from_secs(60) {
+                self.remember_account_environment().await;
+                last_environment_refresh = Instant::now();
             }
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {},
@@ -2016,6 +2108,18 @@ async fn client_ws_session(
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_string();
+        let diag_req = diag::Request {
+            id: diag::next_id(),
+            flow: "business".into(),
+            model: Some(logs::safe_text(&model, 80)).filter(|value| !value.is_empty()),
+            route_kind: "websocket".into(),
+            proxy_session: None,
+        };
+        diag::emit(
+            "request",
+            Some(&diag_req),
+            json!({"method": "WS", "path": "/responses"}),
+        );
         let account = ws_billing_account(&app, &client_headers).await;
         let billing = account.as_ref().and_then(|account| {
             app.begin_ws_billing(
@@ -2041,6 +2145,7 @@ async fn client_ws_session(
                     billing,
                     &mut metrics,
                     true,
+                    Some(&diag_req),
                 )
                 .await;
                 let fail = serde_json::json!({"type":"error","error":{"message": err.to_string()}});
@@ -2060,6 +2165,7 @@ async fn client_ws_session(
                     billing,
                     &mut metrics,
                     true,
+                    Some(&diag_req),
                 )
                 .await;
                 let fail = serde_json::json!({"type":"error","error":{"message": err.to_string()}});
@@ -2097,6 +2203,7 @@ async fn client_ws_session(
             billing,
             &mut metrics,
             failed,
+            Some(&diag_req),
         )
         .await;
     }
@@ -2214,7 +2321,22 @@ async fn finish_client_ws_turn(
     billing: Option<BillingRequest>,
     metrics: &mut logs::ResponseBodyMetrics,
     failed: bool,
+    diag_req: Option<&diag::Request>,
 ) {
+    diag::emit(
+        "ws_finish",
+        diag_req,
+        json!({
+            "status": if failed { 502 } else { 200 },
+            "failed": failed,
+            "usageSeen": metrics.usage_seen(),
+            "inputTokens": metrics.input_tokens(),
+            "outputTokens": metrics.output_tokens(),
+            "usageSource": metrics.usage_seen().then_some("provider_response"),
+            "responseModel": metrics.upstream_response_model(),
+            "events": metrics.sse_event_summary(),
+        }),
+    );
     if let Some(request) = billing {
         let usage_complete = metrics.usage_seen()
             && metrics.input_tokens().is_some()

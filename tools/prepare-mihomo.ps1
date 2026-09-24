@@ -8,11 +8,20 @@ $archive = Join-Path $downloadDir $asset
 $expected = '38b2420799d9e7cde77ec1a19c7150dd17ca77f7fb82d9f62cb8763a307eee67'
 $url = "https://github.com/MetaCubeX/mihomo/releases/download/$version/$asset"
 New-Item -ItemType Directory -Force $downloadDir, $resourceDir | Out-Null
-if (!(Test-Path -LiteralPath $archive) -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+function Get-Sha256([string] $path) {
+    $stream = [System.IO.File]::OpenRead($path)
+    try {
+        $hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($stream)
+        return ([System.BitConverter]::ToString($hash).Replace('-', '')).ToLowerInvariant()
+    } finally {
+        $stream.Dispose()
+    }
+}
+if (!(Test-Path -LiteralPath $archive) -or (Get-Sha256 $archive) -ne $expected) {
     & curl.exe -fL --retry 3 --connect-timeout 15 --max-time 180 $url -o $archive
     if ($LASTEXITCODE -ne 0) { throw 'Mihomo archive download failed' }
 }
-if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+if ((Get-Sha256 $archive) -ne $expected) {
     throw 'Mihomo archive checksum mismatch; refusing to bundle it'
 }
 $unpacked = Join-Path $downloadDir 'unpacked-windows'

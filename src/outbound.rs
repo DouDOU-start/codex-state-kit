@@ -2,6 +2,7 @@
 //! for sticky-exit proxies, and the HTTP client used for latency probes.
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::time::Duration;
 
 const SESSION_PLACEHOLDER_LC: &str = "{session}";
@@ -39,6 +40,56 @@ pub fn generate_proxy_session() -> String {
         .take(8)
         .map(char::from)
         .collect()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProxyGeo {
+    pub country_code: Option<String>,
+    pub timezone: Option<String>,
+    pub languages: Option<String>,
+}
+
+/// Resolves the actual egress location through the configured proxy. The
+/// service sees the proxy exit IP, so no local network location is leaked.
+pub async fn detect_proxy_geo(proxy: &str) -> Result<ProxyGeo> {
+    anyhow::ensure!(
+        !proxy.trim().is_empty() && !has_session_placeholder(proxy),
+        "代理出口尚未就绪"
+    );
+    // `proxy` is already resolved by the business WebSocket pool, including
+    // its sticky session and system-proxy relay. Do not route it twice.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(reqwest::Proxy::all(proxy).context("地区探测代理无效")?)
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let response = client
+        .get("https://ipapi.co/json/")
+        .header("accept", "application/json")
+        .header("user-agent", "codex-state-kit")
+        .send()
+        .await
+        .context("请求代理出口地区")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "代理出口地区服务返回 {}",
+        response.status()
+    );
+    let geo = response
+        .json::<ProxyGeo>()
+        .await
+        .context("解析代理出口地区")?;
+    anyhow::ensure!(
+        geo.country_code.as_deref().is_some_and(|v| v.len() == 2),
+        "代理出口地区缺少国家代码"
+    );
+    geo.timezone
+        .as_deref()
+        .context("地区探测缺少时区")?
+        .parse::<chrono_tz::Tz>()
+        .context("地区探测返回无效时区")?;
+    Ok(geo)
 }
 
 fn normalize_proxy_session(session: Option<&str>) -> Option<String> {

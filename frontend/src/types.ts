@@ -42,6 +42,7 @@ export interface LogEntry {
 export type DevicePlatform = "mac" | "windows" | "linux";
 
 export interface VmIdentityView {
+  environment?: VirtualEnvironment;
   installationId: string;
   sessionId: string;
   platform: DevicePlatform;
@@ -56,6 +57,14 @@ export interface VmIdentityView {
 
 export interface VmProfile {
   platform: DevicePlatform;
+  environment?: VirtualEnvironment;
+}
+
+export interface VirtualEnvironment {
+  autoRegion: boolean;
+  timezone: string;
+  locale: string;
+  region: string;
 }
 
 export interface Status {
