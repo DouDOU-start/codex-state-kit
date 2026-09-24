@@ -347,6 +347,8 @@ svg { flex-shrink: 0; }
 .usage-cost { color: var(--text); font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .usage-cost i { margin-right: 1px; color: #c28a1b; font-style: normal; }
 .usage-cost--none { color: var(--muted); font-size: 11px; font-weight: 500; }
+.usage-cost--button { padding: 0; border: 0; background: transparent; font: inherit; cursor: pointer; text-decoration: underline; text-decoration-color: #cbd5df; text-underline-offset: 3px; }
+.usage-cost--button:hover { color: var(--accent-strong); text-decoration-color: currentColor; }
 .usage-dash { display: grid; gap: 14px; }
 .usage-dash__header, .usage-dash__tools { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .usage-dash__header h2 { margin: 0; font-size: 16px; }
@@ -468,6 +470,19 @@ input[type="checkbox"]:disabled { opacity: .5; cursor: not-allowed; }
 .modal__body { padding: 16px 18px 6px; }
 .modal__body .login-methods { margin-top: 0; }
 .modal__body .panel__hint { margin-bottom: 12px; }
+.modal--record-detail { width: min(520px, calc(100vw - 32px)); }
+.modal__subtitle { margin: 3px 0 0; color: var(--muted); font-size: 10px; }
+.record-detail { padding-bottom: 18px; }
+.record-detail__status { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; padding: 10px 12px; border: 1px solid #f0d8d3; border-radius: 8px; color: var(--red); background: var(--red-soft); }
+.record-detail__status span { color: var(--muted); font: 10px var(--font-mono); }
+.record-detail__grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 12px; margin: 0; }
+.record-detail__grid > div { min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: #f8fafc; }
+.record-detail__grid dt { color: var(--muted); font-size: 9px; }
+.record-detail__grid dd { margin: 3px 0 0; overflow-wrap: anywhere; color: var(--text-soft); font-size: 11px; }
+.record-detail__error { color: var(--red) !important; font-family: var(--font-mono); }
+.record-detail__hint { margin: 14px 0 8px; color: var(--muted); font-size: 10px; line-height: 1.7; }
+.record-detail__id { display: block; overflow-wrap: anywhere; color: var(--faint); font-size: 9px; }
+@media (max-width: 480px) { .record-detail__grid { grid-template-columns: 1fr; } }
 
 /* Notices (components/Notifier.tsx) */
 .notices { position: fixed; right: 16px; bottom: 16px; z-index: 60; display: grid; gap: 8px; width: min(360px, calc(100vw - 32px)); pointer-events: none; }

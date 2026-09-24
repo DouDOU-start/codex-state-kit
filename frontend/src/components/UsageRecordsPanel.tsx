@@ -6,6 +6,7 @@ import PencilLine from "lucide-react/dist/esm/icons/pencil-line.js";
 import Route from "lucide-react/dist/esm/icons/route.js";
 import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
+import X from "lucide-react/dist/esm/icons/x.js";
 import { getBillingRecords, getBillingRevision, getBillingSummary, isTauri } from "@/lib/api";
 import { Select } from "@/components/Select";
 import { PAGE_SIZES, Pager } from "@/components/Pager";
@@ -170,6 +171,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
   /** 空字符串表示全部账号。 */
   const [accountId, setAccountId] = useState("");
   const [onlyDowngraded, setOnlyDowngraded] = useState(false);
+  const [detailRecord, setDetailRecord] = useState<BillingRecord | null>(null);
   const { notify } = useNotify();
   const reportError = useCallback((cause: unknown) => {
     // One notice, updated in place, even when auto-refresh keeps failing.
@@ -178,9 +180,17 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
   const accountChosen = useRef(false);
   const requestSeq = useRef(0);
   const tableRef = useRef<HTMLDivElement>(null);
+  const detailDialogRef = useRef<HTMLDialogElement>(null);
 
   /** Revision of the data on screen; auto-refresh reloads when it moves. */
   const shownRevision = useRef<number | null>(null);
+
+  useEffect(() => {
+    const dialog = detailDialogRef.current;
+    if (!dialog) return;
+    if (detailRecord && !dialog.open) dialog.showModal();
+    if (!detailRecord && dialog.open) dialog.close();
+  }, [detailRecord]);
 
   /** `silent`: an auto-refresh, so no spinner and no jump back to the top. */
   const loadPage = useCallback(async (account: string, pageIndex: number, downgraded: boolean, size: number, silent = false) => {
@@ -418,7 +428,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                       {record.costNanos == null
                         ? (() => {
                           const reason = unpricedLabel(record);
-                          return <span className="usage-cost usage-cost--none" title={reason.title}>{reason.label}</span>;
+                          return <button type="button" className="usage-cost usage-cost--none usage-cost--button" title={`${reason.title} 点击查看详情`} onClick={() => setDetailRecord(record)}>{reason.label}</button>;
                         })()
                         : <span className="usage-cost"><i>$</i>{formatAmount(record.costNanos)}</span>}
                     </td>
@@ -445,6 +455,48 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
           onPageSize={changePageSize}
         />
       ) : null}
+      <dialog
+        ref={detailDialogRef}
+        className="modal modal--record-detail"
+        aria-labelledby="usage-record-detail-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          setDetailRecord(null);
+        }}
+        onClick={(event) => {
+          if (event.target === detailDialogRef.current) setDetailRecord(null);
+        }}
+      >
+        {detailRecord ? (
+          <div className="modal__surface">
+            <header className="modal__header">
+              <div>
+                <h2 id="usage-record-detail-title">请求详情</h2>
+                <p className="modal__subtitle">{recordClock(detailRecord).time} · {recordClock(detailRecord).date}</p>
+              </div>
+              <button type="button" className="modal__close" aria-label="关闭" onClick={() => setDetailRecord(null)}><X size={16} /></button>
+            </header>
+            <div className="modal__body record-detail">
+              <div className="record-detail__status">
+                <strong>{unpricedLabel(detailRecord).label}</strong>
+                <span>{detailRecord.state}</span>
+              </div>
+              <dl className="record-detail__grid">
+                <div><dt>模型</dt><dd>{detailRecord.sentModel || detailRecord.requestedModel || "—"}</dd></div>
+                <div><dt>上游响应模型</dt><dd>{detailRecord.responseModel || "—"}</dd></div>
+                <div><dt>HTTP 状态</dt><dd>{detailRecord.httpStatus ?? "—"}</dd></div>
+                <div><dt>错误类型 / 错误码</dt><dd className={detailRecord.errorKind ? "record-detail__error" : undefined}>{detailRecord.errorKind || "—"}</dd></div>
+                <div><dt>传输方式</dt><dd>{detailRecord.transport || "—"}</dd></div>
+                <div><dt>用量来源</dt><dd>{detailRecord.usageSource || "—"}</dd></div>
+                <div><dt>输入 tokens</dt><dd>{detailRecord.inputTokens ?? "—"}</dd></div>
+                <div><dt>输出 tokens</dt><dd>{detailRecord.outputTokens ?? "—"}</dd></div>
+              </dl>
+              <p className="record-detail__hint">{unpricedLabel(detailRecord).title}</p>
+              <code className="record-detail__id">请求 ID：{detailRecord.requestId}</code>
+            </div>
+          </div>
+        ) : null}
+      </dialog>
     </div>
   );
 }
