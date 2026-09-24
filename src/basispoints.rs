@@ -191,6 +191,40 @@ fn metadata_string_map(raw: Option<&Value>) -> Map<String, Value> {
     result
 }
 
+fn basispoints_model(raw: Option<&Value>) -> String {
+    let model = raw
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if model.contains("luna") {
+        "gpt-5.6-luna".into()
+    } else if model.contains("terra") {
+        "gpt-5.6-terra".into()
+    } else {
+        "gpt-5.6-sol".into()
+    }
+}
+
+fn basispoints_effort(object: &Map<String, Value>) -> String {
+    let raw = object
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            object
+                .get("reasoning")
+                .and_then(|value| value.get("effort"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("medium")
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "low" => "low".into(),
+        "high" => "high".into(),
+        "xhigh" | "x-high" | "extra-high" | "extra_high" | "max" => "xhigh".into(),
+        _ => "medium".into(),
+    }
+}
+
 pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result<PreparedRequest> {
     let plain = decode_body(raw)?;
     let mut body: Value =
@@ -201,6 +235,7 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
     let object = body
         .as_object_mut()
         .ok_or_else(|| anyhow!("BPS 请求体必须是 JSON 对象"))?;
+    let effort = basispoints_effort(object);
     let mut tools = HashMap::new();
     collect_tools(object.get("tools"), None, &mut tools);
     let mut guard = state.lock().await;
@@ -255,14 +290,6 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
     );
     object.remove("tools");
     object.remove("tool_choice");
-    if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
-        if reasoning.get("effort").and_then(Value::as_str) == Some("max") {
-            reasoning.insert("effort".into(), json!("xhigh"));
-        }
-    }
-    if object.get("reasoning_effort").and_then(Value::as_str) == Some("max") {
-        object.insert("reasoning_effort".into(), json!("xhigh"));
-    }
     let mut metadata = metadata_string_map(object.get("metadata"));
     metadata.insert("turn_id".into(), json!(turn_id));
     metadata.insert("agent_iteration".into(), json!(iteration.to_string()));
@@ -271,6 +298,32 @@ pub async fn prepare_request(state: &Arc<Mutex<BpsState>>, raw: &[u8]) -> Result
         json!(format!("bps_{}", &digest(&json!(lineage))[..24])),
     );
     object.insert("metadata".into(), Value::Object(metadata));
+    let model = basispoints_model(object.get("model"));
+    object.insert("model".into(), json!(model));
+    object.insert("model_selection".into(), json!("explicit"));
+    object.insert("reasoning_effort".into(), json!(effort));
+    object.insert("store".into(), json!(false));
+    if !object
+        .get("context_management")
+        .is_some_and(Value::is_array)
+    {
+        object.insert(
+            "context_management".into(),
+            json!([{"type":"compaction","compact_threshold":200000}]),
+        );
+    }
+    for key in [
+        "instructions",
+        "reasoning",
+        "client_metadata",
+        "parallel_tool_calls",
+        "stream_options",
+        "include",
+        "service_tier",
+        "text",
+    ] {
+        object.remove(key);
+    }
     let mut prefix = vec![message(developer_catalog(&tools))];
     if let Some(instructions) = object
         .get("instructions")
@@ -599,6 +652,31 @@ mod tests {
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
-        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["reasoning_effort"], "xhigh");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[tokio::test]
+    async fn emits_basispoints_wire_shape() {
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let request = json!({
+            "model":"gpt-6-astra",
+            "instructions":"hi",
+            "client_metadata":{"thread_id":"t"},
+            "reasoning":{"effort":"high"},
+            "input":"hello",
+            "stream":true
+        });
+        let prepared = prepare_request(&state, serde_json::to_vec(&request).unwrap().as_slice())
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(body["model_selection"], "explicit");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("client_metadata").is_none());
+        assert_eq!(body["context_management"][0]["type"], "compaction");
     }
 }

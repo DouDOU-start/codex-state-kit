@@ -2139,7 +2139,25 @@ async fn forward_http_tracked(
             .unwrap_or_default();
         builder = builder
             .header("x-openai-account-id", account_id)
-            .header("x-basispoints-auth-mode", "chatgpt");
+            .header("x-basispoints-auth-mode", "chatgpt")
+            // Basispoints selects its Excel tool surface from these client
+            // identity headers. Without them it may expose unrelated native
+            // tools such as web_search instead of run_officejs.
+            .header(
+                "x-openai-internal-basispoints-client-agent-profile",
+                "excel",
+            )
+            .header("x-openai-internal-basispoints-client-editor", "excel")
+            .header("x-openai-internal-basispoints-client-host", "office")
+            .header("x-openai-internal-basispoints-client-platform", "excel")
+            .header("x-openai-internal-basispoints-client-platform-class", "PC")
+            .header(
+                "x-openai-internal-basispoints-client-product",
+                "basispoints-excel-plugin",
+            )
+            .header("x-openai-internal-basispoints-client-runtime", "desktop")
+            .header("x-openai-internal-basispoints-office-host", "Excel")
+            .header("x-openai-internal-basispoints-office-platform", "PC");
     }
     let upstream_resp = match builder.send().await {
         Ok(response) => response,
