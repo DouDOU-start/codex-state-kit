@@ -416,7 +416,10 @@ async fn load_subscription(raw: &str) -> Result<String> {
             .context("无法创建订阅客户端")?;
         let text = client
             .get(raw)
-            .header("User-Agent", "codex-state-kit")
+            // Subscription services commonly return a URI list tailored to the
+            // client. Mihomo understands AnyTLS, so request its profile instead
+            // of receiving a list of schemes this importer cannot handle.
+            .header("User-Agent", "clash.meta")
             .send()
             .await
             .context("订阅下载失败")?
@@ -558,6 +561,7 @@ fn parse_uri(line: &str) -> Option<ProxyNode> {
         "vless" => parse_vless(rest),
         "trojan" => parse_trojan(rest),
         "hysteria2" | "hy2" => parse_hysteria2(rest),
+        "anytls" => parse_anytls(rest),
         "tuic" => parse_tuic(rest),
         _ => None,
     }
@@ -638,7 +642,7 @@ fn parse_vmess(rest: &str) -> Option<ProxyNode> {
             fields.push(("servername", yaml_str(sni)));
         }
     }
-    Some(mapping_node(name, "vmess", &fields))
+    Some(mapping_node(&name, "vmess", &fields))
 }
 
 fn parse_vless(rest: &str) -> Option<ProxyNode> {
@@ -649,7 +653,7 @@ fn parse_vless(rest: &str) -> Option<ProxyNode> {
     }
     let server = url.host_str()?;
     let port = url.port()?;
-    let name = url_name(&url).unwrap_or(server);
+    let name = url_name(&url).unwrap_or_else(|| server.to_string());
     let mut fields = vec![
         ("server", yaml_str(server)),
         ("port", yaml_int(port)),
@@ -657,7 +661,7 @@ fn parse_vless(rest: &str) -> Option<ProxyNode> {
         ("udp", serde_yaml::Value::Bool(true)),
     ];
     push_stream_fields(&mut fields, &url);
-    Some(mapping_node(name, "vless", &fields))
+    Some(mapping_node(&name, "vless", &fields))
 }
 
 fn parse_trojan(rest: &str) -> Option<ProxyNode> {
@@ -665,7 +669,7 @@ fn parse_trojan(rest: &str) -> Option<ProxyNode> {
     let password = urlencoding_username(&url)?;
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
-    let name = url_name(&url).unwrap_or(server);
+    let name = url_name(&url).unwrap_or_else(|| server.to_string());
     let mut fields = vec![
         ("server", yaml_str(server)),
         ("port", yaml_int(port)),
@@ -673,14 +677,14 @@ fn parse_trojan(rest: &str) -> Option<ProxyNode> {
         ("udp", serde_yaml::Value::Bool(true)),
     ];
     push_stream_fields(&mut fields, &url);
-    Some(mapping_node(name, "trojan", &fields))
+    Some(mapping_node(&name, "trojan", &fields))
 }
 
 fn parse_hysteria2(rest: &str) -> Option<ProxyNode> {
     let url = url::Url::parse(&format!("hysteria2://{rest}")).ok()?;
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
-    let name = url_name(&url).unwrap_or(server);
+    let name = url_name(&url).unwrap_or_else(|| server.to_string());
     let mut fields = vec![("server", yaml_str(server)), ("port", yaml_int(port))];
     if let Some(password) = urlencoding_username(&url) {
         if !password.is_empty() {
@@ -694,7 +698,35 @@ fn parse_hysteria2(rest: &str) -> Option<ProxyNode> {
     {
         fields.push(("sni", yaml_str(&sni)));
     }
-    Some(mapping_node(name, "hysteria2", &fields))
+    Some(mapping_node(&name, "hysteria2", &fields))
+}
+
+fn parse_anytls(rest: &str) -> Option<ProxyNode> {
+    let url = url::Url::parse(&format!("anytls://{rest}")).ok()?;
+    let password = urlencoding_username(&url)?;
+    let server = url.host_str()?;
+    let port = url.port().unwrap_or(443);
+    let name = url_name(&url).unwrap_or_else(|| server.to_string());
+    let mut fields = vec![
+        ("server", yaml_str(server)),
+        ("port", yaml_int(port)),
+        ("password", yaml_str(&password)),
+        ("udp", serde_yaml::Value::Bool(true)),
+    ];
+    if let Some(sni) = url
+        .query_pairs()
+        .find(|(key, _)| key == "sni")
+        .map(|(_, value)| value.into_owned())
+        .filter(|sni| !sni.is_empty())
+    {
+        fields.push(("sni", yaml_str(&sni)));
+    }
+    if url.query_pairs().any(|(key, value)| {
+        key == "insecure" && (value == "1" || value.eq_ignore_ascii_case("true"))
+    }) {
+        fields.push(("skip-cert-verify", serde_yaml::Value::Bool(true)));
+    }
+    Some(mapping_node(&name, "anytls", &fields))
 }
 
 fn parse_tuic(rest: &str) -> Option<ProxyNode> {
@@ -703,9 +735,9 @@ fn parse_tuic(rest: &str) -> Option<ProxyNode> {
     let password = url.password()?;
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
-    let name = url_name(&url).unwrap_or(server);
+    let name = url_name(&url).unwrap_or_else(|| server.to_string());
     Some(mapping_node(
-        name,
+        &name,
         "tuic",
         &[
             ("server", yaml_str(server)),
@@ -783,9 +815,9 @@ fn split_host_port(hostport: &str) -> Option<(&str, u16)> {
     (!host.is_empty()).then_some((host, port))
 }
 
-fn url_name(url: &url::Url) -> Option<&str> {
+fn url_name(url: &url::Url) -> Option<String> {
     let fragment = url.fragment()?.trim();
-    (!fragment.is_empty()).then_some(fragment)
+    (!fragment.is_empty()).then(|| percent_decode(fragment))
 }
 
 fn urlencoding_username(url: &url::Url) -> Option<String> {
@@ -1211,6 +1243,22 @@ proxies:
         assert!(text.contains("network: ws"));
         assert!(parse_subscription("   ").is_err());
         assert!(parse_subscription("not a subscription").is_err());
+    }
+
+    #[test]
+    fn parses_anytls_share_links() {
+        let nodes = parse_subscription(
+            "anytls://secret@example.test:54101/?insecure=1&sni=front.example#Tokyo%20MPLS",
+        )
+        .unwrap()
+        .nodes;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "Tokyo MPLS");
+        let text = serde_yaml::to_string(&nodes[0].spec).unwrap();
+        assert!(text.contains("type: anytls"));
+        assert!(text.contains("password: secret"));
+        assert!(text.contains("sni: front.example"));
+        assert!(text.contains("skip-cert-verify: true"));
     }
 
     #[test]
