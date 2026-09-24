@@ -429,7 +429,7 @@ export default function App() {
                 </div>
               </>
             )}
-            <div className="field-row">
+            <div className="field-row codex-latency-row">
               <span className="panel__hint">Codex 链路检测</span>
               <LatencyProbe probing={fwd.probing === "mihomo_codex"} disabled={fwd.probing !== null || fwd.status.mihomo?.phase !== "connected"}
                 sample={fwd.latency.mihomo_codex?.samples[0]} onProbe={() => void fwd.probeLatency("mihomo_codex")} />
