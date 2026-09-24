@@ -428,8 +428,7 @@ impl WsUpstreamPool {
                     }
                     if !saw_event
                         && !retried_missing
-                        && ws_bridge::ws_error_code(&text).as_deref()
-                            == Some("previous_response_not_found")
+                        && ws_bridge::is_previous_response_error(&text)
                     {
                         retried_missing = true;
                         ws_bridge::strip_previous_response_id(&mut payload);
@@ -1028,6 +1027,46 @@ mod tests {
         let event = rx.recv().await.unwrap().unwrap();
         assert!(event.contains("response.completed"));
         assert!(!event.contains("connection_limit"));
+    }
+
+    #[tokio::test]
+    async fn invalid_previous_response_id_is_resent_without_chain_handle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dial = local_dial(listener.local_addr().unwrap());
+        let pool = WsUpstreamPool::new();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            assert!(first.contains("previous_response_id"));
+            ws.send(Message::text(
+                r#"{"type":"error","error":{"code":"invalid_request_error","message":"Invalid `previous_response_id`"}}"#,
+            ))
+            .await
+            .unwrap();
+            let retry = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            assert!(!retry.contains("previous_response_id"));
+            ws.send(Message::text(
+                r#"{"type":"response.completed","response":{"id":"resp_retry"}}"#,
+            ))
+            .await
+            .unwrap();
+        });
+
+        let (mut rx, _) = pool
+            .open_turn(
+                dial,
+                json!({
+                    "type":"response.create",
+                    "model":"m",
+                    "previous_response_id":"resp_stale",
+                    "input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]
+                }),
+            )
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap().unwrap();
+        assert_eq!(response_id(&event).as_deref(), Some("resp_retry"));
     }
 
     fn local_dial(addr: std::net::SocketAddr) -> WsDial {

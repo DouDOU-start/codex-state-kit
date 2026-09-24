@@ -94,6 +94,40 @@ pub fn ws_error_code(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether an upstream WebSocket error says that the chained response handle
+/// is no longer usable. Providers use both a dedicated error code and the
+/// generic `invalid_request_error` with a message mentioning the field.
+pub fn is_previous_response_error(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if value.get("type").and_then(Value::as_str) != Some("error") {
+        return false;
+    }
+
+    let code = value
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/error/type").and_then(Value::as_str));
+    if matches!(
+        code,
+        Some("previous_response_not_found" | "invalid_previous_response_id")
+    ) {
+        return true;
+    }
+
+    let message = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    message.contains("previous_response_id")
+        && (message.contains("invalid")
+            || message.contains("not found")
+            || message.contains("unknown"))
+}
+
 pub fn strip_previous_response_id(frame: &mut Value) {
     if let Some(object) = frame.as_object_mut() {
         object.remove("previous_response_id");
@@ -223,5 +257,21 @@ mod tests {
         strip_previous_response_id(&mut frame);
         assert!(frame.get("previous_response_id").is_none());
         assert_eq!(frame["model"], json!("m"));
+    }
+
+    #[test]
+    fn previous_response_errors_cover_provider_variants() {
+        assert!(is_previous_response_error(
+            r#"{"type":"error","error":{"code":"previous_response_not_found"}}"#
+        ));
+        assert!(is_previous_response_error(
+            r#"{"type":"error","error":{"code":"invalid_previous_response_id"}}"#
+        ));
+        assert!(is_previous_response_error(
+            r#"{"type":"error","error":{"code":"invalid_request_error","message":"Invalid `previous_response_id`"}}"#
+        ));
+        assert!(!is_previous_response_error(
+            r#"{"type":"error","error":{"code":"invalid_request_error","message":"Invalid model"}}"#
+        ));
     }
 }
