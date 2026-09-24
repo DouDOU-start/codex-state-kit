@@ -639,7 +639,7 @@ pub async fn transform_event(
             )
         };
         let translated = translated_item(&native, &spec, &payload);
-        state.lock().await.lineages.get_mut(lineage).map(|l| {
+        if let Some(l) = state.lock().await.lineages.get_mut(lineage) {
             l.calls.insert(call_id, NativeCall { item: native });
             while l.calls.len() > MAX_CALLS_PER_LINEAGE {
                 if let Some(key) = l.calls.keys().next().cloned() {
@@ -648,7 +648,7 @@ pub async fn transform_event(
                     break;
                 }
             }
-        });
+        }
         let mut output =
             vec![json!({"type":"response.output_item.added","item":translated.clone()})];
         if translated.get("type").and_then(Value::as_str) == Some("function_call") {
