@@ -1198,7 +1198,14 @@ async fn describe_bps_images(
             .post(target)
             .header(header::ACCEPT, "text/event-stream");
         for (name, value) in headers {
-            if is_hop(name) || name.as_str().starts_with("sec-websocket-") {
+            if is_hop(name)
+                || name.as_str().starts_with("sec-websocket-")
+                || *name == header::CONTENT_LENGTH
+                || *name == header::CONTENT_ENCODING
+                || *name == header::CONTENT_TYPE
+                || *name == header::ACCEPT
+                || *name == header::HOST
+            {
                 continue;
             }
             builder = builder.header(name, value);
@@ -2190,9 +2197,28 @@ async fn forward_http_tracked(
         }
         if request_settings.upstream_mode == UpstreamMode::Basispoints {
             // Basispoints' Excel endpoint is text/tool-only. Resolve image
-            // parts through the normal Codex multimodal upstream first.
+            // parts through its native attachment endpoint first; the normal
+            // Codex multimodal upstream remains the compatibility fallback.
             let vision_target = join_upstream(&upstream, &parts.uri)?;
-            let mut image_body = bytes.to_vec();
+            let (access_token, account_id) = request_identity
+                .as_ref()
+                .map(|(credentials, _)| {
+                    (
+                        credentials.access_token.as_str(),
+                        credentials.account_id.as_str(),
+                    )
+                })
+                .unwrap_or(("", ""));
+            let mut image_body = basispoints::upload_input_images(
+                &app.basispoints,
+                &http,
+                &bytes,
+                &target,
+                access_token,
+                account_id,
+                "chatgpt",
+            )
+            .await?;
             describe_bps_images(&http, &vision_target, &parts.headers, &mut image_body).await;
             bytes = image_body.into();
             let account_id = request_identity

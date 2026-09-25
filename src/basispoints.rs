@@ -8,16 +8,18 @@ use anyhow::{anyhow, Result};
 use axum::body::Bytes;
 use futures_util::Stream;
 use futures_util::StreamExt;
+use percent_encoding::percent_decode_str;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 pub const DEFAULT_ENDPOINT: &str = "https://bps.openai.com/basispoints/api/responses";
 pub const TRANSPORT_NAME: &str = "run_officejs";
 const MAX_LINEAGES: usize = 128;
 const MAX_CALLS_PER_LINEAGE: usize = 512;
+const MAX_ATTACHMENT_CACHE: usize = 512;
 
 #[derive(Clone, Debug)]
 struct ToolSpec {
@@ -47,12 +49,351 @@ pub struct BpsState {
     /// Restores the exact native transport item after a reconnect where the
     /// client sends only function_call_output.
     calls: HashMap<String, NativeCall>,
+    /// Stores only attachment digests and remote IDs. Image bytes and
+    /// credentials are never retained in process state.
+    attachments: HashMap<String, String>,
+    attachment_order: VecDeque<String>,
+    attachment_inflight: HashMap<String, Arc<Notify>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct PreparedRequest {
     pub body: Vec<u8>,
     pub lineage: String,
+}
+
+/// Decode an inline image data URL. Percent escapes are decoded before
+/// base64 parsing so URLs containing escaped `+`, `/`, or `=` work too.
+pub fn decode_inline_image(value: &str) -> Result<Option<(String, Vec<u8>)>> {
+    let Some(rest) = value.get(5..).filter(|_| {
+        value
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    }) else {
+        return Ok(None);
+    };
+    let (metadata, encoded) = rest
+        .split_once(',')
+        .ok_or_else(|| anyhow!("图片 data URL 缺少分隔符"))?;
+    let media_type = metadata
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|value| value.to_ascii_lowercase().starts_with("image/"))
+        .ok_or_else(|| anyhow!("图片 data URL 必须声明 image/* 类型"))?
+        .to_ascii_lowercase();
+    let is_base64 = metadata
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"));
+    let decoded = percent_decode_strict(encoded)?;
+    let data = if is_base64 {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, decoded)
+            .map_err(|_| anyhow!("图片 data URL 的 base64 无效"))?
+    } else {
+        decoded
+    };
+    if data.is_empty() {
+        return Err(anyhow!("图片 data URL 内容为空"));
+    }
+    Ok(Some((media_type, data)))
+}
+
+fn percent_decode_strict(value: &str) -> Result<Vec<u8>> {
+    let bytes = value.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'%' {
+            continue;
+        }
+        let valid = index + 2 < bytes.len()
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit();
+        if !valid {
+            return Err(anyhow!("图片 data URL 百分号编码无效"));
+        }
+    }
+    Ok(percent_decode_str(value).collect())
+}
+
+/// Derive the sibling upload endpoint used by the Basispoints Excel client.
+pub fn attachment_endpoint(responses: &str) -> Result<String> {
+    let mut url = url::Url::parse(responses).map_err(|_| anyhow!("BPS endpoint 不是有效 URL"))?;
+    if url.host_str().is_none()
+        || !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(anyhow!("BPS endpoint 不允许派生附件地址"));
+    }
+    let path = url.path().trim_end_matches('/');
+    let Some(prefix) = path.strip_suffix("/responses") else {
+        return Err(anyhow!("BPS endpoint 必须以 /responses 结尾"));
+    };
+    url.set_path(&format!("{prefix}/attachments"));
+    Ok(url.to_string())
+}
+
+fn attachment_cache_key(
+    endpoint: &str,
+    account_id: &str,
+    auth_mode: &str,
+    access_token: &str,
+    media_type: &str,
+    data: &[u8],
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        endpoint.as_bytes(),
+        account_id.as_bytes(),
+        auth_mode.as_bytes(),
+        access_token.as_bytes(),
+        media_type.as_bytes(),
+    ] {
+        hasher.update(part);
+        hasher.update([0]);
+    }
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+fn attachment_filename(media_type: &str) -> &'static str {
+    match media_type {
+        "image/jpeg" | "image/jpg" => "image.jpg",
+        "image/png" => "image.png",
+        "image/gif" => "image.gif",
+        "image/webp" => "image.webp",
+        "image/heic" => "image.heic",
+        "image/heif" => "image.heif",
+        _ => "image.bin",
+    }
+}
+
+fn attachment_headers(
+    access_token: &str,
+    account_id: &str,
+    auth_mode: &str,
+) -> reqwest::header::HeaderMap {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, ORIGIN};
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {access_token}")) {
+        headers.insert(AUTHORIZATION, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(account_id) {
+        headers.insert(HeaderName::from_static("chatgpt-account-id"), value.clone());
+        headers.insert(HeaderName::from_static("x-openai-account-id"), value);
+    }
+    if let Ok(value) = HeaderValue::from_str(auth_mode) {
+        headers.insert(HeaderName::from_static("x-basispoints-auth-mode"), value);
+    }
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(ORIGIN, HeaderValue::from_static("https://bps.openai.com"));
+    headers.insert(
+        HeaderName::from_static("accept-encoding"),
+        HeaderValue::from_static("identity"),
+    );
+    for (name, value) in [
+        (
+            "x-openai-internal-basispoints-client-agent-profile",
+            "excel",
+        ),
+        ("x-openai-internal-basispoints-client-editor", "excel"),
+        ("x-openai-internal-basispoints-client-host", "office"),
+        ("x-openai-internal-basispoints-client-platform", "excel"),
+        ("x-openai-internal-basispoints-client-platform-class", "PC"),
+        (
+            "x-openai-internal-basispoints-client-product",
+            "basispoints-excel-plugin",
+        ),
+        ("x-openai-internal-basispoints-client-runtime", "desktop"),
+        ("x-openai-internal-basispoints-office-host", "Excel"),
+        ("x-openai-internal-basispoints-office-platform", "PC"),
+    ] {
+        headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    headers
+}
+
+async fn upload_attachment(
+    client: &reqwest::Client,
+    endpoint: &str,
+    access_token: &str,
+    account_id: &str,
+    auth_mode: &str,
+    media_type: &str,
+    data: Vec<u8>,
+) -> Result<String> {
+    let part = reqwest::multipart::Part::bytes(data)
+        .file_name(attachment_filename(media_type))
+        .mime_str(media_type)
+        .map_err(|error| anyhow!("BPS 附件 MIME 无效: {error}"))?;
+    let response = client
+        .post(endpoint)
+        .headers(attachment_headers(access_token, account_id, auth_mode))
+        .multipart(reqwest::multipart::Form::new().part("file", part))
+        .send()
+        .await
+        .map_err(|error| anyhow!("BPS 附件上传失败: {error}"))?;
+    let status = response.status();
+    let body = response.bytes().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!("BPS 附件上传返回 HTTP {status}"));
+    }
+    let body: Value =
+        serde_json::from_slice(&body).map_err(|_| anyhow!("BPS 附件响应不是 JSON"))?;
+    body.get("openai_file_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("BPS 附件响应缺少 openai_file_id"))
+}
+
+async fn get_or_upload_attachment(
+    state: &Arc<Mutex<BpsState>>,
+    client: &reqwest::Client,
+    endpoint: &str,
+    access_token: &str,
+    account_id: &str,
+    auth_mode: &str,
+    media_type: &str,
+    data: Vec<u8>,
+) -> Result<String> {
+    let key = attachment_cache_key(
+        endpoint,
+        account_id,
+        auth_mode,
+        access_token,
+        media_type,
+        &data,
+    );
+    loop {
+        let (leader, notify) = {
+            let mut guard = state.lock().await;
+            if let Some(file_id) = guard.attachments.get(&key).cloned() {
+                if let Some(index) = guard.attachment_order.iter().position(|item| item == &key) {
+                    guard.attachment_order.remove(index);
+                }
+                guard.attachment_order.push_back(key.clone());
+                return Ok(file_id);
+            }
+            if let Some(notify) = guard.attachment_inflight.get(&key).cloned() {
+                (false, notify)
+            } else {
+                let notify = Arc::new(Notify::new());
+                guard
+                    .attachment_inflight
+                    .insert(key.clone(), notify.clone());
+                (true, notify)
+            }
+        };
+        if !leader {
+            notify.notified().await;
+            continue;
+        }
+        let result = upload_attachment(
+            client,
+            endpoint,
+            access_token,
+            account_id,
+            auth_mode,
+            media_type,
+            data.clone(),
+        )
+        .await;
+        let mut guard = state.lock().await;
+        guard.attachment_inflight.remove(&key);
+        if let Ok(file_id) = &result {
+            guard.attachments.insert(key.clone(), file_id.clone());
+            if let Some(index) = guard.attachment_order.iter().position(|item| item == &key) {
+                guard.attachment_order.remove(index);
+            }
+            guard.attachment_order.push_back(key.clone());
+            while guard.attachment_order.len() > MAX_ATTACHMENT_CACHE {
+                if let Some(oldest) = guard.attachment_order.pop_front() {
+                    guard.attachments.remove(&oldest);
+                }
+            }
+        }
+        notify.notify_waiters();
+        return result;
+    }
+}
+
+/// Upload inline user images to `/attachments`, replacing each data URL with
+/// the returned `file_id`. Existing file IDs and remote URLs are preserved.
+pub async fn upload_input_images(
+    state: &Arc<Mutex<BpsState>>,
+    client: &reqwest::Client,
+    raw: &[u8],
+    responses_endpoint: &str,
+    access_token: &str,
+    account_id: &str,
+    auth_mode: &str,
+) -> Result<Vec<u8>> {
+    let plain = decode_body(raw)?;
+    let mut body: Value =
+        serde_json::from_slice(&plain).map_err(|_| anyhow!("BPS 请求体不是 JSON"))?;
+    let endpoint = attachment_endpoint(responses_endpoint)?;
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return Ok(plain);
+    };
+    for item in items.iter_mut() {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        if object.get("role").and_then(Value::as_str) != Some("user")
+            || object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("message")
+                != "message"
+        {
+            continue;
+        }
+        let Some(parts) = object.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            let Some(image) = part.as_object_mut() else {
+                continue;
+            };
+            if !matches!(
+                image.get("type").and_then(Value::as_str),
+                Some("input_image" | "image")
+            ) {
+                continue;
+            }
+            let Some(image_url) = image.get("image_url").and_then(Value::as_str) else {
+                continue;
+            };
+            if image.get("file_id").is_some() {
+                return Err(anyhow!("input_image 不能同时包含 image_url 和 file_id"));
+            }
+            let Some((media_type, data)) = decode_inline_image(image_url)? else {
+                continue;
+            };
+            let file_id = get_or_upload_attachment(
+                state,
+                client,
+                &endpoint,
+                access_token,
+                account_id,
+                auth_mode,
+                &media_type,
+                data,
+            )
+            .await?;
+            image.remove("image_url");
+            image.insert("file_id".into(), Value::String(file_id));
+            image
+                .entry("detail")
+                .or_insert_with(|| Value::String("auto".into()));
+        }
+    }
+    Ok(serde_json::to_vec(&body)?)
 }
 
 /// Returns image content parts from a Responses request in input order.
@@ -62,12 +403,23 @@ pub fn image_parts(raw: &[u8]) -> Result<Vec<Value>> {
     let mut result = Vec::new();
     if let Some(items) = body.get("input").and_then(Value::as_array) {
         for item in items {
+            if item.get("role").and_then(Value::as_str) != Some("user")
+                || item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message")
+                    != "message"
+            {
+                continue;
+            }
             if let Some(parts) = item.get("content").and_then(Value::as_array) {
                 for part in parts {
                     if matches!(
                         part.get("type").and_then(Value::as_str),
                         Some("input_image" | "image")
-                    ) {
+                    ) && part.get("file_id").is_none()
+                        && part.get("image_url").is_some()
+                    {
                         result.push(part.clone());
                     }
                 }
@@ -82,12 +434,24 @@ pub fn replace_image_descriptions(body: &mut Value, descriptions: &[String]) {
     let mut index = 0;
     if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
         for item in items {
+            if item.get("role").and_then(Value::as_str) != Some("user")
+                || item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message")
+                    != "message"
+            {
+                continue;
+            }
             if let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) {
                 for part in parts {
                     if matches!(
                         part.get("type").and_then(Value::as_str),
                         Some("input_image" | "image")
                     ) {
+                        if part.get("file_id").is_some() {
+                            continue;
+                        }
                         let text = descriptions
                             .get(index)
                             .cloned()
@@ -405,6 +769,18 @@ fn normalize_message_item(item: &Value) -> Option<Value> {
                         }
                     }
                     "input_image" | "image" => {
+                        if let Some(file_id) = part
+                            .get("file_id")
+                            .and_then(Value::as_str)
+                            .filter(|v| !v.trim().is_empty())
+                        {
+                            let mut image = json!({"type":"input_image","file_id":file_id});
+                            if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+                                image["detail"] = json!(detail);
+                            }
+                            content.push(image);
+                            continue;
+                        }
                         // Basispoints' Excel endpoint rejects Responses image
                         // blocks (especially data URLs) with a generic 422.
                         // Keep the turn usable and make the loss explicit to
@@ -1342,6 +1718,239 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(first.lineage, second.lineage);
+    }
+
+    #[test]
+    fn decodes_inline_image_data_urls_including_percent_encoded_payloads() {
+        let decoded = decode_inline_image("data:image/png;base64,aGk=")
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.0, "image/png");
+        assert_eq!(decoded.1, b"hi");
+        let decoded = decode_inline_image("data:image/svg+xml,%3Csvg%3E%3C%2Fsvg%3E")
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.0, "image/svg+xml");
+        assert_eq!(decoded.1, b"<svg></svg>");
+        let decoded = decode_inline_image("data:image/png,%00%FF%01")
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.1, [0, 255, 1]);
+        assert!(decode_inline_image("data:image/png,%GG").is_err());
+        assert_eq!(
+            decode_inline_image("DATA:image/png;base64,aGk=")
+                .unwrap()
+                .unwrap()
+                .1,
+            b"hi"
+        );
+        assert!(decode_inline_image("data:image/png,%GG").is_err());
+    }
+
+    #[test]
+    fn derives_sibling_attachment_endpoint() {
+        assert_eq!(
+            attachment_endpoint("https://bps.openai.com/basispoints/api/responses").unwrap(),
+            "https://bps.openai.com/basispoints/api/attachments"
+        );
+        assert_eq!(
+            attachment_endpoint("https://example.test/custom/responses/").unwrap(),
+            "https://example.test/custom/attachments"
+        );
+        assert!(attachment_endpoint("https://example.test/responses?x=1").is_err());
+        assert!(attachment_endpoint("https://example.test/other").is_err());
+    }
+
+    #[tokio::test]
+    async fn coalesces_concurrent_uploads_for_the_same_image() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let counter = uploads.clone();
+        let router = axum::Router::new().route(
+            "/basispoints/api/attachments",
+            axum::routing::post(move |request: axum::extract::Request<axum::body::Body>| {
+                let counter = counter.clone();
+                async move {
+                    let _ = axum::body::to_bytes(request.into_body(), 1024 * 1024).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"openai_file_id":"file-shared"})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let client = reqwest::Client::new();
+        let request = json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,aGk="}]}]});
+        let raw = serde_json::to_vec(&request).unwrap();
+        let endpoint = format!("http://{address}/basispoints/api/responses");
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            let client = client.clone();
+            let raw = raw.clone();
+            let endpoint = endpoint.clone();
+            tasks.push(tokio::spawn(async move {
+                upload_input_images(
+                    &state,
+                    &client,
+                    &raw,
+                    &endpoint,
+                    "test-token",
+                    "test-account",
+                    "chatgpt",
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        for task in tasks {
+            let body = task.await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["input"][0]["content"][0]["file_id"], "file-shared");
+        }
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn uploads_multipart_file_with_auth_and_preserves_detail() {
+        let router = axum::Router::new().route(
+            "/basispoints/api/attachments",
+            axum::routing::post(
+                |request: axum::extract::Request<axum::body::Body>| async move {
+                    assert_eq!(
+                        request.headers().get("authorization").unwrap(),
+                        "Bearer test-token"
+                    );
+                    assert_eq!(
+                        request.headers().get("chatgpt-account-id").unwrap(),
+                        "test-account"
+                    );
+                    assert_eq!(
+                        request.headers().get("x-openai-account-id").unwrap(),
+                        "test-account"
+                    );
+                    assert_eq!(
+                        request.headers().get("x-basispoints-auth-mode").unwrap(),
+                        "chatgpt"
+                    );
+                    assert_eq!(
+                        request.headers().get("origin").unwrap(),
+                        "https://bps.openai.com"
+                    );
+                    let content_type = request
+                        .headers()
+                        .get("content-type")
+                        .unwrap()
+                        .to_str()
+                        .unwrap();
+                    assert!(content_type.starts_with("multipart/form-data; boundary="));
+                    let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let body = String::from_utf8_lossy(&body);
+                    assert!(body.contains("name=\"file\""));
+                    assert!(body.contains("filename=\"image.png\""));
+                    assert!(body.contains("Content-Type: image/png"));
+                    assert!(body.contains("hi"));
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"openai_file_id":"file-uploaded"})),
+                    )
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let request = json!({"input":[{"role":"user","content":[
+            {"type":"input_text","text":"look"},
+            {"type":"input_image","image_url":"data:image/png;base64,aGk=","detail":"high"}
+        ]}]});
+        let output = upload_input_images(
+            &state,
+            &reqwest::Client::new(),
+            &serde_json::to_vec(&request).unwrap(),
+            &format!("http://{address}/basispoints/api/responses"),
+            "test-token",
+            "test-account",
+            "chatgpt",
+        )
+        .await
+        .unwrap();
+        let output: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            output["input"][0]["content"][1],
+            json!({"type":"input_image","file_id":"file-uploaded","detail":"high"})
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_inline_image_with_both_file_id_and_image_url() {
+        let request = json!({"input":[{"role":"user","content":[{
+            "type":"input_image",
+            "file_id":"file-existing",
+            "image_url":"data:image/png;base64,aGk="
+        }]}]});
+        let error = upload_input_images(
+            &Arc::new(Mutex::new(BpsState::default())),
+            &reqwest::Client::new(),
+            &serde_json::to_vec(&request).unwrap(),
+            "https://bps.openai.com/basispoints/api/responses",
+            "test-token",
+            "test-account",
+            "chatgpt",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("file_id"));
+    }
+
+    #[tokio::test]
+    async fn uploads_image_from_zstd_compressed_request_body() {
+        let router = axum::Router::new().route(
+            "/basispoints/api/attachments",
+            axum::routing::post(
+                |request: axum::extract::Request<axum::body::Body>| async move {
+                    let _ = axum::body::to_bytes(request.into_body(), 1024 * 1024).await;
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"openai_file_id":"file-zstd"})),
+                    )
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let request = json!({"input":[{"role":"user","content":[
+            {"type":"input_image","image_url":"data:image/png;base64,aGk="}
+        ]}]});
+        let plain = serde_json::to_vec(&request).unwrap();
+        let mut compressed = Vec::new();
+        zstd::stream::copy_encode(std::io::Cursor::new(&plain), &mut compressed, 3).unwrap();
+        let output = upload_input_images(
+            &Arc::new(Mutex::new(BpsState::default())),
+            &reqwest::Client::new(),
+            &compressed,
+            &format!("http://{address}/basispoints/api/responses"),
+            "test-token",
+            "test-account",
+            "chatgpt",
+        )
+        .await
+        .unwrap();
+        let output: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(output["input"][0]["content"][0]["file_id"], "file-zstd");
+        server.abort();
     }
 }
 
