@@ -44,6 +44,9 @@ struct Lineage {
 #[derive(Clone, Debug, Default)]
 pub struct BpsState {
     lineages: HashMap<String, Lineage>,
+    /// Restores the exact native transport item after a reconnect where the
+    /// client sends only function_call_output.
+    calls: HashMap<String, NativeCall>,
 }
 
 #[derive(Clone, Debug)]
@@ -415,8 +418,7 @@ fn normalize_input_item(
             if name == "update_plan" || name == TRANSPORT_NAME {
                 return Some(item);
             }
-            tools
-                .contains_key(name)
+            (tools.contains_key(name) || item.get("call_id").is_some())
                 .then(|| fallback_transport_call(&item))
         }
         "custom_tool_call_output" => {
@@ -499,11 +501,14 @@ pub async fn prepare_request(
             }
         }
     }
+    let global_calls = guard.calls.clone();
     let entry = guard.lineages.entry(lineage.clone()).or_default();
     if object.contains_key("tools") {
         entry.tools = tools.clone();
     }
     let tools = entry.tools.clone();
+    let mut calls = entry.calls.clone();
+    calls.extend(global_calls);
     let fingerprint = turn_fingerprint(&input);
     let turn_id = string_field(object.get("metadata").and_then(|m| m.get("turn_id")))
         .or(client_turn)
@@ -528,12 +533,12 @@ pub async fn prepare_request(
         })
         .unwrap_or(1);
 
-    let mut translated_input = input
+    let translated_input = input
         .as_array()
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| normalize_input_item(item, &entry.calls, &entry.tools))
+                .filter_map(|item| normalize_input_item(item, &calls, &entry.tools))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| input.as_str().map(|text| vec![json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]})]).unwrap_or_default());
@@ -542,22 +547,34 @@ pub async fn prepare_request(
     // the same request, so remove orphaned tool results instead of forwarding
     // an unrecoverable 400.
     let mut seen_calls = std::collections::HashSet::new();
-    translated_input.retain(|item| {
+    let mut repaired_input = Vec::with_capacity(translated_input.len());
+    for item in translated_input {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
         if matches!(kind, "function_call" | "custom_tool_call") {
             if let Some(call_id) = string_field(item.get("call_id")) {
                 seen_calls.insert(call_id);
             }
-            return true;
+            repaired_input.push(item);
+            continue;
         }
         if kind == "function_call_output" {
-            return item
-                .get("call_id")
-                .and_then(Value::as_str)
-                .is_some_and(|call_id| seen_calls.contains(call_id));
+            let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !seen_calls.contains(call_id) {
+                if let Some(native) = calls.get(call_id) {
+                    repaired_input.push(native.item.clone());
+                    seen_calls.insert(call_id.to_owned());
+                } else {
+                    continue;
+                }
+            }
+            repaired_input.push(item);
+            continue;
         }
-        true
-    });
+        repaired_input.push(item);
+    }
+    let translated_input = repaired_input;
     object.insert("input".into(), Value::Array(translated_input));
     object.remove("tools");
     object.remove("tool_choice");
@@ -799,7 +816,8 @@ pub async fn transform_event(
             )
         };
         let translated = translated_item(&native, &spec, &payload);
-        if let Some(l) = state.lock().await.lineages.get_mut(lineage) {
+        let mut state_guard = state.lock().await;
+        if let Some(l) = state_guard.lineages.get_mut(lineage) {
             l.calls.insert(call_id, NativeCall { item: native });
             while l.calls.len() > MAX_CALLS_PER_LINEAGE {
                 if let Some(key) = l.calls.keys().next().cloned() {
@@ -809,6 +827,24 @@ pub async fn transform_event(
                 }
             }
         }
+        if let Some(call_id) = translated.get("call_id").and_then(Value::as_str) {
+            let native = state_guard
+                .lineages
+                .get(lineage)
+                .and_then(|l| l.calls.get(call_id))
+                .cloned();
+            if let Some(native) = native {
+                state_guard.calls.insert(call_id.to_owned(), native);
+            }
+        }
+        while state_guard.calls.len() > MAX_LINEAGES * MAX_CALLS_PER_LINEAGE {
+            if let Some(key) = state_guard.calls.keys().next().cloned() {
+                state_guard.calls.remove(&key);
+            } else {
+                break;
+            }
+        }
+        drop(state_guard);
         let mut output =
             vec![json!({"type":"response.output_item.added","item":translated.clone()})];
         if translated.get("type").and_then(Value::as_str) == Some("function_call") {
@@ -1112,6 +1148,50 @@ mod tests {
             .unwrap()
             .iter()
             .all(|item| item["type"] != "function_call_output"));
+    }
+
+    #[tokio::test]
+    async fn rehydrates_cached_call_for_result_only_reconnect() {
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let request = json!({
+            "prompt_cache_key":"stable-thread",
+            "input":[{"role":"user","content":[{"type":"input_text","text":"weather"}]}],
+            "tools":[{"type":"function","name":"get_weather","parameters":{"type":"object"}}]
+        });
+        let prepared = prepare_request(&state, &serde_json::to_vec(&request).unwrap(), None)
+            .await
+            .unwrap();
+        let native = json!({
+            "type":"function_call","id":"fc_native","call_id":"call_reconnect",
+            "name":"run_officejs","arguments":serde_json::to_string(&json!({
+                "code":serde_json::to_string(&json!({"name":"get_weather","arguments":{"city":"Tokyo"}})).unwrap()
+            })).unwrap()
+        });
+        transform_event(
+            &state,
+            &prepared.lineage,
+            &json!({"type":"response.output_item.added","item":native.clone()}),
+        )
+        .await;
+        transform_event(
+            &state,
+            &prepared.lineage,
+            &json!({"type":"response.output_item.done","item":native}),
+        )
+        .await;
+        let reconnect = json!({
+            "prompt_cache_key":"stable-thread",
+            "input":[{"type":"function_call_output","call_id":"call_reconnect","output":"18C"}]
+        });
+        let replay = prepare_request(&state, &serde_json::to_vec(&reconnect).unwrap(), None)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&replay.body).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().any(|item| item["type"] == "function_call"));
+        assert!(input
+            .iter()
+            .any(|item| item["type"] == "function_call_output"));
     }
 
     #[test]
