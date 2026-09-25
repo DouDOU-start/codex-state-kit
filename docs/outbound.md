@@ -46,8 +46,6 @@ Clash Verge 等软件只开系统代理、没开 TUN 时，浏览器能出网，
 
 原生 WebSocket 客户端的业务请求和官方 Codex 客户端一样走上游 WebSocket，不需要设置。HTTP 客户端继续走 HTTP SSE，以确保 usage 事件完整并能计费：
 
-若「转发设置」选择 `basispoints` 上游模式，Basispoints 请求固定走其 Responses HTTP SSE 端点；即使下游客户端使用 WebSocket，Kit 也会在本地将 WebSocket 请求桥接为 HTTP SSE。该模式复用当前 ChatGPT 登录，并只转换工具协议，不执行 OfficeJS。
-
 - **预热**：Kit 在后台预先连好一条连接，请求到达时直接发送，省去握手时间；账号、设备或线路变化后立即按新的身份重新预热。
 - **保活与换新**：空闲连接每 25 秒 ping 一次；连接用到约 50 分钟（上游约一小时断开）时在空闲期提前换新。
 - **并发**：一条连接一次只跑一轮，并发请求各用一条，最多 8 条；带 `previous_response_id` 的续跑回到原来那条连接。多出来的空闲连接闲置 10 分钟后关闭。

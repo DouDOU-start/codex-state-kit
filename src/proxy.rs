@@ -21,7 +21,6 @@ use url::Url;
 
 use crate::accounts::{self, AccountEnvironment, NetworkProfile};
 use crate::attach::{self, is_attached};
-use crate::basispoints;
 use crate::billing::{BillingStore, RequestStart, UsageOutcome, UsageState};
 use crate::diag;
 use crate::downgrade;
@@ -32,7 +31,7 @@ use crate::logs::ObservedStream;
 use crate::logs::{self, LogEntry, NetworkLogDetails, StreamLifecycle};
 use crate::mihomo::{MihomoRuntime, MihomoStatus};
 use crate::outbound;
-use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch, UpstreamMode};
+use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch};
 use crate::traffic::{AccountTraffic, RequestActivity, TrafficTracker};
 use crate::ws_bridge;
 use crate::ws_upstream::{WsDial, WsUpstreamPool};
@@ -103,7 +102,6 @@ const HOP_BY_HOP: &[&str] = &[
 pub struct Status {
     pub proxy_listen: String,
     pub upstream: String,
-    pub upstream_mode: UpstreamMode,
     pub codex_home: String,
     pub proxy_ok: bool,
     pub attached: bool,
@@ -149,7 +147,6 @@ pub struct App {
     pub sidecar_wake: Notify,
     vm_identity: Mutex<VmIdentity>,
     ws_upstream: WsUpstreamPool,
-    basispoints: Arc<Mutex<basispoints::BpsState>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,7 +225,6 @@ impl App {
                 VmIdentity::load_or_create()
             }),
             ws_upstream: WsUpstreamPool::new(),
-            basispoints: Arc::new(Mutex::new(basispoints::BpsState::default())),
         })
     }
 
@@ -284,7 +280,6 @@ impl App {
         Status {
             proxy_listen: settings.proxy_listen,
             upstream: settings.upstream,
-            upstream_mode: settings.upstream_mode,
             codex_home: settings.codex_home,
             proxy_ok: self.proxy_ok.load(Ordering::Relaxed),
             attached,
@@ -1045,209 +1040,9 @@ async fn bind_listen(addr: SocketAddr) -> Result<TcpListener> {
 
 async fn proxy(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
     if is_websocket(&req) {
-        if app.settings.lock().await.upstream_mode == UpstreamMode::Basispoints {
-            return proxy_bps_ws(app, req).await;
-        }
         return proxy_ws(app, req).await;
     }
     proxy_http(app, req).await
-}
-
-/// Accept a Codex WebSocket client while keeping the BPS leg on HTTP SSE.
-/// This lets the existing Codex attachment continue to work when the client
-/// elects its native WebSocket transport.
-async fn proxy_bps_ws(app: Arc<App>, req: Request<Body>) -> Response {
-    let headers = req.headers().clone();
-    let (mut parts, _body) = req.into_parts();
-    match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
-        Ok(upgrade) => upgrade.on_upgrade(move |socket| async move {
-            if let Err(error) = client_bps_ws_session(app, headers, socket).await {
-                eprintln!("[bps-ws] 客户端会话结束: {error:#}");
-            }
-        }),
-        Err(rejection) => rejection.into_response(),
-    }
-}
-
-async fn client_bps_ws_session(
-    app: Arc<App>,
-    client_headers: HeaderMap,
-    mut socket: WebSocket,
-) -> Result<()> {
-    let mut history = basispoints::WsHistory::default();
-    while let Some(message) = socket.recv().await {
-        let message = message.context("读取 BPS WebSocket 客户端消息")?;
-        let text = match message {
-            WsMessage::Text(text) => text.to_string(),
-            WsMessage::Close(_) => return Ok(()),
-            WsMessage::Ping(payload) => {
-                socket.send(WsMessage::Pong(payload)).await.ok();
-                continue;
-            }
-            WsMessage::Pong(_) | WsMessage::Binary(_) => continue,
-        };
-        let request_body = match history.expand(&text) {
-            Ok(body) => body,
-            Err(_) => {
-                socket.send(WsMessage::text(json!({"type":"error", "status":400, "error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"Send a full response.create request without previous_response_id"}}).to_string())).await?;
-                continue;
-            }
-        };
-        if request_body
-            .get("generate")
-            .and_then(serde_json::Value::as_bool)
-            == Some(false)
-        {
-            let response = json!({"id":format!("resp_{}",uuid::Uuid::new_v4().simple()),"object":"response","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}});
-            history.remember(&request_body, &response);
-            socket
-                .send(WsMessage::text(
-                    json!({"type":"response.completed","response":response}).to_string(),
-                ))
-                .await?;
-            continue;
-        }
-        let mut builder = Request::builder()
-            .method(http::Method::POST)
-            .uri("/responses");
-        for (name, value) in &client_headers {
-            if is_hop(name)
-                || name.as_str().eq_ignore_ascii_case("upgrade")
-                || name.as_str().starts_with("sec-websocket-")
-            {
-                continue;
-            }
-            builder = builder.header(name, value);
-        }
-        builder = builder.header(header::ACCEPT, "text/event-stream");
-        let request = builder
-            .body(Body::from(serde_json::to_vec(&request_body)?))
-            .context("构造 BPS HTTP 请求")?;
-        let response = proxy_http(app.clone(), request).await;
-        let status = response.status();
-        let mut body = response.into_body().into_data_stream();
-        if !status.is_success() {
-            let mut error_body = Vec::new();
-            while let Some(chunk) = body.next().await {
-                error_body.extend_from_slice(&chunk.context("读取 BPS 错误响应")?);
-            }
-            let payload = String::from_utf8_lossy(&error_body).to_string();
-            socket.send(WsMessage::text(payload)).await.ok();
-            continue;
-        }
-        let mut pending = Vec::new();
-        while let Some(chunk) = body.next().await {
-            pending.extend_from_slice(&chunk.context("读取 BPS SSE")?);
-            while let Some((pos, separator_len)) = pending
-                .windows(4)
-                .position(|pair| pair == b"\r\n\r\n")
-                .map(|pos| (pos, 4))
-                .or_else(|| {
-                    pending
-                        .windows(2)
-                        .position(|pair| pair == b"\n\n")
-                        .map(|pos| (pos, 2))
-                })
-            {
-                let block: Vec<u8> = pending.drain(..pos + separator_len).collect();
-                if let Some(data) = String::from_utf8_lossy(&block)
-                    .lines()
-                    .find_map(|line| line.strip_prefix("data:").map(str::trim))
-                {
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                        if event.get("type").and_then(serde_json::Value::as_str)
-                            == Some("response.completed")
-                        {
-                            if let Some(response) = event.get("response") {
-                                history.remember(&request_body, response);
-                            }
-                        }
-                    }
-                    socket.send(WsMessage::text(data.to_string())).await?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn describe_bps_images(
-    http: &reqwest::Client,
-    target: &str,
-    headers: &HeaderMap,
-    body: &mut Vec<u8>,
-) {
-    let Ok(images) = basispoints::image_parts(body) else {
-        return;
-    };
-    if images.is_empty() {
-        return;
-    }
-    let mut descriptions = Vec::with_capacity(images.len());
-    for image in images {
-        let request = json!({
-            "model": "gpt-5.6-luna",
-            "store": false,
-            "stream": true,
-            "input": [{"role":"user","content":[
-                {"type":"input_text","text":"Describe this image precisely in concise Chinese. Include visible text, UI controls, errors, and important layout details. Do not speculate."},
-                image
-            ]}]
-        });
-        let mut builder = http
-            .post(target)
-            .header(header::ACCEPT, "text/event-stream");
-        for (name, value) in headers {
-            if is_hop(name)
-                || name.as_str().starts_with("sec-websocket-")
-                || *name == header::CONTENT_LENGTH
-                || *name == header::CONTENT_ENCODING
-                || *name == header::CONTENT_TYPE
-                || *name == header::ACCEPT
-                || *name == header::HOST
-            {
-                continue;
-            }
-            builder = builder.header(name, value);
-        }
-        let description = match builder.json(&request).send().await {
-            Ok(response) if response.status().is_success() => match response.bytes().await {
-                Ok(bytes) => extract_description_from_sse(&bytes),
-                Err(_) => None,
-            },
-            _ => None,
-        };
-        descriptions.push(
-            description.unwrap_or_else(|| "[图片描述不可用：正常 Codex 多模态上游请求失败]".into()),
-        );
-    }
-    if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) {
-        basispoints::replace_image_descriptions(&mut value, &descriptions);
-        if let Ok(encoded) = serde_json::to_vec(&value) {
-            *body = encoded;
-        }
-    }
-}
-
-fn extract_description_from_sse(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut result = String::new();
-    for line in text.lines() {
-        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-            continue;
-        };
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
-            continue;
-        };
-        if event.get("type").and_then(serde_json::Value::as_str)
-            == Some("response.output_text.delta")
-        {
-            if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
-                result.push_str(delta);
-            }
-        }
-    }
-    (!result.trim().is_empty()).then(|| result.trim().to_owned())
 }
 
 fn is_websocket(req: &Request<Body>) -> bool {
@@ -1970,18 +1765,7 @@ async fn forward_http_tracked(
         );
     }
     let (mut parts, body) = req.into_parts();
-    let target = if request_settings.upstream_mode == UpstreamMode::Basispoints
-        && parts.method == http::Method::POST
-        && parts
-            .uri
-            .path()
-            .trim_end_matches('/')
-            .ends_with("/responses")
-    {
-        basispoints::DEFAULT_ENDPOINT.to_string()
-    } else {
-        join_upstream(&upstream, &parts.uri)?
-    };
+    let target = join_upstream(&upstream, &parts.uri)?;
     let path = parts.uri.path();
 
     // 先读取 body，以便从中提取或改写 model 字段
@@ -2030,22 +1814,13 @@ async fn forward_http_tracked(
     .await;
 
     let request_identity = app.sync_request_identity(Path::new(&home)).await;
-    if request_settings.upstream_mode == UpstreamMode::Basispoints && request_identity.is_none() {
-        anyhow::bail!("Basispoints 模式需要先登录 ChatGPT");
-    }
     let billing_identity_matches =
         request_identity
             .as_ref()
             .is_some_and(|(creds, override_headers)| {
                 *override_headers || !login::credentials_conflict_headers(&parts.headers, creds)
             });
-    if request_settings.upstream_mode == UpstreamMode::Basispoints {
-        if let Some((creds, _)) = &request_identity {
-            if !login::apply_chatgpt_credentials_headers(&mut parts.headers, creds) {
-                anyhow::bail!("无法应用 ChatGPT 鉴权请求头");
-            }
-        }
-    } else if let Some((creds, true)) = &request_identity {
+    if let Some((creds, true)) = &request_identity {
         if !login::apply_chatgpt_credentials_headers(&mut parts.headers, creds) {
             anyhow::bail!("无法应用 ChatGPT 鉴权请求头");
         }
@@ -2067,15 +1842,6 @@ async fn forward_http_tracked(
         details.account_id = effective_account
             .as_deref()
             .map(|id| logs::safe_text(id, 128));
-    }
-    if request_settings.upstream_mode == UpstreamMode::Basispoints {
-        if let Some((creds, _)) = &request_identity {
-            details.account_id = Some(logs::safe_text(&creds.account_id, 128));
-            details.account_email = creds
-                .email
-                .as_deref()
-                .map(|email| logs::safe_text(email, 254));
-        }
     }
     let request_model = crate::body_model::extract_model_from_body(&bytes);
     details.model = request_model
@@ -2186,7 +1952,6 @@ async fn forward_http_tracked(
     // still use the upstream WebSocket path in `proxy_ws` below.
     // WebSocket 链式续跑才认 previous_response_id；走 HTTP 时必须去掉，
     // 否则上游返回 "Invalid previous_response_id"。
-    let mut bps_lineage = None;
     let http = app.business_client(&resolved_proxy).await?;
     if parts.method == http::Method::POST && path.contains("/responses") {
         let stripped =
@@ -2194,47 +1959,6 @@ async fn forward_http_tracked(
         if stripped.as_slice() != bytes.as_ref() {
             bytes = stripped.into();
             details.body_bytes = bytes.len();
-        }
-        if request_settings.upstream_mode == UpstreamMode::Basispoints {
-            // Basispoints' Excel endpoint is text/tool-only. Resolve image
-            // parts through its native attachment endpoint first; the normal
-            // Codex multimodal upstream remains the compatibility fallback.
-            let vision_target = join_upstream(&upstream, &parts.uri)?;
-            let (access_token, account_id) = request_identity
-                .as_ref()
-                .map(|(credentials, _)| {
-                    (
-                        credentials.access_token.as_str(),
-                        credentials.account_id.as_str(),
-                    )
-                })
-                .unwrap_or(("", ""));
-            let mut image_body = basispoints::upload_input_images(
-                &app.basispoints,
-                &http,
-                &bytes,
-                &target,
-                access_token,
-                account_id,
-                "chatgpt",
-            )
-            .await?;
-            describe_bps_images(&http, &vision_target, &parts.headers, &mut image_body).await;
-            bytes = image_body.into();
-            let account_id = request_identity
-                .as_ref()
-                .map(|(credentials, _)| credentials.account_id.as_str());
-            let prepared =
-                basispoints::prepare_request(&app.basispoints, &bytes, account_id).await?;
-            bytes = prepared.body.into();
-            bps_lineage = Some(prepared.lineage);
-            details.body_bytes = bytes.len();
-            parts.headers.remove(header::CONTENT_ENCODING);
-            parts.headers.remove(header::CONTENT_LENGTH);
-            parts.headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
         }
     }
     let mut builder = http
@@ -2290,34 +2014,6 @@ async fn forward_http_tracked(
         {
             builder = builder.header("x-codex-routing-hint", vm.routing_hint(model));
         }
-    }
-    if request_settings.upstream_mode == UpstreamMode::Basispoints {
-        let account_id = parts
-            .headers
-            .get("chatgpt-account-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        builder = builder
-            .header("x-openai-account-id", account_id)
-            .header("x-basispoints-auth-mode", "chatgpt")
-            // Basispoints selects its Excel tool surface from these client
-            // identity headers. Without them it may expose unrelated native
-            // tools such as web_search instead of run_officejs.
-            .header(
-                "x-openai-internal-basispoints-client-agent-profile",
-                "excel",
-            )
-            .header("x-openai-internal-basispoints-client-editor", "excel")
-            .header("x-openai-internal-basispoints-client-host", "office")
-            .header("x-openai-internal-basispoints-client-platform", "excel")
-            .header("x-openai-internal-basispoints-client-platform-class", "PC")
-            .header(
-                "x-openai-internal-basispoints-client-product",
-                "basispoints-excel-plugin",
-            )
-            .header("x-openai-internal-basispoints-client-runtime", "desktop")
-            .header("x-openai-internal-basispoints-office-host", "Excel")
-            .header("x-openai-internal-basispoints-office-platform", "PC");
     }
     let upstream_resp = match builder.send().await {
         Ok(response) => response,
@@ -2380,35 +2076,8 @@ async fn forward_http_tracked(
         let lifecycle = Arc::new(StreamLifecycle::new(started, response_header_ms));
         details.stream_lifecycle = Some(lifecycle.clone());
     }
-    // Preserve the upstream error body and log a bounded, redacted summary.
-    // Without this, a BPS 422 only appeared as a status code in dev logs,
-    // making malformed input and authentication failures indistinguishable.
-    if request_settings.upstream_mode == UpstreamMode::Basispoints && !status.is_success() {
-        let error_body = upstream_resp.bytes().await.unwrap_or_default();
-        let summary = String::from_utf8_lossy(&error_body);
-        let summary = logs::safe_text(summary.trim(), 2048);
-        debug_log(format!(
-            "[bps] upstream error status={} body={}",
-            status, summary
-        ))
-        .await;
-        let mut response = Response::new(Body::from(error_body));
-        *response.status_mut() = status;
-        *response.headers_mut() = headers;
-        return Ok(response);
-    }
     let body_stream = upstream_resp.bytes_stream();
-    let body = if let Some(lineage) =
-        bps_lineage.filter(|_| status.is_success() && details.transport == "http_sse")
-    {
-        Body::from_stream(basispoints::sse_stream(
-            body_stream,
-            app.basispoints.clone(),
-            lineage,
-        ))
-    } else {
-        Body::from_stream(body_stream)
-    };
+    let body = Body::from_stream(body_stream);
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;

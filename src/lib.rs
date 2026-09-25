@@ -1,6 +1,5 @@
 pub mod accounts;
 pub mod attach;
-pub mod basispoints;
 pub mod billing;
 pub mod body_model;
 pub mod browser_login;
@@ -35,4 +34,4 @@ pub use login::{
 };
 pub use logs::LogEntry;
 pub use proxy::{join_upstream, App, ProxyHandle, Status};
-pub use settings::{home_dir, load_settings, save_settings, Settings, SettingsPatch, UpstreamMode};
+pub use settings::{home_dir, load_settings, save_settings, Settings, SettingsPatch};

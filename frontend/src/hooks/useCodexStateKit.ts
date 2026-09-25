@@ -20,13 +20,12 @@ import {
   removeAccount,
   switchAccount,
 } from "@/lib/api";
-import type { SavedAccount, Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, UpstreamMode, SettingsPatch, ProbeKind, LatencyReport, VmProfile } from "@/types";
+import type { SavedAccount, Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, SettingsPatch, ProbeKind, LatencyReport, VmProfile } from "@/types";
 
 function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): SettingsPatch {
   return {
     proxyListen: status.proxyListen,
     upstream: status.upstream,
-    upstreamMode: status.upstreamMode,
     codexHome: status.codexHome,
     outboundProxy: status.outboundProxy,
     outboundMode: status.outboundMode,
@@ -261,20 +260,6 @@ export function useCodexStateKit() {
     }
   }, []);
 
-  const saveUpstreamMode = useCallback(async (upstreamMode: UpstreamMode) => {
-    setBusy("save");
-    try {
-      const latest = await getStatus();
-      const next = await setConfig(patchFrom(latest, { upstreamMode }));
-      setStatus(next);
-      setBanner({ kind: "ok", text: upstreamMode === "basispoints" ? "已切换到 Basispoints 上游" : "已切换到 ChatGPT 上游" });
-    } catch (cause) {
-      setBanner({ kind: "error", text: errorMessage(cause) });
-    } finally {
-      setBusy(null);
-    }
-  }, []);
-
   const selectMihomoNode = useCallback(async (group: string, node: string) => {
     setBusy("save");
     try {
@@ -496,7 +481,6 @@ export function useCodexStateKit() {
     saveSettings,
     saveMihomo,
     saveForcedModel,
-    saveUpstreamMode,
     probing,
     probingGroup,
     latency,

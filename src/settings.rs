@@ -11,14 +11,6 @@ pub enum OutboundMode {
     Mihomo,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum UpstreamMode {
-    #[default]
-    Chatgpt,
-    Basispoints,
-}
-
 fn deserialize_outbound_mode<'de, D>(deserializer: D) -> Result<OutboundMode, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -40,8 +32,6 @@ where
 pub struct Settings {
     pub proxy_listen: String,
     pub upstream: String,
-    #[serde(default)]
-    pub upstream_mode: UpstreamMode,
     pub codex_home: String,
     pub outbound_proxy: String,
     #[serde(default, deserialize_with = "deserialize_outbound_mode")]
@@ -64,7 +54,6 @@ impl Default for Settings {
         Self {
             proxy_listen: default_listen().into(),
             upstream: "https://chatgpt.com/backend-api/codex".into(),
-            upstream_mode: UpstreamMode::Chatgpt,
             codex_home: home_dir().join(".codex").display().to_string(),
             outbound_proxy: String::new(),
             outbound_mode: OutboundMode::Manual,
@@ -114,8 +103,6 @@ pub fn is_dev_mode() -> bool {
 pub struct SettingsPatch {
     pub proxy_listen: String,
     pub upstream: String,
-    #[serde(default)]
-    pub upstream_mode: UpstreamMode,
     pub codex_home: String,
     #[serde(default)]
     pub outbound_proxy: String,
@@ -138,7 +125,6 @@ impl SettingsPatch {
         let settings = Settings {
             proxy_listen: self.proxy_listen.trim().to_string(),
             upstream: self.upstream.trim().to_string(),
-            upstream_mode: self.upstream_mode,
             codex_home: self.codex_home.trim().to_string(),
             outbound_proxy: normalize_outbound_proxy(&self.outbound_proxy)?,
             outbound_mode: self.outbound_mode,
@@ -335,7 +321,6 @@ mod tests {
         let settings = SettingsPatch {
             proxy_listen: "127.0.0.1:8787".into(),
             upstream: "https://chatgpt.com/backend-api/codex".into(),
-            upstream_mode: UpstreamMode::Chatgpt,
             codex_home: "/tmp/codex".into(),
             outbound_proxy: "socks5://127.0.0.1:1080".into(),
             outbound_mode: OutboundMode::Manual,

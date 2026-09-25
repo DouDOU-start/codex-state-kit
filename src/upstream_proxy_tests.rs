@@ -65,7 +65,6 @@ fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
     SettingsPatch {
         proxy_listen: settings.proxy_listen.clone(),
         upstream: settings.upstream.clone(),
-        upstream_mode: settings.upstream_mode,
         codex_home: settings.codex_home.clone(),
         outbound_proxy: proxy.into(),
         outbound_mode: settings.outbound_mode,
