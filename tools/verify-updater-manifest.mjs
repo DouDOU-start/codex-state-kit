@@ -7,7 +7,10 @@ export function verifyManifest(manifest, assets, tag, repository) {
     'windows-x86_64': '.exe',
     'darwin-x86_64': '.app.tar.gz',
     'darwin-aarch64': '.app.tar.gz',
-    'linux-x86_64': '.AppImage.tar.gz',
+    // Tauri's Linux updater feed uses the signed AppImage itself. The
+    // release also contains deb/rpm packages, but they are not updater
+    // payloads and must not be selected for the feed.
+    'linux-x86_64': '.AppImage',
   };
   for (const [platform, extension] of Object.entries(required)) {
     const entry = manifest.platforms?.[platform];

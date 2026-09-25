@@ -2,7 +2,7 @@
 
 [返回首页](../README.md)
 
-应用使用 Tauri updater 下载并验证签名。Windows 使用 NSIS 更新包，Linux 使用 `.AppImage.tar.gz`，macOS 使用 `.app.tar.gz`；下载期间不停止转发，用户确认后才安装重启。Windows 使用 `passive` 安装模式，显示安装进度；系统权限提示仍可能出现。
+应用使用 Tauri updater 下载并验证签名。Windows 使用 NSIS 更新包，Linux 使用签名的 `.AppImage`，macOS 使用 `.app.tar.gz`；下载期间不停止转发，用户确认后才安装重启。Windows 使用 `passive` 安装模式，显示安装进度；系统权限提示仍可能出现。
 
 ## 签名与 Secrets
 
@@ -33,7 +33,7 @@
 
 1. 同步提高 `package.json`、两个 `Cargo.toml` 的版本号，并更新 `Cargo.lock`。旧版 `0.0.4` 用户需手动安装一次带 updater 公钥的新版本，之后才支持应用内更新。
 2. 提交代码并推送相同版本的 `vX.Y.Z` 标签。发布流程首先检查版本号和两个 Secrets 是否存在；已公开的版本禁止覆盖。
-3. 四个平台依次构建签名更新包，上传到草稿 Release，并合并生成 `latest.json`。Windows 清单优先使用 NSIS `.exe`，Linux 清单使用 AppImage 更新包。
+3. 四个平台依次构建签名更新包，上传到草稿 Release，并合并生成 `latest.json`。Windows 清单优先使用 NSIS `.exe`，Linux 清单使用签名 AppImage 更新包。
 4. 最终任务核对四个平台条目、版本、下载地址及安装包和 `.sig` 资源齐全，再公开 Release 并标记 latest。构建失败时草稿保持不公开，可修复后重新运行。
 
 固定更新入口：`https://github.com/DouDOU-start/codex-state-kit/releases/latest/download/latest.json`。更新包 URL 指向对应版本标签，避免下载时混用不同版本的资源。

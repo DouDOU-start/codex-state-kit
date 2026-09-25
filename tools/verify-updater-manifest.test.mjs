@@ -10,7 +10,7 @@ function fixture() {
     'windows-x86_64': 'app-windows-x64-setup.exe',
     'darwin-x86_64': 'app-darwin-x64.app.tar.gz',
     'darwin-aarch64': 'app-darwin-aarch64.app.tar.gz',
-    'linux-x86_64': 'app-linux-amd64.AppImage.tar.gz',
+    'linux-x86_64': 'app-linux-amd64.AppImage',
   })) {
     platforms[platform] = { signature: 'test-signature', url: `https://github.com/${repo}/releases/download/v0.0.5/${name}` };
     assets.push({ name, size: 100 }, { name: `${name}.sig`, size: 100 });
