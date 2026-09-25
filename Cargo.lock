@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "codex-state-kit"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "axum",
@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "codex-state-kit-desktop"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "codex-state-kit",
