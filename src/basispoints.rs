@@ -304,14 +304,23 @@ fn filter_tools_for_choice(tools: &mut HashMap<String, ToolSpec>, choice: Option
                     )
                 })
                 .collect();
-            tools.retain(|key, spec| allowed.contains(key) || allowed.contains(&spec.name));
+            tools.retain(|key, spec| {
+                allowed.contains(key) || (spec.namespace.is_none() && allowed.contains(&spec.name))
+            });
         }
         Some("function") | Some("custom") => {
             let name = object
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            tools.retain(|key, spec| key == name || spec.name == name);
+            let selected = object
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(|namespace| format!("{namespace}.{name}"));
+            tools.retain(|key, spec| {
+                selected.as_deref() == Some(key.as_str())
+                    || (selected.is_none() && (key == name || spec.name == name))
+            });
         }
         _ => {}
     }
