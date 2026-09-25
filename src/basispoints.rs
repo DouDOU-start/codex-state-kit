@@ -52,6 +52,52 @@ pub struct PreparedRequest {
     pub lineage: String,
 }
 
+/// Returns image content parts from a Responses request in input order.
+pub fn image_parts(raw: &[u8]) -> Result<Vec<Value>> {
+    let plain = decode_body(raw)?;
+    let body: Value = serde_json::from_slice(&plain).map_err(|_| anyhow!("请求体不是 JSON"))?;
+    let mut result = Vec::new();
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items {
+            if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                for part in parts {
+                    if matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some("input_image" | "image")
+                    ) {
+                        result.push(part.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Replaces image content parts with text descriptions before BPS translation.
+pub fn replace_image_descriptions(body: &mut Value, descriptions: &[String]) {
+    let mut index = 0;
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items {
+            if let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) {
+                for part in parts {
+                    if matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some("input_image" | "image")
+                    ) {
+                        let text = descriptions
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_else(|| "[Image description unavailable]".into());
+                        *part = json!({"type":"input_text","text":text});
+                        index += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn digest(value: &Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     let mut hasher = Sha256::new();

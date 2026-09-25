@@ -1171,6 +1171,78 @@ async fn client_bps_ws_session(
     Ok(())
 }
 
+async fn describe_bps_images(
+    http: &reqwest::Client,
+    target: &str,
+    headers: &HeaderMap,
+    body: &mut Vec<u8>,
+) {
+    let Ok(images) = basispoints::image_parts(body) else {
+        return;
+    };
+    if images.is_empty() {
+        return;
+    }
+    let mut descriptions = Vec::with_capacity(images.len());
+    for image in images {
+        let request = json!({
+            "model": "gpt-5.6-luna",
+            "store": false,
+            "stream": true,
+            "input": [{"role":"user","content":[
+                {"type":"input_text","text":"Describe this image precisely in concise Chinese. Include visible text, UI controls, errors, and important layout details. Do not speculate."},
+                image
+            ]}]
+        });
+        let mut builder = http
+            .post(target)
+            .header(header::ACCEPT, "text/event-stream");
+        for (name, value) in headers {
+            if is_hop(name) || name.as_str().starts_with("sec-websocket-") {
+                continue;
+            }
+            builder = builder.header(name, value);
+        }
+        let description = match builder.json(&request).send().await {
+            Ok(response) if response.status().is_success() => match response.bytes().await {
+                Ok(bytes) => extract_description_from_sse(&bytes),
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        descriptions.push(
+            description.unwrap_or_else(|| "[图片描述不可用：正常 Codex 多模态上游请求失败]".into()),
+        );
+    }
+    if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) {
+        basispoints::replace_image_descriptions(&mut value, &descriptions);
+        if let Ok(encoded) = serde_json::to_vec(&value) {
+            *body = encoded;
+        }
+    }
+}
+
+fn extract_description_from_sse(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut result = String::new();
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if event.get("type").and_then(serde_json::Value::as_str)
+            == Some("response.output_text.delta")
+        {
+            if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
+                result.push_str(delta);
+            }
+        }
+    }
+    (!result.trim().is_empty()).then(|| result.trim().to_owned())
+}
+
 fn is_websocket(req: &Request<Body>) -> bool {
     req.headers()
         .get(header::UPGRADE)
@@ -2108,6 +2180,7 @@ async fn forward_http_tracked(
     // WebSocket 链式续跑才认 previous_response_id；走 HTTP 时必须去掉，
     // 否则上游返回 "Invalid previous_response_id"。
     let mut bps_lineage = None;
+    let http = app.business_client(&resolved_proxy).await?;
     if parts.method == http::Method::POST && path.contains("/responses") {
         let stripped =
             crate::body_model::strip_previous_response_id(&bytes, content_encoding.as_deref());
@@ -2116,6 +2189,12 @@ async fn forward_http_tracked(
             details.body_bytes = bytes.len();
         }
         if request_settings.upstream_mode == UpstreamMode::Basispoints {
+            // Basispoints' Excel endpoint is text/tool-only. Resolve image
+            // parts through the normal Codex multimodal upstream first.
+            let vision_target = join_upstream(&upstream, &parts.uri)?;
+            let mut image_body = bytes.to_vec();
+            describe_bps_images(&http, &vision_target, &parts.headers, &mut image_body).await;
+            bytes = image_body.into();
             let account_id = request_identity
                 .as_ref()
                 .map(|(credentials, _)| credentials.account_id.as_str());
@@ -2132,7 +2211,6 @@ async fn forward_http_tracked(
             );
         }
     }
-    let http = app.business_client(&resolved_proxy).await?;
     let mut builder = http
         .request(
             reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?,
