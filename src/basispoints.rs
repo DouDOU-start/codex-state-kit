@@ -342,6 +342,15 @@ fn normalize_message_item(item: &Value) -> Option<Value> {
                             content.push(json!({"type":text_type,"text":text}));
                         }
                     }
+                    "refusal" if role == "assistant" => {
+                        if let Some(text) = part
+                            .get("refusal")
+                            .or_else(|| part.get("text"))
+                            .and_then(Value::as_str)
+                        {
+                            content.push(json!({"type":"refusal","refusal":text}));
+                        }
+                    }
                     "input_image" | "image" => {
                         // Basispoints' Excel endpoint rejects Responses image
                         // blocks (especially data URLs) with a generic 422.
@@ -403,10 +412,12 @@ fn normalize_input_item(
                     return Some(native.item.clone());
                 }
             }
-            if name == "update_plan" || !tools.contains_key(name) {
+            if name == "update_plan" || name == TRANSPORT_NAME {
                 return Some(item);
             }
-            Some(fallback_transport_call(&item))
+            tools
+                .contains_key(name)
+                .then(|| fallback_transport_call(&item))
         }
         "custom_tool_call_output" => {
             let call_id = string_field(item.get("call_id"));
@@ -430,7 +441,24 @@ fn normalize_input_item(
             }
             Some(output)
         }
-        _ => Some(item),
+        // Codex can replay provider-internal records (web search, shell,
+        // computer use, MCP discovery, compaction, image generation, etc.).
+        // The Excel endpoint does not accept these input item variants. Their
+        // user-visible result is already represented by adjacent messages, so
+        // dropping the internal record preserves the conversation and avoids
+        // a generic 400/422 for an unsupported item type.
+        "compaction"
+        | "web_search_call"
+        | "local_shell_call"
+        | "local_shell_call_output"
+        | "computer_call"
+        | "computer_call_output"
+        | "mcp_call"
+        | "mcp_list_tools"
+        | "mcp_approval_request"
+        | "image_generation_call"
+        | "code_interpreter_call" => None,
+        _ => None,
     }
 }
 
@@ -500,7 +528,7 @@ pub async fn prepare_request(
         })
         .unwrap_or(1);
 
-    let translated_input = input
+    let mut translated_input = input
         .as_array()
         .map(|items| {
             items
@@ -509,6 +537,27 @@ pub async fn prepare_request(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| input.as_str().map(|text| vec![json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]})]).unwrap_or_default());
+    // A follow-up can arrive after the in-memory lineage was evicted or after
+    // a client reconnect. BPS rejects an output whose call is not present in
+    // the same request, so remove orphaned tool results instead of forwarding
+    // an unrecoverable 400.
+    let mut seen_calls = std::collections::HashSet::new();
+    translated_input.retain(|item| {
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if matches!(kind, "function_call" | "custom_tool_call") {
+            if let Some(call_id) = string_field(item.get("call_id")) {
+                seen_calls.insert(call_id);
+            }
+            return true;
+        }
+        if kind == "function_call_output" {
+            return item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .is_some_and(|call_id| seen_calls.contains(call_id));
+        }
+        true
+    });
     object.insert("input".into(), Value::Array(translated_input));
     object.remove("tools");
     object.remove("tool_choice");
@@ -918,7 +967,11 @@ mod tests {
         .unwrap();
         let replay: Value = serde_json::from_slice(&replay.body).unwrap();
         assert_eq!(replay["metadata"]["agent_iteration"], "2");
-        assert_eq!(replay["input"][2]["name"], "run_officejs");
+        assert!(replay["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call" && item["name"] == "run_officejs"));
     }
 
     #[tokio::test]
@@ -987,7 +1040,9 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         assert!(input.iter().all(|item| item["type"] != "reasoning"));
         assert!(input.iter().all(|item| item["type"] != "item_reference"));
-        assert_eq!(input.last().unwrap()["type"], "function_call_output");
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != "function_call_output"));
     }
 
     #[tokio::test]
@@ -1040,6 +1095,23 @@ mod tests {
             .find(|item| item["role"] == "assistant")
             .unwrap();
         assert_eq!(assistant["content"][0]["type"], "output_text");
+    }
+
+    #[tokio::test]
+    async fn drops_orphaned_tool_outputs() {
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let request = json!({
+            "input":[{"type":"function_call_output","call_id":"missing","output":"ok"}]
+        });
+        let prepared = prepare_request(&state, &serde_json::to_vec(&request).unwrap(), None)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["type"] != "function_call_output"));
     }
 
     #[test]
