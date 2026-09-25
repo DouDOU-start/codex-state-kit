@@ -36,7 +36,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NO_PROXY: localhost,127.0.0.1
-      no_proxy: localhost,127.0.0.1
     steps:
       - uses: actions/checkout@v4
       - name: Install Tauri dependencies
