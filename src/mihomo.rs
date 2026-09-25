@@ -466,7 +466,7 @@ async fn load_subscription(raw: &str) -> Result<String> {
 }
 
 pub fn parse_subscription(raw: &str) -> Result<SubscriptionConfig> {
-    let text = raw.trim();
+    let text = raw.trim().trim_start_matches('\u{feff}').trim();
     if text.is_empty() {
         bail!("订阅为空");
     }
@@ -476,6 +476,7 @@ pub fn parse_subscription(raw: &str) -> Result<SubscriptionConfig> {
         }
     }
     if let Some(decoded) = decode_text(text) {
+        let decoded = decoded.trim().trim_start_matches('\u{feff}').trim();
         if let Some(config) = yaml_subscription(&decoded) {
             if !config.nodes.is_empty() {
                 return Ok(config);
@@ -598,19 +599,26 @@ fn parse_uri(line: &str) -> Option<ProxyNode> {
 
 fn parse_shadowsocks(rest: &str) -> Option<ProxyNode> {
     let (body, name) = split_name(rest);
+    let (body, outer_plugin) = split_uri_query(body);
     if let Some((userinfo, hostport)) = body.split_once('@') {
         let decoded = String::from_utf8(b64(userinfo)?).ok()?;
         let (cipher, password) = decoded.split_once(':')?;
+        let (hostport, inline_plugin) = split_uri_query(hostport);
         let (server, port) = split_host_port(hostport)?;
         let display = name.unwrap_or_else(|| server.to_string());
-        return Some(ss_node(&display, server, port, cipher, password));
+        let mut node = ss_node(&display, server, port, cipher, password);
+        apply_shadowsocks_plugin(&mut node, plugin_query(outer_plugin, inline_plugin));
+        return Some(node);
     }
     let decoded = String::from_utf8(b64(body)?).ok()?;
     let (method, rest) = decoded.split_once(':')?;
     let (password, hostport) = rest.rsplit_once('@')?;
+    let (hostport, inline_plugin) = split_uri_query(hostport);
     let (server, port) = split_host_port(hostport)?;
     let display = name.unwrap_or_else(|| server.to_string());
-    Some(ss_node(&display, server, port, method, password))
+    let mut node = ss_node(&display, server, port, method, password);
+    apply_shadowsocks_plugin(&mut node, plugin_query(outer_plugin, inline_plugin));
+    Some(node)
 }
 
 fn ss_node(name: &str, server: &str, port: u16, cipher: &str, password: &str) -> ProxyNode {
@@ -628,7 +636,7 @@ fn ss_node(name: &str, server: &str, port: u16, cipher: &str, password: &str) ->
 }
 
 fn parse_vmess(rest: &str) -> Option<ProxyNode> {
-    let (body, _) = split_name(rest);
+    let (body, fragment_name) = split_name(rest);
     let json: JsonValue = serde_json::from_slice(&b64(body)?).ok()?;
     let server = json.get("add")?.as_str()?.trim();
     let port = json_port(json.get("port")?)?;
@@ -638,6 +646,7 @@ fn parse_vmess(rest: &str) -> Option<ProxyNode> {
         .and_then(JsonValue::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty())
+        .or_else(|| fragment_name.as_deref())
         .unwrap_or(server);
     let mut fields = vec![
         ("server", yaml_str(server)),
@@ -657,34 +666,38 @@ fn parse_vmess(rest: &str) -> Option<ProxyNode> {
         ),
         ("udp", serde_yaml::Value::Bool(true)),
     ];
-    let network = json.get("net").and_then(JsonValue::as_str).unwrap_or("tcp");
+    let network = json
+        .get("net")
+        .and_then(JsonValue::as_str)
+        .map(|network| network.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "tcp".into());
     if network != "tcp" {
-        fields.push(("network", yaml_str(network)));
+        fields.push(("network", yaml_str(&network)));
     }
     if network == "ws" {
-        let path = json
-            .get("path")
-            .and_then(JsonValue::as_str)
-            .filter(|path| !path.is_empty());
-        let host = json
-            .get("host")
-            .and_then(JsonValue::as_str)
-            .map(str::trim)
-            .filter(|host| !host.is_empty());
-        if path.is_some() || host.is_some() {
-            let mut ws_opts = serde_yaml::Mapping::new();
-            if let Some(path) = path {
-                ws_opts.insert(yaml_str("path"), yaml_str(path));
-            }
-            if let Some(host) = host {
-                let mut headers = serde_yaml::Mapping::new();
-                headers.insert(yaml_str("Host"), yaml_str(host));
-                ws_opts.insert(yaml_str("headers"), serde_yaml::Value::Mapping(headers));
-            }
-            fields.push(("ws-opts", serde_yaml::Value::Mapping(ws_opts)));
+        if let Some(opts) = websocket_opts(
+            json.get("path").and_then(JsonValue::as_str),
+            json.get("host").and_then(JsonValue::as_str),
+        ) {
+            fields.push(("ws-opts", opts));
+        }
+    } else if matches!(network.as_str(), "h2" | "http") {
+        if let Some(opts) = http_opts(
+            json.get("path").and_then(JsonValue::as_str),
+            json.get("host").and_then(JsonValue::as_str),
+        ) {
+            fields.push(("http-opts", opts));
+        }
+    } else if network == "grpc" {
+        if let Some(opts) = grpc_opts(
+            json.get("serviceName")
+                .and_then(JsonValue::as_str)
+                .or_else(|| json.get("path").and_then(JsonValue::as_str)),
+        ) {
+            fields.push(("grpc-opts", opts));
         }
     }
-    if json.get("tls").and_then(JsonValue::as_str) == Some("tls") {
+    if vmess_tls_enabled(json.get("tls")) {
         fields.push(("tls", serde_yaml::Value::Bool(true)));
         if let Some(sni) = json
             .get("sni")
@@ -694,25 +707,39 @@ fn parse_vmess(rest: &str) -> Option<ProxyNode> {
             fields.push(("servername", yaml_str(sni)));
         }
     }
+    if let Some(alpn) = json_csv(json.get("alpn")) {
+        fields.push(("alpn", alpn));
+    }
+    if let Some(fingerprint) = json
+        .get("fp")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        fields.push(("client-fingerprint", yaml_str(fingerprint)));
+    }
+    if json_bool(json.get("allowInsecure")) {
+        fields.push(("skip-cert-verify", serde_yaml::Value::Bool(true)));
+    }
     Some(mapping_node(&name, "vmess", &fields))
 }
 
 fn parse_vless(rest: &str) -> Option<ProxyNode> {
     let url = url::Url::parse(&format!("vless://{rest}")).ok()?;
-    let uuid = url.username();
+    let uuid = percent_decode(url.username());
     if uuid.is_empty() {
         return None;
     }
     let server = url.host_str()?;
-    let port = url.port()?;
+    let port = url.port().unwrap_or(443);
     let name = url_name(&url).unwrap_or_else(|| server.to_string());
     let mut fields = vec![
         ("server", yaml_str(server)),
         ("port", yaml_int(port)),
-        ("uuid", yaml_str(uuid)),
+        ("uuid", yaml_str(&uuid)),
         ("udp", serde_yaml::Value::Bool(true)),
     ];
-    push_stream_fields(&mut fields, &url);
+    push_stream_fields(&mut fields, &url, "vless");
     Some(mapping_node(&name, "vless", &fields))
 }
 
@@ -728,7 +755,7 @@ fn parse_trojan(rest: &str) -> Option<ProxyNode> {
         ("password", yaml_str(&password)),
         ("udp", serde_yaml::Value::Bool(true)),
     ];
-    push_stream_fields(&mut fields, &url);
+    push_stream_fields(&mut fields, &url, "trojan");
     Some(mapping_node(&name, "trojan", &fields))
 }
 
@@ -743,12 +770,24 @@ fn parse_hysteria2(rest: &str) -> Option<ProxyNode> {
             fields.push(("password", yaml_str(&password)));
         }
     }
-    if let Some(sni) = url
-        .query_pairs()
-        .find(|(key, _)| key == "sni")
-        .map(|(_, value)| value.into_owned())
-    {
+    if let Some(sni) = url_query(&url, "sni") {
         fields.push(("sni", yaml_str(&sni)));
+    }
+    if let Some(obfs) = url_query(&url, "obfs") {
+        fields.push(("obfs", yaml_str(&obfs)));
+    }
+    if let Some(password) = url_query(&url, "obfs-password") {
+        fields.push(("obfs-password", yaml_str(&password)));
+    }
+    if query_bool(
+        url_query(&url, "insecure")
+            .or_else(|| url_query(&url, "allow_insecure"))
+            .as_deref(),
+    ) {
+        fields.push(("skip-cert-verify", serde_yaml::Value::Bool(true)));
+    }
+    if let Some(alpn) = yaml_csv(url_query(&url, "alpn").as_deref()) {
+        fields.push(("alpn", alpn));
     }
     Some(mapping_node(&name, "hysteria2", &fields))
 }
@@ -765,43 +804,59 @@ fn parse_anytls(rest: &str) -> Option<ProxyNode> {
         ("password", yaml_str(&password)),
         ("udp", serde_yaml::Value::Bool(true)),
     ];
-    if let Some(sni) = url
-        .query_pairs()
-        .find(|(key, _)| key == "sni")
-        .map(|(_, value)| value.into_owned())
-        .filter(|sni| !sni.is_empty())
-    {
+    if let Some(sni) = url_query(&url, "sni").filter(|sni| !sni.is_empty()) {
         fields.push(("sni", yaml_str(&sni)));
     }
-    if url.query_pairs().any(|(key, value)| {
-        key == "insecure" && (value == "1" || value.eq_ignore_ascii_case("true"))
-    }) {
+    if query_bool(
+        url_query(&url, "insecure")
+            .or_else(|| url_query(&url, "allow_insecure"))
+            .as_deref(),
+    ) {
         fields.push(("skip-cert-verify", serde_yaml::Value::Bool(true)));
+    }
+    if let Some(alpn) = yaml_csv(url_query(&url, "alpn").as_deref()) {
+        fields.push(("alpn", alpn));
     }
     Some(mapping_node(&name, "anytls", &fields))
 }
 
 fn parse_tuic(rest: &str) -> Option<ProxyNode> {
     let url = url::Url::parse(&format!("tuic://{rest}")).ok()?;
-    let uuid = url.username();
-    let password = url.password()?;
+    let uuid = percent_decode(url.username());
+    let password = percent_decode(url.password()?);
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
     let name = url_name(&url).unwrap_or_else(|| server.to_string());
-    Some(mapping_node(
-        &name,
-        "tuic",
-        &[
-            ("server", yaml_str(server)),
-            ("port", yaml_int(port)),
-            ("uuid", yaml_str(uuid)),
-            ("password", yaml_str(password)),
-            ("udp", serde_yaml::Value::Bool(true)),
-        ],
-    ))
+    let mut fields = vec![
+        ("server", yaml_str(server)),
+        ("port", yaml_int(port)),
+        ("uuid", yaml_str(&uuid)),
+        ("password", yaml_str(&password)),
+        ("udp", serde_yaml::Value::Bool(true)),
+    ];
+    if let Some(sni) = url_query(&url, "sni") {
+        fields.push(("sni", yaml_str(&sni)));
+    }
+    if let Some(controller) = url_query(&url, "congestion_control") {
+        fields.push(("congestion-controller", yaml_str(&controller)));
+    }
+    if let Some(mode) = url_query(&url, "udp_relay_mode") {
+        fields.push(("udp-relay-mode", yaml_str(&mode)));
+    }
+    if query_bool(
+        url_query(&url, "insecure")
+            .or_else(|| url_query(&url, "allow_insecure"))
+            .as_deref(),
+    ) {
+        fields.push(("skip-cert-verify", serde_yaml::Value::Bool(true)));
+    }
+    if let Some(alpn) = yaml_csv(url_query(&url, "alpn").as_deref()) {
+        fields.push(("alpn", alpn));
+    }
+    Some(mapping_node(&name, "tuic", &fields))
 }
 
-fn push_stream_fields(fields: &mut Vec<(&str, serde_yaml::Value)>, url: &url::Url) {
+fn push_stream_fields(fields: &mut Vec<(&str, serde_yaml::Value)>, url: &url::Url, kind: &str) {
     let query: Vec<(String, String)> = url
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -812,19 +867,194 @@ fn push_stream_fields(fields: &mut Vec<(&str, serde_yaml::Value)>, url: &url::Ur
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
     };
-    let network = get("type").unwrap_or("tcp");
+    let network = get("type").unwrap_or("tcp").trim().to_ascii_lowercase();
     if network != "tcp" {
-        fields.push(("network", yaml_str(network)));
+        fields.push(("network", yaml_str(&network)));
     }
-    let security = get("security").unwrap_or("");
-    if security == "tls"
-        || security == "reality"
-        || get("tls").is_some_and(|value| value == "1" || value == "true")
-    {
+    if network == "ws" {
+        if let Some(opts) = websocket_opts(get("path"), get("host")) {
+            fields.push(("ws-opts", opts));
+        }
+    } else if matches!(network.as_str(), "h2" | "http") {
+        if let Some(opts) = http_opts(get("path"), get("host")) {
+            fields.push(("http-opts", opts));
+        }
+    } else if network == "grpc" {
+        if let Some(opts) = grpc_opts(get("serviceName").or_else(|| get("path"))) {
+            fields.push(("grpc-opts", opts));
+        }
+    }
+    let security = get("security").unwrap_or("").to_ascii_lowercase();
+    if security == "tls" || security == "reality" || query_bool(get("tls")) {
         fields.push(("tls", serde_yaml::Value::Bool(true)));
     }
-    if let Some(sni) = get("sni").filter(|sni| !sni.is_empty()) {
-        fields.push(("servername", yaml_str(sni)));
+    if let Some(sni) = get("sni")
+        .or_else(|| get("serverName"))
+        .filter(|sni| !sni.is_empty())
+    {
+        fields.push((
+            if kind == "trojan" {
+                "sni"
+            } else {
+                "servername"
+            },
+            yaml_str(sni),
+        ));
+    }
+    if let Some(alpn) = yaml_csv(get("alpn")) {
+        fields.push(("alpn", alpn));
+    }
+    if let Some(flow) = get("flow").filter(|flow| !flow.is_empty()) {
+        fields.push(("flow", yaml_str(flow)));
+    }
+    if let Some(fingerprint) = get("fp").or_else(|| get("fingerprint")) {
+        if !fingerprint.is_empty() {
+            fields.push(("client-fingerprint", yaml_str(fingerprint)));
+        }
+    }
+    if security == "reality" {
+        if let Some(opts) = reality_opts(get("pbk"), get("sid")) {
+            fields.push(("reality-opts", opts));
+        }
+    }
+    if query_bool(
+        get("allowInsecure")
+            .or_else(|| get("allow_insecure"))
+            .or_else(|| get("insecure")),
+    ) {
+        fields.push(("skip-cert-verify", serde_yaml::Value::Bool(true)));
+    }
+}
+
+fn websocket_opts(path: Option<&str>, host: Option<&str>) -> Option<serde_yaml::Value> {
+    let path = path.map(str::trim).filter(|path| !path.is_empty());
+    let host = host.map(str::trim).filter(|host| !host.is_empty());
+    if path.is_none() && host.is_none() {
+        return None;
+    }
+    let mut opts = serde_yaml::Mapping::new();
+    if let Some(path) = path {
+        opts.insert(yaml_str("path"), yaml_str(path));
+    }
+    if let Some(host) = host {
+        let mut headers = serde_yaml::Mapping::new();
+        headers.insert(yaml_str("Host"), yaml_str(host));
+        opts.insert(yaml_str("headers"), serde_yaml::Value::Mapping(headers));
+    }
+    Some(serde_yaml::Value::Mapping(opts))
+}
+
+fn url_query(url: &url::Url, key: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn yaml_csv(value: Option<&str>) -> Option<serde_yaml::Value> {
+    let values: Vec<serde_yaml::Value> = value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(yaml_str)
+        .collect();
+    (!values.is_empty()).then_some(serde_yaml::Value::Sequence(values))
+}
+
+fn http_opts(path: Option<&str>, host: Option<&str>) -> Option<serde_yaml::Value> {
+    let path = path.map(str::trim).filter(|path| !path.is_empty());
+    let host = host.map(str::trim).filter(|host| !host.is_empty());
+    if path.is_none() && host.is_none() {
+        return None;
+    }
+    let mut opts = serde_yaml::Mapping::new();
+    if let Some(path) = path {
+        opts.insert(
+            yaml_str("path"),
+            serde_yaml::Value::Sequence(vec![yaml_str(path)]),
+        );
+    }
+    if let Some(host) = host {
+        let mut headers = serde_yaml::Mapping::new();
+        headers.insert(
+            yaml_str("Host"),
+            serde_yaml::Value::Sequence(vec![yaml_str(host)]),
+        );
+        opts.insert(yaml_str("headers"), serde_yaml::Value::Mapping(headers));
+    }
+    Some(serde_yaml::Value::Mapping(opts))
+}
+
+fn grpc_opts(service_name: Option<&str>) -> Option<serde_yaml::Value> {
+    let service_name = service_name
+        .map(str::trim)
+        .filter(|service_name| !service_name.is_empty())?;
+    let mut opts = serde_yaml::Mapping::new();
+    opts.insert(yaml_str("grpc-service-name"), yaml_str(service_name));
+    Some(serde_yaml::Value::Mapping(opts))
+}
+
+fn reality_opts(public_key: Option<&str>, short_id: Option<&str>) -> Option<serde_yaml::Value> {
+    let public_key = public_key.map(str::trim).filter(|value| !value.is_empty());
+    let short_id = short_id.map(str::trim).filter(|value| !value.is_empty());
+    if public_key.is_none() && short_id.is_none() {
+        return None;
+    }
+    let mut opts = serde_yaml::Mapping::new();
+    if let Some(public_key) = public_key {
+        opts.insert(yaml_str("public-key"), yaml_str(public_key));
+    }
+    if let Some(short_id) = short_id {
+        opts.insert(yaml_str("short-id"), yaml_str(short_id));
+    }
+    Some(serde_yaml::Value::Mapping(opts))
+}
+
+fn query_bool(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn vmess_tls_enabled(value: Option<&JsonValue>) -> bool {
+    match value {
+        Some(JsonValue::Bool(enabled)) => *enabled,
+        Some(JsonValue::Number(value)) => value.as_u64().is_some_and(|value| value > 0),
+        Some(JsonValue::String(value)) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "tls" | "xtls" | "reality"
+        ),
+        _ => false,
+    }
+}
+
+fn json_bool(value: Option<&JsonValue>) -> bool {
+    match value {
+        Some(JsonValue::Bool(enabled)) => *enabled,
+        Some(JsonValue::Number(value)) => value.as_u64().is_some_and(|value| value > 0),
+        Some(JsonValue::String(value)) => query_bool(Some(value)),
+        _ => false,
+    }
+}
+
+fn json_csv(value: Option<&JsonValue>) -> Option<serde_yaml::Value> {
+    match value {
+        Some(JsonValue::String(value)) => yaml_csv(Some(value)),
+        Some(JsonValue::Array(values)) => {
+            let values: Vec<serde_yaml::Value> = values
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(yaml_str)
+                .collect();
+            (!values.is_empty()).then_some(serde_yaml::Value::Sequence(values))
+        }
+        _ => None,
     }
 }
 
@@ -865,6 +1095,63 @@ fn split_host_port(hostport: &str) -> Option<(&str, u16)> {
     let host = host.trim_matches(['[', ']']);
     let port = port.parse().ok()?;
     (!host.is_empty()).then_some((host, port))
+}
+
+fn split_uri_query(value: &str) -> (&str, Option<&str>) {
+    if let Some((hostport, query)) = value.split_once("/?") {
+        return (hostport, Some(query));
+    }
+    if let Some((hostport, query)) = value.split_once('?') {
+        return (hostport.trim_end_matches('/'), Some(query));
+    }
+    (value.trim_end_matches('/'), None)
+}
+
+fn plugin_query<'a>(outer: Option<&'a str>, inline: Option<&'a str>) -> Option<&'a str> {
+    [outer, inline].into_iter().flatten().find(|query| {
+        query
+            .split('&')
+            .any(|pair| pair.split_once('=').is_some_and(|(key, _)| key == "plugin"))
+    })
+}
+
+fn apply_shadowsocks_plugin(node: &mut ProxyNode, query: Option<&str>) {
+    let Some(plugin) = query.and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == "plugin").then(|| percent_decode(value))
+        })
+    }) else {
+        return;
+    };
+    let mut parts = plugin.split(';');
+    let Some(raw_name) = parts.next().map(str::trim).filter(|name| !name.is_empty()) else {
+        return;
+    };
+    let plugin_name = match raw_name {
+        "obfs-local" | "simple-obfs" => "obfs",
+        name => name,
+    };
+    let Some(mapping) = node.spec.as_mapping_mut() else {
+        return;
+    };
+    mapping.insert(yaml_str("plugin"), yaml_str(plugin_name));
+    let mut options = serde_yaml::Mapping::new();
+    for item in parts {
+        let Some((key, value)) = item.split_once('=') else {
+            continue;
+        };
+        let key = match key.trim() {
+            "obfs" => "mode",
+            "obfs-host" => "host",
+            "obfs-uri" => "path",
+            key => key,
+        };
+        options.insert(yaml_str(key), yaml_str(value.trim()));
+    }
+    if !options.is_empty() {
+        mapping.insert(yaml_str("plugin-opts"), serde_yaml::Value::Mapping(options));
+    }
 }
 
 fn url_name(url: &url::Url) -> Option<String> {
@@ -915,10 +1202,14 @@ fn b64(raw: &str) -> Option<Vec<u8>> {
 }
 
 fn decode_text(raw: &str) -> Option<String> {
-    if raw.lines().count() != 1 || raw.contains(' ') {
+    let compact: String = raw
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    if compact.len() < 16 {
         return None;
     }
-    String::from_utf8(b64(raw)?).ok()
+    String::from_utf8(b64(&compact)?).ok()
 }
 
 pub fn render_config(
@@ -1287,12 +1578,32 @@ proxies:
         let text = serde_yaml::to_string(&nodes[0].spec).unwrap();
         assert!(text.contains("aes-256-gcm"));
         assert!(text.contains("8388"));
+
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(20)
+            .map(std::str::from_utf8)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        let wrapped_nodes = parse_subscription(&wrapped).unwrap().nodes;
+        assert_eq!(wrapped_nodes[0].name, "home");
+
+        let plugin = parse_subscription(
+            "ss://YWVzLTI1Ni1nY206cGFzcw@example.test:8388/?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dcdn.example#obfs",
+        )
+        .unwrap()
+        .nodes;
+        let plugin_text = serde_yaml::to_string(&plugin[0].spec).unwrap();
+        assert!(plugin_text.contains("plugin: obfs"));
+        assert!(plugin_text.contains("mode: http"));
+        assert!(plugin_text.contains("host: cdn.example"));
     }
 
     #[test]
     fn parses_vmess_and_rejects_empty() {
         let payload = base64::engine::general_purpose::STANDARD.encode(
-            br#"{"add":"vmess.example","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"ws","tls":"tls","host":"cdn.example","path":"/chat","ps":"edge"}"#,
+            br#"{"add":"vmess.example","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"ws","tls":"tls","host":"cdn.example","path":"/chat","alpn":"h2,http/1.1","fp":"chrome","ps":"edge"}"#,
         );
         let nodes = parse_subscription(&format!("vmess://{payload}"))
             .unwrap()
@@ -1304,12 +1615,80 @@ proxies:
         assert!(text.contains("ws-opts:"));
         assert!(text.contains("path: /chat"));
         assert!(text.contains("Host: cdn.example"));
+        assert!(text.contains("- h2"));
+        assert!(text.contains("client-fingerprint: chrome"));
         let config = render_config(&nodes_only(nodes), 17891, "127.0.0.1:17892", "secret");
         assert!(config.contains("ws-opts:"));
         assert!(config.contains("path: /chat"));
         assert!(config.contains("Host: cdn.example"));
         assert!(parse_subscription("   ").is_err());
         assert!(parse_subscription("not a subscription").is_err());
+    }
+
+    #[test]
+    fn parses_websocket_options_from_vless_and_trojan_urls() {
+        let vless = parse_subscription(
+            "vless://uuid@example.test?type=ws&security=tls&sni=front.example&host=cdn.example&path=%2Fchat&alpn=h2%2Chttp%2F1.1#vless-ws",
+        )
+        .unwrap()
+        .nodes;
+        let vless_text = serde_yaml::to_string(&vless[0].spec).unwrap();
+        assert!(vless_text.contains("network: ws"));
+        assert!(vless_text.contains("tls: true"));
+        assert!(vless_text.contains("servername: front.example"));
+        assert!(vless_text.contains("path: /chat"));
+        assert!(vless_text.contains("Host: cdn.example"));
+        assert!(vless_text.contains("- h2"));
+
+        let trojan = parse_subscription(
+            "trojan://secret@example.test?type=ws&sni=front.example&host=cdn.example&path=%2Fchat&alpn=h2%2Chttp%2F1.1#trojan-ws",
+        )
+        .unwrap()
+        .nodes;
+        let trojan_text = serde_yaml::to_string(&trojan[0].spec).unwrap();
+        assert!(trojan_text.contains("network: ws"));
+        assert!(trojan_text.contains("sni: front.example"));
+        assert!(trojan_text.contains("path: /chat"));
+        assert!(trojan_text.contains("Host: cdn.example"));
+        assert!(trojan_text.contains("- h2"));
+
+        let reality = parse_subscription(
+            "vless://uuid@example.test?type=grpc&serviceName=codex&security=reality&pbk=public-key&sid=short-id&fp=chrome",
+        )
+        .unwrap()
+        .nodes;
+        let reality_text = serde_yaml::to_string(&reality[0].spec).unwrap();
+        assert!(reality_text.contains("network: grpc"));
+        assert!(reality_text.contains("grpc-service-name: codex"));
+        assert!(reality_text.contains("reality-opts:"));
+        assert!(reality_text.contains("public-key: public-key"));
+        assert!(reality_text.contains("short-id: short-id"));
+        assert!(reality_text.contains("client-fingerprint: chrome"));
+    }
+
+    #[test]
+    fn preserves_optional_transport_options_from_hysteria_and_tuic_urls() {
+        let hysteria = parse_subscription(
+            "hysteria2://secret@example.test:443?sni=front.example&obfs=salamander&obfs-password=obfs-secret&insecure=1&alpn=h3%2Ch3-29#hy2",
+        )
+        .unwrap()
+        .nodes;
+        let hysteria_text = serde_yaml::to_string(&hysteria[0].spec).unwrap();
+        assert!(hysteria_text.contains("obfs: salamander"));
+        assert!(hysteria_text.contains("obfs-password: obfs-secret"));
+        assert!(hysteria_text.contains("skip-cert-verify: true"));
+        assert!(hysteria_text.contains("- h3"));
+
+        let tuic = parse_subscription(
+            "tuic://uuid:p%40ss@example.test:443?sni=front.example&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#tuic",
+        )
+        .unwrap()
+        .nodes;
+        let tuic_text = serde_yaml::to_string(&tuic[0].spec).unwrap();
+        assert!(tuic_text.contains("password: p@ss"));
+        assert!(tuic_text.contains("congestion-controller: bbr"));
+        assert!(tuic_text.contains("udp-relay-mode: native"));
+        assert!(tuic_text.contains("skip-cert-verify: true"));
     }
 
     #[test]
