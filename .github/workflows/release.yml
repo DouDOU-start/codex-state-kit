@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.verify.outputs.tag }}
+
     steps:
       - uses: actions/checkout@v4
       - name: 检查更新清单验证器
@@ -87,6 +88,12 @@ jobs:
             target_args: --target x86_64-apple-darwin
             core_platform: macos
             core_arch: amd64
+          - name: Linux x64
+            runner: ubuntu-22.04
+            rust_target: ""
+            target_args: ""
+            core_platform: linux
+            core_arch: amd64
 
     steps:
       - name: 拉取代码
@@ -100,7 +107,7 @@ jobs:
         env:
           MANUAL_NOTES: ${{ github.event.inputs.notes }}
         run: |
-          default='下载对应系统的安装包即可。Mac 版本当前为未公证构建；首次打开时请按系统提示允许应用运行。'
+          default='下载对应系统的安装包即可。Mac 版本当前为未公证构建；首次打开时请按系统提示允许应用运行。Linux 版本提供 AppImage 安装包。'
           notes="${MANUAL_NOTES:-}"
           if [ -z "$notes" ] && [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             notes="$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}")"
@@ -139,6 +146,12 @@ jobs:
       - name: 准备 Mihomo 内核（macOS）
         if: matrix.core_platform == 'macos'
         run: bash ./tools/prepare-mihomo.sh "${{ matrix.core_arch }}"
+
+      - name: 安装 Linux Tauri 依赖
+        if: matrix.core_platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
 
       - name: 安装前端依赖
         run: corepack pnpm install --frozen-lockfile

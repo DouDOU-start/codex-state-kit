@@ -3,3 +3,4 @@ license: GPL-3.0-only
 windows-x64: https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-windows-amd64-v1.19.31.zip
 macos-arm64: https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-darwin-arm64-v1.19.31.gz
 macos-amd64: https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-darwin-amd64-v1.19.31.gz
+linux-amd64: https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-linux-amd64-v1.19.31.gz

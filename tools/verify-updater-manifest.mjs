@@ -3,7 +3,12 @@ import { pathToFileURL } from 'node:url';
 
 export function verifyManifest(manifest, assets, tag, repository) {
   if (manifest.version?.replace(/^v/, '') !== tag.replace(/^v/, '')) throw new Error('更新清单版本不匹配');
-  const required = { 'windows-x86_64': '.exe', 'darwin-x86_64': '.app.tar.gz', 'darwin-aarch64': '.app.tar.gz' };
+  const required = {
+    'windows-x86_64': '.exe',
+    'darwin-x86_64': '.app.tar.gz',
+    'darwin-aarch64': '.app.tar.gz',
+    'linux-x86_64': '.AppImage.tar.gz',
+  };
   for (const [platform, extension] of Object.entries(required)) {
     const entry = manifest.platforms?.[platform];
     if (!entry?.signature?.trim()) throw new Error(`${platform} 缺少签名`);
@@ -38,5 +43,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const [manifestFile, assetsFile, tag, repository] = process.argv.slice(2);
   const manifest = prepareManifest(JSON.parse(readFileSync(manifestFile, 'utf8')), JSON.parse(readFileSync(assetsFile, 'utf8')).assets, tag, repository);
   writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
-  console.log('Windows x64、macOS Intel/Apple Silicon 更新清单验证通过');
+  console.log('Windows x64、macOS Intel/Apple Silicon、Linux x64 更新清单验证通过');
 }

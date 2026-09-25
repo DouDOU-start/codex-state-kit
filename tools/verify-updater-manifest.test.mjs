@@ -10,13 +10,14 @@ function fixture() {
     'windows-x86_64': 'app-windows-x64-setup.exe',
     'darwin-x86_64': 'app-darwin-x64.app.tar.gz',
     'darwin-aarch64': 'app-darwin-aarch64.app.tar.gz',
+    'linux-x86_64': 'app-linux-amd64.AppImage.tar.gz',
   })) {
     platforms[platform] = { signature: 'test-signature', url: `https://github.com/${repo}/releases/download/v0.0.5/${name}` };
     assets.push({ name, size: 100 }, { name: `${name}.sig`, size: 100 });
   }
   return { manifest: { version: '0.0.5', platforms }, assets };
 }
-test('accepts complete signed three-platform release', () => {
+test('accepts complete signed four-platform release', () => {
   const { manifest, assets } = fixture();
   assert.doesNotThrow(() => verifyManifest(manifest, assets, 'v0.0.5', repo));
 });

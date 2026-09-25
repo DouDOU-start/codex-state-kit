@@ -4,7 +4,7 @@
 
 ## 环境
 
-订阅节点使用内置的 Mihomo 内核：Windows x64、macOS Intel 和 macOS Apple Silicon 分别使用对应二进制文件，不跨平台复用。
+订阅节点使用内置的 Mihomo 内核：Windows x64、Linux x64、macOS Intel 和 macOS Apple Silicon 分别使用对应二进制文件，不跨平台复用。
 
 准备 Node.js、Rust stable、C++ 构建工具和 WebView2 等 [Tauri 开发依赖](https://v2.tauri.app/start/prerequisites/)。pnpm 版本以根目录 `package.json` 的 `packageManager` 为准；以下命令使用 Corepack 调用。
 
@@ -38,7 +38,7 @@ corepack pnpm dev
 
 ## GitHub Actions 发布
 
-推送形如 `v0.0.1` 的标签会触发 `.github/workflows/release.yml`，构建 Windows x64、macOS Intel 和 macOS Apple Silicon，并将安装包、更新包与签名上传到同一个草稿 Release。构建任务依次执行，避免并发覆盖 `latest.json`；所有平台成功且更新清单验证通过后才公开发布。也可以在 Actions 页面手动运行工作流。已公开版本不允许覆盖，需提高版本号。
+推送形如 `v0.0.1` 的标签会触发 `.github/workflows/release.yml`，构建 Windows x64、Linux x64、macOS Intel 和 macOS Apple Silicon，并将安装包、更新包与签名上传到同一个草稿 Release。Linux 发布提供 AppImage 安装包。构建任务依次执行，避免并发覆盖 `latest.json`；所有平台成功且更新清单验证通过后才公开发布。也可以在 Actions 页面手动运行工作流。已公开版本不允许覆盖，需提高版本号。
 
 发布说明来自**附注标签**的正文，不要用轻量标签。附注里不要写以 `#` 开头的行（Git 会当成注释丢掉），小标题直接写「功能」「本次更新」即可。PowerShell 示例：
 
@@ -79,7 +79,7 @@ target/release/bundle/nsis/
 target/release/bundle/msi/
 ```
 
-构建前会下载并校验当前目标平台的 Mihomo 内核，再重新生成图标与前端资源；内核会随 Tauri 安装包放进应用 Resources，运行时不再下载。macOS Apple Silicon 与 Intel 安装包分别内置对应架构的二进制，不能交叉复用。内核二进制不提交到仓库。优先分发安装包；单独分发主程序时必须附带 `mihomo/` 资源目录。内核更新步骤见 [Mihomo 来源记录](../src-tauri/resources/mihomo/PROVENANCE.md)。
+构建前会下载并校验当前目标平台的 Mihomo 内核，再重新生成图标与前端资源；内核会随 Tauri 安装包放进应用 Resources，运行时不再下载。Windows、Linux 和 macOS 安装包分别内置对应架构的二进制，不能跨平台复用。内核二进制不提交到仓库。优先分发安装包；单独分发主程序时必须附带 `mihomo/` 资源目录。内核更新步骤见 [Mihomo 来源记录](../src-tauri/resources/mihomo/PROVENANCE.md)。
 
 ## 代码结构
 

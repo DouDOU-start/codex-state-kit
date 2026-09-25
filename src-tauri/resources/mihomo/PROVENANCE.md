@@ -12,6 +12,8 @@
 | macOS Apple Silicon SHA-256 | `d131f44b3deb2a8356f7ac75048ad67a10d53243323951c4f3cda7b672922963` |
 | macOS Intel 压缩包 | `mihomo-darwin-amd64-v1.19.31.gz` |
 | macOS Intel SHA-256 | `3546681ebef3415e5dcbe7210a61aa80748136e95e6552768fd883df345508ed` |
+| Linux x64 压缩包 | `mihomo-linux-amd64-v1.19.31.gz` |
+| Linux x64 SHA-256 | `d5e74bbddbdfff49a1aef7775bf5911da59f0d7196ed509a0ac914b3653dd5f1` |
 
 可执行文件不放进 Git 仓库。打包时下载上游未修改的当前平台内核，校验 SHA-256 后打进安装包；每个安装包只包含当前系统的内核。
 
@@ -37,6 +39,12 @@ macOS 可按当前架构运行：
 ```sh
 bash ./tools/prepare-mihomo.sh arm64  # Apple Silicon
 bash ./tools/prepare-mihomo.sh amd64  # Intel
+```
+
+Linux x64 运行：
+
+```sh
+bash ./tools/prepare-mihomo-linux.sh
 ```
 
 `tauri build` 和发布流程都会执行同一脚本，校验压缩包 SHA-256 后再打包。终端用户无需单独下载内核。升级时同步更新脚本中的版本、校验值与本文件。

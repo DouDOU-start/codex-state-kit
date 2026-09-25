@@ -34,8 +34,10 @@ try {
   } else if (process.platform === "darwin") {
     const arch = targetArch();
     run("bash", [path.join(root, "tools/prepare-mihomo.sh"), arch]);
+  } else if (process.platform === "linux") {
+    run("bash", [path.join(root, "tools/prepare-mihomo-linux.sh")]);
   } else {
-    throw new Error("当前只为 Windows 和 macOS 下载 Mihomo 内核");
+    throw new Error("当前只为 Windows、macOS 和 Linux 下载 Mihomo 内核");
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
