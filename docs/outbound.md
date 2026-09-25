@@ -32,6 +32,8 @@ Clash Verge 等软件只开系统代理、没开 TUN 时，浏览器能出网，
 
 选择「订阅节点」，填写 Clash / Mihomo 订阅 URL、本地文件路径或分享链接正文。Kit 用内置 Mihomo 内核加载订阅，可在节点分组中切换节点和测速；未指定节点时使用订阅中的第一个。内核来源与校验值见[来源记录](../src-tauri/resources/mihomo/PROVENANCE.md)。
 
+分享链接正文支持 `ss`、`vmess`、`vless`、`trojan`、`hysteria2`/`hy2`、`anytls` 和 `tuic`，也支持裸 Base64、`base64://` 与 `base64,` 前缀。需要完整协议覆盖时请使用包含 `proxies` 节点的 Clash / Mihomo YAML；只有 `proxy-providers` 的配置需要先由订阅客户端展开，URI 形式的 SSR、Hysteria v1、HTTP 和 SOCKS 分享链接暂不解析。
+
 ## 失败处理
 
 ### 延迟检测

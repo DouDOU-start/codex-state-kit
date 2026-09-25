@@ -466,23 +466,26 @@ async fn load_subscription(raw: &str) -> Result<String> {
 }
 
 pub fn parse_subscription(raw: &str) -> Result<SubscriptionConfig> {
+    if raw.len() > MAX_BODY {
+        bail!("订阅内容过长");
+    }
     let text = raw.trim().trim_start_matches('\u{feff}').trim();
     if text.is_empty() {
         bail!("订阅为空");
     }
-    if let Some(config) = yaml_subscription(text) {
+    if let Some(config) = yaml_subscription(text)? {
         if !config.nodes.is_empty() {
             return Ok(config);
         }
     }
     if let Some(decoded) = decode_text(text) {
         let decoded = decoded.trim().trim_start_matches('\u{feff}').trim();
-        if let Some(config) = yaml_subscription(&decoded) {
+        if let Some(config) = yaml_subscription(decoded)? {
             if !config.nodes.is_empty() {
                 return Ok(config);
             }
         }
-        let nodes = uri_lines(&decoded)?;
+        let nodes = uri_lines(decoded)?;
         if !nodes.is_empty() {
             return Ok(nodes_only(nodes));
         }
@@ -502,17 +505,25 @@ fn nodes_only(nodes: Vec<ProxyNode>) -> SubscriptionConfig {
     }
 }
 
-fn yaml_subscription(text: &str) -> Option<SubscriptionConfig> {
-    let value: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
+fn yaml_subscription(text: &str) -> Result<Option<SubscriptionConfig>> {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return Ok(None);
+    };
     let list = value
         .get("proxies")
         .and_then(serde_yaml::Value::as_sequence)
-        .or_else(|| value.as_sequence())?;
-    Some(SubscriptionConfig {
+        .or_else(|| value.as_sequence());
+    if list.is_none_or(Vec::is_empty) && value.get("proxy-providers").is_some() {
+        bail!("暂不支持仅包含 proxy-providers 的订阅，请提供含 proxies 节点的 Clash/Mihomo 订阅");
+    }
+    let Some(list) = list else {
+        return Ok(None);
+    };
+    Ok(Some(SubscriptionConfig {
         nodes: unique_nodes(list.iter().filter_map(node_from_yaml)),
         groups: sequence_values(&value, "proxy-groups"),
         rules: sequence_values(&value, "rules"),
-    })
+    }))
 }
 
 fn sequence_values(value: &serde_yaml::Value, key: &str) -> Vec<serde_yaml::Value> {
@@ -524,12 +535,25 @@ fn sequence_values(value: &serde_yaml::Value, key: &str) -> Vec<serde_yaml::Valu
 }
 
 fn node_from_yaml(value: &serde_yaml::Value) -> Option<ProxyNode> {
-    let name = value.get("name")?.as_str()?.trim();
-    if name.is_empty()
+    let name = value.get("name")?.as_str()?;
+    if name.trim().is_empty()
         || value
             .get("type")
             .and_then(serde_yaml::Value::as_str)
             .is_none()
+    {
+        return None;
+    }
+    if value
+        .get("server")
+        .and_then(serde_yaml::Value::as_str)
+        .is_some_and(|server| server.trim().is_empty())
+    {
+        return None;
+    }
+    if value
+        .get("port")
+        .is_some_and(|port| yaml_port(port).is_none_or(|port| port == 0))
     {
         return None;
     }
@@ -541,44 +565,79 @@ fn node_from_yaml(value: &serde_yaml::Value) -> Option<ProxyNode> {
 
 fn uri_lines(text: &str) -> Result<Vec<ProxyNode>> {
     let mut nodes = Vec::new();
-    for line in text.lines() {
+    let mut invalid_lines = Vec::new();
+    for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if let Some(node) = parse_uri(line) {
             nodes.push(node);
+        } else if line.contains("://") && invalid_lines.len() < 8 {
+            invalid_lines.push((index + 1).to_string());
         }
         if nodes.len() >= MAX_PROXIES {
             break;
         }
     }
+    if nodes.is_empty() && !invalid_lines.is_empty() {
+        // Report positions, never credentials or a subscription URL.
+        bail!(
+            "订阅里没有识别到节点：第 {} 行的分享链接格式不支持或参数无效；支持 ss、vmess、vless、trojan、hysteria2/hy2、anytls、tuic，也可提供 Clash/Mihomo YAML",
+            invalid_lines.join("、")
+        );
+    }
     Ok(unique_nodes(nodes.into_iter()))
 }
 
 fn unique_nodes(nodes: impl Iterator<Item = ProxyNode>) -> Vec<ProxyNode> {
-    let mut seen = std::collections::HashSet::new();
+    let nodes: Vec<_> = nodes.take(MAX_PROXIES).collect();
+    let original_names: std::collections::HashSet<_> = nodes
+        .iter()
+        .map(|node| node.name.trim().to_string())
+        .collect();
+    let mut seen: std::collections::HashSet<String> = [
+        GROUP,
+        "DIRECT",
+        "REJECT",
+        "REJECT-DROP",
+        "COMPATIBLE",
+        "PASS",
+        "PASS-RULE",
+        "GLOBAL",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let mut renamed = std::collections::HashMap::new();
     let mut unique = Vec::new();
     for mut node in nodes {
-        if unique.len() >= MAX_PROXIES {
-            break;
-        }
-        let mut name = node.name.clone();
+        let base = node.name.trim();
+        let mut name = base.to_string();
         let mut index = 2;
-        while !seen.insert(name.clone()) {
-            name = format!("{}-{index}", node.name);
+        while seen.contains(&name) || (name != base && original_names.contains(&name)) {
+            name = format!("{base}-{index}");
             index += 1;
         }
-        if name != node.name {
-            if let Some(mapping) = node.spec.as_mapping_mut() {
-                mapping.insert(
-                    serde_yaml::Value::String("name".into()),
-                    serde_yaml::Value::String(name.clone()),
-                );
-            }
-            node.name = name;
+        seen.insert(name.clone());
+        renamed.entry(node.name.clone()).or_insert(name.clone());
+        renamed.entry(base.to_string()).or_insert(name.clone());
+        if let Some(mapping) = node.spec.as_mapping_mut() {
+            mapping.insert(yaml_str("name"), yaml_str(&name));
         }
+        node.name = name;
         unique.push(node);
+    }
+    for node in &mut unique {
+        if let Some(target) = node
+            .spec
+            .get("dialer-proxy")
+            .and_then(serde_yaml::Value::as_str)
+        {
+            if let Some(name) = renamed.get(target) {
+                node.spec["dialer-proxy"] = yaml_str(name);
+            }
+        }
     }
     unique
 }
@@ -599,18 +658,29 @@ fn parse_uri(line: &str) -> Option<ProxyNode> {
 
 fn parse_shadowsocks(rest: &str) -> Option<ProxyNode> {
     let (body, name) = split_name(rest);
-    let (body, outer_plugin) = split_uri_query(body);
-    if let Some((userinfo, hostport)) = body.split_once('@') {
-        let decoded = String::from_utf8(b64(userinfo)?).ok()?;
-        let (cipher, password) = decoded.split_once(':')?;
+    // Do not strip '/' from a Base64 payload: it is part of the alphabet.
+    let (body, outer_plugin) = body
+        .split_once('?')
+        .map_or((body, None), |(body, query)| (body, Some(query)));
+    if let Some((userinfo, hostport)) = body.rsplit_once('@') {
+        let (cipher, password) = if let Some((cipher, password)) = userinfo.split_once(':') {
+            (percent_decode(cipher), percent_decode(password))
+        } else {
+            let decoded = String::from_utf8(b64(&percent_decode(userinfo))?).ok()?;
+            let (cipher, password) = decoded.split_once(':')?;
+            (cipher.to_string(), password.to_string())
+        };
+        if cipher.is_empty() {
+            return None;
+        }
         let (hostport, inline_plugin) = split_uri_query(hostport);
         let (server, port) = split_host_port(hostport)?;
         let display = name.unwrap_or_else(|| server.to_string());
-        let mut node = ss_node(&display, server, port, cipher, password);
+        let mut node = ss_node(&display, server, port, &cipher, &password);
         apply_shadowsocks_plugin(&mut node, plugin_query(outer_plugin, inline_plugin));
         return Some(node);
     }
-    let decoded = String::from_utf8(b64(body)?).ok()?;
+    let decoded = String::from_utf8(decode_b64_payload(body)?).ok()?;
     let (method, rest) = decoded.split_once(':')?;
     let (password, hostport) = rest.rsplit_once('@')?;
     let (hostport, inline_plugin) = split_uri_query(hostport);
@@ -637,10 +707,19 @@ fn ss_node(name: &str, server: &str, port: u16, cipher: &str, password: &str) ->
 
 fn parse_vmess(rest: &str) -> Option<ProxyNode> {
     let (body, fragment_name) = split_name(rest);
-    let json: JsonValue = serde_json::from_slice(&b64(body)?).ok()?;
+    let json: JsonValue = serde_json::from_slice(&decode_b64_payload(body)?).ok()?;
     let server = json.get("add")?.as_str()?.trim();
+    if server.is_empty() {
+        return None;
+    }
     let port = json_port(json.get("port")?)?;
+    if port == 0 {
+        return None;
+    }
     let uuid = json.get("id")?.as_str()?.trim();
+    if uuid.is_empty() {
+        return None;
+    }
     let name = json
         .get("ps")
         .and_then(JsonValue::as_str)
@@ -681,7 +760,14 @@ fn parse_vmess(rest: &str) -> Option<ProxyNode> {
         ) {
             fields.push(("ws-opts", opts));
         }
-    } else if matches!(network.as_str(), "h2" | "http") {
+    } else if network == "h2" {
+        if let Some(opts) = h2_opts(
+            json.get("path").and_then(JsonValue::as_str),
+            json.get("host").and_then(JsonValue::as_str),
+        ) {
+            fields.push(("h2-opts", opts));
+        }
+    } else if network == "http" {
         if let Some(opts) = http_opts(
             json.get("path").and_then(JsonValue::as_str),
             json.get("host").and_then(JsonValue::as_str),
@@ -705,6 +791,18 @@ fn parse_vmess(rest: &str) -> Option<ProxyNode> {
             .filter(|sni| !sni.is_empty())
         {
             fields.push(("servername", yaml_str(sni)));
+        }
+        if json
+            .get("tls")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|tls| tls.trim().eq_ignore_ascii_case("reality"))
+        {
+            if let Some(opts) = reality_opts(
+                json.get("pbk").and_then(JsonValue::as_str),
+                json.get("sid").and_then(JsonValue::as_str),
+            ) {
+                fields.push(("reality-opts", opts));
+            }
         }
     }
     if let Some(alpn) = json_csv(json.get("alpn")) {
@@ -732,6 +830,9 @@ fn parse_vless(rest: &str) -> Option<ProxyNode> {
     }
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
+    if port == 0 {
+        return None;
+    }
     let name = url_name(&url).unwrap_or_else(|| server.to_string());
     let mut fields = vec![
         ("server", yaml_str(server)),
@@ -748,6 +849,9 @@ fn parse_trojan(rest: &str) -> Option<ProxyNode> {
     let password = urlencoding_username(&url)?;
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
+    if port == 0 {
+        return None;
+    }
     let name = url_name(&url).unwrap_or_else(|| server.to_string());
     let mut fields = vec![
         ("server", yaml_str(server)),
@@ -763,6 +867,9 @@ fn parse_hysteria2(rest: &str) -> Option<ProxyNode> {
     let url = url::Url::parse(&format!("hysteria2://{rest}")).ok()?;
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
+    if port == 0 {
+        return None;
+    }
     let name = url_name(&url).unwrap_or_else(|| server.to_string());
     let mut fields = vec![("server", yaml_str(server)), ("port", yaml_int(port))];
     if let Some(password) = urlencoding_username(&url) {
@@ -797,6 +904,9 @@ fn parse_anytls(rest: &str) -> Option<ProxyNode> {
     let password = urlencoding_username(&url)?;
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
+    if port == 0 {
+        return None;
+    }
     let name = url_name(&url).unwrap_or_else(|| server.to_string());
     let mut fields = vec![
         ("server", yaml_str(server)),
@@ -824,8 +934,14 @@ fn parse_tuic(rest: &str) -> Option<ProxyNode> {
     let url = url::Url::parse(&format!("tuic://{rest}")).ok()?;
     let uuid = percent_decode(url.username());
     let password = percent_decode(url.password()?);
+    if uuid.is_empty() || password.is_empty() {
+        return None;
+    }
     let server = url.host_str()?;
     let port = url.port().unwrap_or(443);
+    if port == 0 {
+        return None;
+    }
     let name = url_name(&url).unwrap_or_else(|| server.to_string());
     let mut fields = vec![
         ("server", yaml_str(server)),
@@ -867,7 +983,11 @@ fn push_stream_fields(fields: &mut Vec<(&str, serde_yaml::Value)>, url: &url::Ur
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
     };
-    let network = get("type").unwrap_or("tcp").trim().to_ascii_lowercase();
+    let network = get("type")
+        .or_else(|| get("network"))
+        .unwrap_or("tcp")
+        .trim()
+        .to_ascii_lowercase();
     if network != "tcp" {
         fields.push(("network", yaml_str(&network)));
     }
@@ -875,7 +995,11 @@ fn push_stream_fields(fields: &mut Vec<(&str, serde_yaml::Value)>, url: &url::Ur
         if let Some(opts) = websocket_opts(get("path"), get("host")) {
             fields.push(("ws-opts", opts));
         }
-    } else if matches!(network.as_str(), "h2" | "http") {
+    } else if network == "h2" {
+        if let Some(opts) = h2_opts(get("path"), get("host")) {
+            fields.push(("h2-opts", opts));
+        }
+    } else if network == "http" {
         if let Some(opts) = http_opts(get("path"), get("host")) {
             fields.push(("http-opts", opts));
         }
@@ -986,6 +1110,17 @@ fn http_opts(path: Option<&str>, host: Option<&str>) -> Option<serde_yaml::Value
     Some(serde_yaml::Value::Mapping(opts))
 }
 
+fn h2_opts(path: Option<&str>, host: Option<&str>) -> Option<serde_yaml::Value> {
+    let mut opts = serde_yaml::Mapping::new();
+    if let Some(path) = path.filter(|path| !path.is_empty()) {
+        opts.insert(yaml_str("path"), yaml_str(path));
+    }
+    if let Some(hosts) = yaml_csv(host) {
+        opts.insert(yaml_str("host"), hosts);
+    }
+    (!opts.is_empty()).then_some(serde_yaml::Value::Mapping(opts))
+}
+
 fn grpc_opts(service_name: Option<&str>) -> Option<serde_yaml::Value> {
     let service_name = service_name
         .map(str::trim)
@@ -1094,7 +1229,7 @@ fn split_host_port(hostport: &str) -> Option<(&str, u16)> {
     let (host, port) = hostport.rsplit_once(':')?;
     let host = host.trim_matches(['[', ']']);
     let port = port.parse().ok()?;
-    (!host.is_empty()).then_some((host, port))
+    (!host.is_empty() && port > 0).then_some((host, port))
 }
 
 fn split_uri_query(value: &str) -> (&str, Option<&str>) {
@@ -1137,17 +1272,26 @@ fn apply_shadowsocks_plugin(node: &mut ProxyNode, query: Option<&str>) {
     };
     mapping.insert(yaml_str("plugin"), yaml_str(plugin_name));
     let mut options = serde_yaml::Mapping::new();
+    if plugin_name == "v2ray-plugin" {
+        options.insert(yaml_str("mode"), yaml_str("websocket"));
+    }
     for item in parts {
-        let Some((key, value)) = item.split_once('=') else {
+        let (key, value) = item.split_once('=').unwrap_or((item, "true"));
+        if key.is_empty() {
             continue;
-        };
+        }
         let key = match key.trim() {
             "obfs" => "mode",
             "obfs-host" => "host",
             "obfs-uri" => "path",
             key => key,
         };
-        options.insert(yaml_str(key), yaml_str(value.trim()));
+        let value = if matches!(key, "tls" | "mux" | "skip-cert-verify") {
+            serde_yaml::Value::Bool(query_bool(Some(value)))
+        } else {
+            yaml_str(value)
+        };
+        options.insert(yaml_str(key), value);
     }
     if !options.is_empty() {
         mapping.insert(yaml_str("plugin-opts"), serde_yaml::Value::Mapping(options));
@@ -1192,16 +1336,33 @@ fn json_port(value: &JsonValue) -> Option<u16> {
         .or_else(|| value.as_str().and_then(|port| port.parse().ok()))
 }
 
+fn yaml_port(value: &serde_yaml::Value) -> Option<u16> {
+    value
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .or_else(|| value.as_str().and_then(|port| port.parse().ok()))
+}
+
+fn decode_b64_payload(raw: &str) -> Option<Vec<u8>> {
+    let payload = percent_decode(raw);
+    b64(&payload).or_else(|| b64(payload.strip_suffix('/')?))
+}
+
 fn b64(raw: &str) -> Option<Vec<u8>> {
     let raw = raw.trim();
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(raw)
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(raw))
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(raw))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(raw))
         .ok()
 }
 
 fn decode_text(raw: &str) -> Option<String> {
+    let raw = raw
+        .strip_prefix("base64://")
+        .or_else(|| raw.strip_prefix("base64,"))
+        .unwrap_or(raw);
     let compact: String = raw
         .chars()
         .filter(|character| !character.is_whitespace())
@@ -1527,6 +1688,10 @@ impl WindowsJob {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "mihomo_subscription_tests.rs"]
+mod subscription_tests;
 
 #[cfg(test)]
 mod tests {
