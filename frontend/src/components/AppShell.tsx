@@ -83,7 +83,7 @@ export function AppShell({ children }: PropsWithChildren) {
           <button type="button" aria-label="最大化" onClick={() => void windowAction("maximize")}>
             <Square size={13} />
           </button>
-          <button className="window-controls__close" type="button" aria-label="隐藏到后台" title="隐藏到后台" disabled={updates.phase === "installing"} onClick={() => void windowAction("close")}>
+          <button className="window-controls__close" type="button" aria-label="隐藏到后台" title="隐藏到后台" onClick={() => void windowAction("close")}>
             <X size={17} />
           </button>
         </div>
