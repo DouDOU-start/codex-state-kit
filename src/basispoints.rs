@@ -267,6 +267,58 @@ fn fallback_transport_call(item: &Value) -> Value {
     })
 }
 
+fn normalize_message_item(item: &Value) -> Option<Value> {
+    let role = item
+        .get("role")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "user".into());
+    if !matches!(role.as_str(), "developer" | "system" | "user" | "assistant") {
+        return None;
+    }
+    let role = if role == "system" { "developer" } else { &role };
+    let mut content = Vec::new();
+    match item.get("content") {
+        Some(Value::String(text)) => content.push(json!({"type":"input_text","text":text})),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                let Some(kind) = part.get("type").and_then(Value::as_str) else {
+                    continue;
+                };
+                match kind {
+                    "input_text" | "output_text" => {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            content.push(json!({"type":"input_text","text":text}));
+                        }
+                    }
+                    "input_image" | "image" => {
+                        // Basispoints' Excel endpoint rejects Responses image
+                        // blocks (especially data URLs) with a generic 422.
+                        // Keep the turn usable and make the loss explicit to
+                        // the model instead of forwarding an invalid item.
+                        let hint = part
+                            .get("image_url")
+                            .and_then(Value::as_str)
+                            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+                            .map(|url| format!(" URL: {url}"))
+                            .unwrap_or_default();
+                        content.push(json!({
+                            "type":"input_text",
+                            "text":format!("[Image input is unavailable on the Basispoints Excel upstream.{hint}]")
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    if content.is_empty() {
+        return None;
+    }
+    Some(json!({"type":"message","role":role,"content":content}))
+}
+
 fn normalize_input_item(
     item: &Value,
     calls: &HashMap<String, NativeCall>,
@@ -278,6 +330,7 @@ fn normalize_input_item(
     }
     let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
     match kind {
+        "message" => normalize_message_item(&item),
         "reasoning" => {
             let encrypted = item.get("encrypted_content").and_then(Value::as_str)?;
             if encrypted.is_empty() {
@@ -884,6 +937,36 @@ mod tests {
         assert!(input.iter().all(|item| item["type"] != "reasoning"));
         assert!(input.iter().all(|item| item["type"] != "item_reference"));
         assert_eq!(input.last().unwrap()["type"], "function_call_output");
+    }
+
+    #[tokio::test]
+    async fn degrades_image_input_to_text_for_excel_upstream() {
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let request = json!({
+            "input":[{"type":"message","role":"user","content":[
+                {"type":"input_text","text":"Describe this"},
+                {"type":"input_image","image_url":"data:image/png;base64,AAAA","detail":"high"}
+            ]}]
+        });
+        let prepared = prepare_request(
+            &state,
+            serde_json::to_vec(&request).unwrap().as_slice(),
+            None,
+        )
+        .await
+        .unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let content = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["role"] == "user")
+            .unwrap()["content"]
+            .as_array()
+            .unwrap();
+        assert!(content.iter().all(|part| part["type"] == "input_text"));
+        assert!(content[1]["text"].as_str().unwrap().contains("Image input"));
+        assert!(serde_json::to_string(&body).unwrap().contains("AAAA") == false);
     }
 
     #[test]
