@@ -4,6 +4,7 @@ version = "0.0.12"
 edition = "2021"
 rust-version = "1.85"
 description = "Transparent local reverse proxy for Codex HTTP SSE"
+license = "MIT"
 exclude = ["frontend", "dist", "node_modules"]
 
 [lib]

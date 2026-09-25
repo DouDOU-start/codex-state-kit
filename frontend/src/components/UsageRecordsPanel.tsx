@@ -1,3 +1,5 @@
+import { t, formatNumber, getLocale } from "@/lib/i18n";
+import { useLocale } from "@/hooks/useLocale";
 import { useCallback, useEffect, useRef, useState } from "react";
 import BookOpen from "lucide-react/dist/esm/icons/book-open.js";
 import CircleArrowDown from "lucide-react/dist/esm/icons/circle-arrow-down.js";
@@ -41,51 +43,52 @@ function savedPageSize(): number {
 
 function formatAmount(costNanos: number): string {
   const amount = Number(costNanos) / 1_000_000_000;
-  return amount < 1 ? amount.toFixed(6) : amount.toFixed(4);
+  const digits = amount < 1 ? 6 : 4;
+  return formatNumber(amount, { minimumFractionDigits: digits, maximumFractionDigits: digits, useGrouping: false });
 }
 
 function formatMoney(costNanos: number | null | undefined): string {
-  if (costNanos == null || !Number.isFinite(Number(costNanos))) return "未定价";
+  if (costNanos == null || !Number.isFinite(Number(costNanos))) return t("未定价");
   return `$${formatAmount(costNanos)}`;
 }
 
 function unpricedLabel(record: BillingRecord): { label: string; title: string } {
   if (record.state === "pending") {
-    return { label: "处理中", title: "请求仍在转发，等待上游返回最终状态。" };
+    return { label: t("处理中"), title: t("请求仍在转发，等待上游返回最终状态。") };
   }
   if (record.state === "interrupted") {
     const reason = record.errorMessage || record.errorKind;
-    return { label: "转发错误", title: reason ? `转发失败：${reason}` : "请求在转发过程中未完成；历史记录未保存具体错误原因。" };
+    return { label: t("转发错误"), title: reason ? t("转发失败：{0}", [reason]) : t("请求在转发过程中未完成；历史记录未保存具体错误原因。") };
   }
   if (record.state === "missing_usage" || record.inputTokens == null || record.outputTokens == null) {
-    return { label: "缺少用量", title: "请求已返回，但上游没有提供完整的输入/输出 token，暂时无法计算费用。" };
+    return { label: t("缺少用量"), title: t("请求已返回，但上游没有提供完整的输入/输出 token，暂时无法计算费用。") };
   }
-  return { label: "价格未匹配", title: "已有完整用量，但当前价格目录没有匹配的模型价格。" };
+  return { label: t("价格未匹配"), title: t("已有完整用量，但当前价格目录没有匹配的模型价格。") };
 }
 
 function stateLabel(state: BillingRecord["state"]): string {
   return ({
-    pending: "处理中",
-    measured: "已计量",
-    missing_usage: "缺少用量",
-    interrupted: "转发错误",
+    pending: t("处理中"),
+    measured: t("已计量"),
+    missing_usage: t("缺少用量"),
+    interrupted: t("转发错误"),
   } as Record<string, string>)[state] ?? state;
 }
 
 /** 1 万以内显示千分位，更大时显示 K / M。 */
 function compactTokens(value: number | null | undefined): string {
   if (value == null) return "—";
-  if (value < 10_000) return new Intl.NumberFormat("en-US").format(value);
-  if (value < 1_000_000) return `${(value / 1000).toFixed(1)}K`;
-  return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value < 10_000) return formatNumber(value);
+  if (value < 1_000_000) return `${formatNumber(value / 1000, { minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false })}K`;
+  return `${formatNumber(value / 1_000_000, { minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false })}M`;
 }
 
 function formatDuration(ms?: number | null): string {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";
   if (ms < 1000) return `${Math.round(ms)}ms`;
-  if (ms < 100_000) return `${(ms / 1000).toFixed(2)}s`;
+  if (ms < 100_000) return `${formatNumber(ms / 1000, { minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false })}s`;
   const seconds = Math.round(ms / 1000);
-  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${formatNumber(Math.floor(seconds / 60))}m ${formatNumber(seconds % 60)}s`;
 }
 
 type Speed = "fast" | "mid" | "slow" | "none";
@@ -112,7 +115,7 @@ function recordClock(record: BillingRecord): { time: string; date: string } {
   const pad = (value: number) => String(value).padStart(2, "0");
   return {
     time: `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`,
-    date: `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`,
+    date: date.toLocaleDateString(getLocale()),
   };
 }
 
@@ -147,11 +150,11 @@ function matchLog(record: BillingRecord, logs: LogEntry[]): LogEntry | undefined
 /** Badge text: confirmed reroutes name the serving model. */
 export function downgradeLabel(report: DowngradeReport): string {
   if (report.verdict === "confirmed") {
-    return report.effectiveModel ? `已降级 → ${report.effectiveModel}` : "已降级";
+    return report.effectiveModel ? t("已降级 → {0}", [report.effectiveModel]) : t("已降级");
   }
-  if (report.safetyBuffering) return "疑似降智 · 安全缓冲";
-  if (report.verifications?.length) return "疑似降智 · 需验证";
-  return report.effectiveModel ? `疑似降智 → ${report.effectiveModel}` : "疑似降智";
+  if (report.safetyBuffering) return t("疑似降智 · 安全缓冲");
+  if (report.verifications?.length) return t("疑似降智 · 需验证");
+  return report.effectiveModel ? t("疑似降智 → {0}", [report.effectiveModel]) : t("疑似降智");
 }
 
 const TIER_LABEL: Record<string, string> = { priority: "Priority", flex: "Flex" };
@@ -159,10 +162,10 @@ const TIER_LABEL: Record<string, string> = { priority: "Priority", flex: "Flex" 
 /** 非零的分项成本，按 输入 / 缓存读 / 缓存写 / 输出 排列。 */
 function costParts(record: BillingRecord): string[] {
   return ([
-    ["输入", record.inputCostNanos],
-    ["缓存读", record.cacheReadCostNanos],
-    ["缓存写", record.cacheWriteCostNanos],
-    ["输出", record.outputCostNanos],
+    [t("输入"), record.inputCostNanos],
+    [t("缓存读"), record.cacheReadCostNanos],
+    [t("缓存写"), record.cacheWriteCostNanos],
+    [t("输出"), record.outputCostNanos],
   ] as const)
     .filter(([, nanos]) => nanos != null && nanos > 0)
     .map(([label, nanos]) => `${label} ${formatMoney(nanos)}`);
@@ -176,6 +179,7 @@ export function accountLabel(accountId: string, email: string | null | undefined
 }
 
 export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, onRefreshMsChange }: UsageRecordsPanelProps) {
+  useLocale();
   const [loading, setLoading] = useState(false);
   const [records, setRecords] = useState<BillingRecord[]>([]);
   const [total, setTotal] = useState(0);
@@ -189,7 +193,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
   const { notify } = useNotify();
   const reportError = useCallback((cause: unknown) => {
     // One notice, updated in place, even when auto-refresh keeps failing.
-    notify({ id: "usage-records-error", kind: "error", title: "读取使用记录失败", message: cause instanceof Error ? cause.message : String(cause) });
+    notify({ id: "usage-records-error", kind: "error", title: t("读取使用记录失败"), message: cause instanceof Error ? cause.message : String(cause) });
   }, [notify]);
   const accountChosen = useRef(false);
   const requestSeq = useRef(0);
@@ -311,8 +315,8 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
         <div className="section-heading">
           <span className="section-icon"><ScrollText size={19} /></span>
           <div>
-            <h2>使用记录</h2>
-            <p>共 {total} 条{!isTauri ? " · 浏览器示例" : ""}</p>
+            <h2>{t("使用记录")}</h2>
+            <p>{t("共")} {total}  {t("条")}{!isTauri ? t(" · 浏览器示例") : ""}</p>
           </div>
         </div>
         <div className="usage-records__actions">
@@ -321,12 +325,12 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
       </header>
       <div className="usage-record-filter">
         <div className="usage-record-filter__field">
-          <span>账号</span>
+          <span>{t("账号")}</span>
           <Select
             variant="compact"
-            ariaLabel="筛选账号"
+            ariaLabel={t("筛选账号")}
             value={accountId}
-            options={[{ value: "", label: "全部账号" }, ...accounts.map(([id, email]) => ({ value: id, label: accountLabel(id, email, savedAccounts) }))]}
+            options={[{ value: "", label: t("全部账号") }, ...accounts.map(([id, email]) => ({ value: id, label: accountLabel(id, email, savedAccounts) }))]}
             onChange={(next) => {
               accountChosen.current = true;
               setAccountId(next);
@@ -343,20 +347,19 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
               setPage(0);
             }}
           />
-          只看降智请求
-        </label>
-        <span>按请求开始时间排列</span>
+          {t("只看降智请求")} </label>
+        <span>{t("按请求开始时间排列")}</span>
       </div>
       <div className="usage-records__table" ref={tableRef}>
         {visible.length ? (
           <table className="usage-table">
             <thead>
               <tr>
-                <th>时间</th>
-                <th>模型</th>
-                <th>延迟</th>
-                <th>计量</th>
-                <th>费用</th>
+                <th>{t("时间")}</th>
+                <th>{t("模型")}</th>
+                <th>{t("延迟")}</th>
+                <th>{t("计量")}</th>
+                <th>{t("费用")}</th>
               </tr>
             </thead>
             <tbody>
@@ -365,7 +368,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                 const log = matchLog(record, status.logs);
                 const first = record.firstTokenMs ?? log?.firstTokenMs ?? null;
                 const total = log?.ms ?? durationMs(record);
-                const model = record.sentModel || record.requestedModel || "未知模型";
+                const model = record.sentModel || record.requestedModel || t("未知模型");
                 const requested = record.requestedModel || model;
                 const response = record.responseModel;
                 const matches = response ? sameModel(model, response) : null;
@@ -385,22 +388,22 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                     </td>
                     <td className="usage-table__model">
                       <div className="usage-model__line">
-                        <span className="usage-model__key">请求模型</span>
+                        <span className="usage-model__key">{t("请求模型")}</span>
                         <strong>{requested}</strong>
                         <span className="usage-model__transport">· {transportLabel(record)}</span>
                       </div>
                       {model !== requested ? (
                         <div className="usage-model__line usage-model__line--sub">
-                          <span className="usage-model__key">↳ 转发为</span>
+                          <span className="usage-model__key">{t("↳ 转发为")}</span>
                           <strong>{model}</strong>
                         </div>
                       ) : null}
                       <div className="usage-model__line usage-model__line--sub">
-                        <span className="usage-model__key">↳ 上游响应</span>
+                        <span className="usage-model__key">{t("↳ 上游响应")}</span>
                         <strong>{response ?? "—"}</strong>
                         {matches === null ? null : (
                           <span className={matches ? "usage-match usage-match--ok" : "usage-match usage-match--bad"}>
-                            {matches ? "模型一致" : "模型不一致"}
+                            {matches ? t("模型一致") : t("模型不一致")}
                           </span>
                         )}
                       </div>
@@ -408,45 +411,45 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                         <button
                           type="button"
                           className={`usage-downgrade usage-downgrade--${record.downgrade.verdict}`}
-                          title="查看判定依据"
+                          title={t("查看判定依据")}
                           onClick={() => explainDowngrade(record, record.downgrade!)}
                         >
                           <TriangleAlert size={11} />
                           {downgradeLabel(record.downgrade)}
                         </button>
                       ) : null}
-                      {record.pricingModel && record.pricingModel !== model ? <small>按 {record.pricingModel} 计价</small> : null}
+                      {record.pricingModel && record.pricingModel !== model ? <small>{t("按 {0} 计价", [record.pricingModel])}</small> : null}
                       {tier || record.longContext ? (
                         <span className="usage-table__badges">
                           {tier ? <span className="usage-badge">{tier}</span> : null}
-                          {record.longContext ? <span className="usage-badge usage-badge--warm">长上下文</span> : null}
+                          {record.longContext ? <span className="usage-badge usage-badge--warm">{t("长上下文")}</span> : null}
                         </span>
                       ) : null}
                     </td>
                     <td className="usage-table__latency">
                       <div className={`usage-latency usage-latency--${speed(first, FIRST_TOKEN_LIMITS)}`}>
-                        <span className="usage-latency__label">首字</span>
+                        <span className="usage-latency__label">{t("首字")}</span>
                         <span className={`usage-speed--${speed(first, FIRST_TOKEN_LIMITS)}`}>{formatDuration(first)}</span>
-                        <span className="usage-latency__label">总耗时</span>
+                        <span className="usage-latency__label">{t("总耗时")}</span>
                         <span className={`usage-speed--${speed(total, TOTAL_LIMITS)}`}>{formatDuration(total)}</span>
                       </div>
                     </td>
                     <td className="usage-table__meter">
                       <div className="usage-meter">
                         <div className="usage-meter__io">
-                          <span className="usage-meter__in" title="非缓存输入"><CircleArrowDown size={13} />{compactTokens(uncached)}</span>
-                          <span className="usage-meter__out" title={record.reasoningTokens ? `输出（含推理 ${compactTokens(record.reasoningTokens)}）` : "输出"}><CircleArrowUp size={13} />{compactTokens(record.outputTokens)}</span>
-                          <span className="usage-meter__cache" title="缓存读"><BookOpen size={12} />{compactTokens(record.inputTokens == null ? null : cached)}</span>
-                          {cacheWrite ? <span className="usage-meter__cache" title="缓存写"><PencilLine size={12} />{compactTokens(cacheWrite)}</span> : null}
+                          <span className="usage-meter__in" title={t("非缓存输入")}><CircleArrowDown size={13} />{compactTokens(uncached)}</span>
+                          <span className="usage-meter__out" title={record.reasoningTokens ? t("输出（含推理 {0}）", [compactTokens(record.reasoningTokens)]) : t("输出")}><CircleArrowUp size={13} />{compactTokens(record.outputTokens)}</span>
+                          <span className="usage-meter__cache" title={t("缓存读")}><BookOpen size={12} />{compactTokens(record.inputTokens == null ? null : cached)}</span>
+                          {cacheWrite ? <span className="usage-meter__cache" title={t("缓存写")}><PencilLine size={12} />{compactTokens(cacheWrite)}</span> : null}
                         </div>
-                        <strong className="usage-meter__total" title="总 tokens（输入 + 输出）">{compactTokens(totalTokens)}</strong>
+                        <strong className="usage-meter__total" title={t("总 tokens（输入 + 输出）")}>{compactTokens(totalTokens)}</strong>
                       </div>
                     </td>
                     <td className="usage-table__cost" title={parts.length ? parts.join("\n") : undefined}>
                       {record.costNanos == null
                         ? (() => {
                           const reason = unpricedLabel(record);
-                          return <button type="button" className="usage-cost usage-cost--none usage-cost--button" title={`${reason.title} 点击查看详情`} onClick={() => setDetailRecord(record)}>{reason.label}</button>;
+                          return <button type="button" className="usage-cost usage-cost--none usage-cost--button" title={t("{0} 点击查看详情", [reason.title])} onClick={() => setDetailRecord(record)}>{reason.label}</button>;
                         })()
                         : <span className="usage-cost"><i>$</i>{formatAmount(record.costNanos)}</span>}
                     </td>
@@ -458,8 +461,8 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
         ) : (
           <div className="usage-records__empty">
             <Route size={24} strokeWidth={1.5} />
-            <strong>{onlyDowngraded ? "没有降智请求" : "还没有使用记录"}</strong>
-            <p>{onlyDowngraded ? "没有检测到被改路由或安全缓冲的请求。" : "完成一次上游请求后，时间和用量会列在这里。"}</p>
+            <strong>{onlyDowngraded ? t("没有降智请求") : t("还没有使用记录")}</strong>
+            <p>{onlyDowngraded ? t("没有检测到被改路由或安全缓冲的请求。") : t("完成一次上游请求后，时间和用量会列在这里。")}</p>
           </div>
         )}
       </div>
@@ -489,10 +492,10 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
           <div className="modal__surface">
             <header className="modal__header">
               <div>
-                <h2 id="usage-record-detail-title">请求详情</h2>
+                <h2 id="usage-record-detail-title">{t("请求详情")}</h2>
                 <p className="modal__subtitle">{recordClock(detailRecord).time} · {recordClock(detailRecord).date}</p>
               </div>
-              <button type="button" className="modal__close" aria-label="关闭" onClick={() => setDetailRecord(null)}><X size={16} /></button>
+              <button type="button" className="modal__close" aria-label={t("关闭")} onClick={() => setDetailRecord(null)}><X size={16} /></button>
             </header>
             <div className="modal__body record-detail">
               <div className="record-detail__status">
@@ -500,17 +503,17 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                 <span>{stateLabel(detailRecord.state)}</span>
               </div>
               <dl className="record-detail__grid">
-                <div><dt>模型</dt><dd>{detailRecord.sentModel || detailRecord.requestedModel || "—"}</dd></div>
-                <div><dt>上游响应模型</dt><dd>{detailRecord.responseModel || "—"}</dd></div>
-                <div><dt>HTTP 状态</dt><dd>{detailStatus ?? "—"}</dd></div>
-                <div><dt>错误类型 / 错误码</dt><dd className={detailError ? "record-detail__error" : undefined}>{detailError || "—"}</dd></div>
-                <div><dt>传输方式</dt><dd>{detailTransport || "—"}</dd></div>
-                <div><dt>用量来源</dt><dd>{detailRecord.usageSource || "—"}</dd></div>
-                <div><dt>输入 tokens</dt><dd>{detailRecord.inputTokens ?? "—"}</dd></div>
-                <div><dt>输出 tokens</dt><dd>{detailRecord.outputTokens ?? "—"}</dd></div>
+                <div><dt>{t("模型")}</dt><dd>{detailRecord.sentModel || detailRecord.requestedModel || "—"}</dd></div>
+                <div><dt>{t("上游响应模型")}</dt><dd>{detailRecord.responseModel || "—"}</dd></div>
+                <div><dt>{t("HTTP 状态")}</dt><dd>{detailStatus ?? "—"}</dd></div>
+                <div><dt>{t("错误类型 / 错误码")}</dt><dd className={detailError ? "record-detail__error" : undefined}>{detailError || "—"}</dd></div>
+                <div><dt>{t("传输方式")}</dt><dd>{detailTransport || "—"}</dd></div>
+                <div><dt>{t("用量来源")}</dt><dd>{detailRecord.usageSource || "—"}</dd></div>
+                <div><dt>{t("输入 tokens")}</dt><dd>{detailRecord.inputTokens ?? "—"}</dd></div>
+                <div><dt>{t("输出 tokens")}</dt><dd>{detailRecord.outputTokens ?? "—"}</dd></div>
               </dl>
               <p className="record-detail__hint">{unpricedLabel(detailRecord).title}</p>
-              <code className="record-detail__id">请求 ID：{detailRecord.requestId}</code>
+              <code className="record-detail__id">{t("请求 ID：")}{detailRecord.requestId}</code>
             </div>
           </div>
         ) : null}

@@ -1,6 +1,7 @@
 {
   "name": "codex-state-kit-desktop",
   "version": "0.0.12",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.1.1",
@@ -13,7 +14,8 @@
     "build": "tauri build",
     "build:renderer": "tsc --noEmit && vite build",
     "icons": "tauri icon frontend/public/icon.svg --output src-tauri/icons && node -e \"require('node:fs').copyFileSync('src-tauri/icons/icon.png', 'src-tauri/icons/source.png')\"",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:i18n": "node --test tools/i18n.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

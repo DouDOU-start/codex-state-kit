@@ -1,8 +1,12 @@
 # Codex State Kit
 
+简体中文 | [Русский](README.ru.md)
+
 面向 Codex 的本地桌面助手：在本机代理 Codex 的上游请求，管理多个 ChatGPT 账号、出站线路和虚拟设备，记录每次请求的用量与费用，并按官方客户端的信号标记被降智的请求。
 
 基于 Tauri、Rust 和 React。实际效果受账号、网络和上游服务影响，不保证消除过载或提升模型能力。
+
+界面与托盘支持简体中文和俄语，可在标题栏切换。语言选择会在本机保存，不会修改 Codex 的虚拟设备语言区域。[本地化开发说明](docs/localization.md)。
 
 ## 使用说明
 
@@ -66,3 +70,7 @@ corepack pnpm dev
 ## 第三方组件
 
 订阅节点使用第三方开源内核 Mihomo，来源和许可证见[内核来源记录](src-tauri/resources/mihomo/PROVENANCE.md)。上游许可证与依赖声明保留原文。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。第三方组件仍受其各自许可证约束。

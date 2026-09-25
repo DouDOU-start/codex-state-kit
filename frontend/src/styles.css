@@ -58,6 +58,7 @@ svg { flex-shrink: 0; }
 .titlebar__identity { display: flex; align-items: center; gap: 9px; }
 .app-version { padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font: 10px/1.4 var(--font-mono); background: var(--surface-raised); }
 .titlebar__actions { display: flex; align-items: center; gap: 12px; height: 100%; }
+.language-select { min-width: 100px; }
 .update-check { border: 0; padding: 5px 7px; border-radius: 5px; background: transparent; color: var(--accent); font-size: 11px; cursor: pointer; }
 .update-check:hover { background: var(--accent-soft); }
 .window-controls { display: flex; height: 100%; }
@@ -105,7 +106,7 @@ svg { flex-shrink: 0; }
 .latency-probe[data-grade]:not(:disabled):hover { filter: brightness(.96); }
 .mihomo-picker__actions .latency-probe { min-width: 72px; min-height: 28px; font-size: 10px; }
 .page-nav { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.page-tabs { display: flex; min-width: 0; max-width: 100%; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: #f0f3f7; box-shadow: 0 6px 14px -12px rgba(48, 66, 88, .35); }
+.page-tabs { display: flex; flex-wrap: wrap; min-width: 0; max-width: 100%; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: #f0f3f7; box-shadow: 0 6px 14px -12px rgba(48, 66, 88, .35); }
 .page-tabs button { position: relative; display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; gap: 7px; min-height: 32px; padding: 0 16px; border: 1px solid transparent; border-radius: 8px; color: var(--muted); background: transparent; font-size: 11px; white-space: nowrap; cursor: pointer; transition: color .15s, background .15s, border-color .15s; }
 .page-tabs button:hover { color: var(--text-soft); background: #f7f9fb; }
 .page-tabs button[aria-selected="true"] { color: var(--accent-strong); background: var(--surface); border-color: #dbe4ef; box-shadow: 0 2px 4px #273d5408; font-weight: 600; }

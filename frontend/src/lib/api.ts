@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { t } from "@/lib/i18n";
 import type {
   ActionResult,
   CodexConfigView,
@@ -241,7 +242,7 @@ export async function probeOutboundLatency(kind: ProbeKind, proxy?: string): Pro
       })),
     };
   }
-  if (kind === "manual" && !proxy?.trim() && !mockStatus.outboundProxy.trim()) throw new Error("请先填写代理地址");
+  if (kind === "manual" && !proxy?.trim() && !mockStatus.outboundProxy.trim()) throw new Error(t("请先填写代理地址"));
   return { target, samples: [{ name: kind, delayMs: 128, error: null }] };
 }
 
@@ -377,21 +378,21 @@ export async function pollChatgptLogin(): Promise<LoginPoll> {
   }
   if (++mockLoginPolls < 8) return { status: "pending" };
   mockLogin = defaultLogin();
-  return { status: "ok", message: "预览：已模拟登录成功", login: mockLogin };
+  return { status: "ok", message: t("预览：已模拟登录成功"), login: mockLogin };
 }
 
 export async function cancelChatgptLogin(): Promise<ActionResult> {
   if (isTauri) {
     return invoke<ActionResult>("cancel_chatgpt_login");
   }
-  return { ok: true, message: "已取消登录" };
+  return { ok: true, message: t("已取消登录") };
 }
 
 export async function openUrl(url: string): Promise<ActionResult> {
   if (isTauri) {
     return invoke<ActionResult>("open_url", { url });
   }
-  return { ok: true, message: "预览模式不发起真实授权" };
+  return { ok: true, message: t("预览模式不发起真实授权") };
 }
 
 const emptyBillingTotals = (): BillingUsageTotals => ({
@@ -782,7 +783,7 @@ export async function listAccounts(home?: string): Promise<SavedAccount[]> {
 export async function switchAccount(accountId: string, home?: string): Promise<LoginStatus> {
   if (isTauri) return invoke<LoginStatus>("switch_account", { home: home ?? null, accountId });
   const target = mockAccounts.find((account) => account.accountId === accountId);
-  if (!target) throw new Error("账号不存在");
+  if (!target) throw new Error(t("账号不存在"));
   for (const account of mockAccounts) account.active = account === target;
   target.lastUsedAt = new Date().toISOString();
   mockLogin = {
@@ -800,8 +801,8 @@ export async function switchAccount(accountId: string, home?: string): Promise<L
 export async function removeAccount(accountId: string, home?: string): Promise<void> {
   if (isTauri) return invoke<void>("remove_account", { home: home ?? null, accountId });
   const index = mockAccounts.findIndex((account) => account.accountId === accountId);
-  if (index < 0) throw new Error("账号不存在");
-  if (mockAccounts[index].active) throw new Error("不能删除正在使用的账号，请先切换到其他账号");
+  if (index < 0) throw new Error(t("账号不存在"));
+  if (mockAccounts[index].active) throw new Error(t("不能删除正在使用的账号，请先切换到其他账号"));
   mockAccounts.splice(index, 1);
 }
 

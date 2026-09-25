@@ -2,6 +2,7 @@
 name = "codex-state-kit-desktop"
 version = "0.0.12"
 description = "Desktop manager for the Codex reverse proxy"
+license = "MIT"
 edition = "2021"
 rust-version = "1.85"
 

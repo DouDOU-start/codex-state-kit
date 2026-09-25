@@ -1,3 +1,4 @@
+import { t } from "@/lib/i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   cancelChatgptLogin,
@@ -38,21 +39,21 @@ function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): Sett
 }
 
 function errorMessage(cause: unknown): string {
-  if (typeof cause === "string") return cause;
-  if (cause instanceof Error) return cause.message;
+  if (typeof cause === "string") return t(cause);
+  if (cause instanceof Error) return t(cause.message);
   if (cause && typeof cause === "object" && "message" in cause) {
-    return String((cause as { message: unknown }).message);
+    return t(String((cause as { message: unknown }).message));
   }
-  return String(cause);
+  return t(String(cause));
 }
 
 /** Success notice; warns when a re-authorization signed in to another account. */
 function loginBanner(login: LoginStatus | null, expected: string | undefined, text: string): Banner {
   if (expected && login?.accountId && login.accountId !== expected) {
-    return { kind: "warn", text: `登录的是 ${login.email ?? login.accountId}，不是要重新授权的账号，已作为另一个账号保存` };
+    return { kind: "warn", text: t("登录的是 {0}，不是要重新授权的账号，已作为另一个账号保存", [login.email ?? login.accountId]) };
   }
-  if (expected) return { kind: "ok", text: `已重新授权 ${login?.email ?? expected}` };
-  return { kind: "ok", text };
+  if (expected) return { kind: "ok", text: t("已重新授权 {0}", [login?.email ?? expected]) };
+  return { kind: "ok", text: t(text) };
 }
 
 export function useCodexStateKit() {
@@ -158,7 +159,7 @@ export function useCodexStateKit() {
     try {
       const next = await switchAccount(accountId, codexHome);
       setLogin(next);
-      setBanner({ kind: "ok", text: `已切换到 ${next.email ?? accountId}，后续请求立即使用该账号` });
+      setBanner({ kind: "ok", text: t("已切换到 {0}，后续请求立即使用该账号", [next.email ?? accountId]) });
       await loadAccounts();
       void loadStatus(true);
     } catch (cause) {
@@ -251,8 +252,8 @@ export function useCodexStateKit() {
       const next = await setConfig(patchFrom(latest, { forcedModel: forcedModel.trim() }));
       setStatus(next);
       setBanner({ kind: "ok", text: next.forcedModel
-        ? `已强制绑定模型 ${next.forcedModel}，下游请求都会改成这个 ID 再转发。`
-        : "已关闭强制绑定模型，按下游请求的模型 ID 转发。" });
+        ? t("已强制绑定模型 {0}，下游请求都会改成这个 ID 再转发。", [next.forcedModel])
+        : t("已关闭强制绑定模型，按下游请求的模型 ID 转发。") });
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
     } finally {
@@ -327,9 +328,9 @@ export function useCodexStateKit() {
           setDevice(null);
           if (poll.status === "ok") {
             setLogin(loggedIn);
-            setBanner(loginBanner(loggedIn, accountId, poll.message || "已登录 ChatGPT"));
+            setBanner(loginBanner(loggedIn, accountId, poll.message ? t(poll.message) : t("已登录 ChatGPT")));
           } else {
-            setBanner({ kind: "error", text: poll.message || "登录失败" });
+            setBanner({ kind: "error", text: poll.message ? t(poll.message) : t("登录失败") });
           }
         } catch (cause) {
           if (generation !== loginGeneration.current) return;
@@ -355,7 +356,7 @@ export function useCodexStateKit() {
     try {
       const loggedIn = await importChatgptRefreshToken(home.trim(), refreshToken.trim(), accountId);
       setLogin(loggedIn);
-      setBanner(loginBanner(loggedIn, accountId, "Refresh Token 已换取并同步到 Codex 账号"));
+      setBanner(loginBanner(loggedIn, accountId, t("Refresh Token 已换取并同步到 Codex 账号")));
       return true;
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
@@ -372,7 +373,7 @@ export function useCodexStateKit() {
     try {
       const loggedIn = await importChatgptAccessToken(home.trim(), accessToken.trim());
       setLogin(loggedIn);
-      setBanner(loginBanner(loggedIn, accountId, "Access Token 已同步到 Codex 账号"));
+      setBanner(loginBanner(loggedIn, accountId, t("Access Token 已同步到 Codex 账号")));
       return true;
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
@@ -387,7 +388,7 @@ export function useCodexStateKit() {
     setDevice(null);
     try {
       await cancelChatgptLogin();
-      setBanner({ kind: "ok", text: "已取消登录" });
+      setBanner({ kind: "ok", text: t("已取消登录") });
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
     }
@@ -409,7 +410,7 @@ export function useCodexStateKit() {
       const latest = await getStatus();
       const next = await setConfig(patchFrom(latest, { chainSystemProxy: enabled }));
       setStatus(next);
-      setBanner({ kind: "ok", text: enabled ? "手动代理将经系统代理连接（检测到时）" : "手动代理改为直连" });
+      setBanner({ kind: "ok", text: enabled ? t("手动代理将经系统代理连接（检测到时）") : t("手动代理改为直连") });
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
     } finally {
@@ -425,8 +426,8 @@ export function useCodexStateKit() {
       setBanner({
         kind: "ok",
         text: profile.enabled === false
-          ? "已关闭虚拟设备模拟，之后的请求将原样透传设备和环境"
-          : "虚拟设备身份已保存，之后的请求都使用这份指纹",
+          ? t("已关闭虚拟设备模拟，之后的请求将原样透传设备和环境")
+          : t("虚拟设备身份已保存，之后的请求都使用这份指纹"),
       });
       return next;
     } catch (cause) {
@@ -442,7 +443,7 @@ export function useCodexStateKit() {
     try {
       const next = await regenerateVmInstallationId();
       setStatus(next);
-      setBanner({ kind: "ok", text: "已换成新的 Installation ID，上游会把 Kit 看成一台新设备" });
+      setBanner({ kind: "ok", text: t("已换成新的 Installation ID，上游会把 Kit 看成一台新设备") });
       return next;
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
@@ -457,7 +458,7 @@ export function useCodexStateKit() {
     try {
       const next = await detectVmCliVersion();
       setStatus(next);
-      setBanner({ kind: "ok", text: `已对齐本机 Codex CLI ${next.vmIdentity.cliVersion}` });
+      setBanner({ kind: "ok", text: t("已对齐本机 Codex CLI {0}", [next.vmIdentity.cliVersion]) });
       return next;
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });

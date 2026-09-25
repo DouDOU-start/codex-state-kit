@@ -1,3 +1,5 @@
+import { t } from "@/lib/i18n";
+import { useLocale } from "@/hooks/useLocale";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type PropsWithChildren, type ReactNode } from "react";
 import CircleAlert from "lucide-react/dist/esm/icons/circle-alert.js";
 import CircleCheck from "lucide-react/dist/esm/icons/circle-check.js";
@@ -28,6 +30,7 @@ export interface NoticeInput {
 
 interface Notice extends NoticeInput {
   id: string;
+  build?: () => Omit<NoticeInput, "id">;
 }
 
 export interface ConfirmOptions {
@@ -40,7 +43,7 @@ export interface ConfirmOptions {
 }
 
 interface NotifyApi {
-  notify: (input: NoticeInput) => string;
+  notify: (input: NoticeInput, build?: () => Omit<NoticeInput, "id">) => string;
   dismiss: (id: string) => void;
   confirm: (options: ConfirmOptions) => Promise<boolean>;
 }
@@ -59,6 +62,7 @@ let nextId = 0;
 
 /** Themed notices (top-right) and confirm dialogs, replacing banners and window.confirm. */
 export function NotifyProvider({ children }: PropsWithChildren) {
+  useLocale();
   const [notices, setNotices] = useState<Notice[]>([]);
   const timers = useRef(new Map<string, number>());
   const [pendingConfirm, setPendingConfirm] = useState<(ConfirmOptions & { resolve: (ok: boolean) => void }) | null>(null);
@@ -71,9 +75,9 @@ export function NotifyProvider({ children }: PropsWithChildren) {
     setNotices((current) => current.filter((notice) => notice.id !== id));
   }, []);
 
-  const notify = useCallback((input: NoticeInput) => {
+  const notify = useCallback((input: NoticeInput, build?: () => Omit<NoticeInput, "id">) => {
     const id = input.id ?? `notice-${++nextId}`;
-    const notice: Notice = { ...input, id };
+    const notice: Notice = { ...input, id, build };
     setNotices((current) => {
       const index = current.findIndex((item) => item.id === id);
       if (index < 0) return [...current, notice];
@@ -113,7 +117,10 @@ export function NotifyProvider({ children }: PropsWithChildren) {
     <NotifyContext.Provider value={api}>
       {children}
       <div className="notices" aria-live="polite">
-        {notices.map((notice) => {
+        {notices.map((saved) => {
+          // Re-render active notices in the new language without reopening
+          // dismissed notices or restarting their auto-dismiss timers.
+          const notice = { ...saved, ...saved.build?.() };
           const Icon = ICONS[notice.kind];
           return (
             <div key={notice.id} className={`notice notice--${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>
@@ -134,7 +141,7 @@ export function NotifyProvider({ children }: PropsWithChildren) {
               <button
                 type="button"
                 className="notice__close"
-                aria-label="关闭提醒"
+                aria-label={t("关闭提醒")}
                 onClick={() => {
                   notice.onClose?.();
                   dismiss(notice.id);
@@ -171,7 +178,7 @@ export function NotifyProvider({ children }: PropsWithChildren) {
             </div>
             <div className="confirm__actions">
               <button type="button" className="button button--ghost" onClick={() => settle(false)}>
-                {pendingConfirm.cancelText ?? "取消"}
+                {pendingConfirm.cancelText ?? t("取消")}
               </button>
               <button
                 type="button"
@@ -179,7 +186,7 @@ export function NotifyProvider({ children }: PropsWithChildren) {
                 className={pendingConfirm.danger ? "button button--danger" : "button button--primary"}
                 onClick={() => settle(true)}
               >
-                {pendingConfirm.confirmText ?? "确定"}
+                {pendingConfirm.confirmText ?? t("确定")}
               </button>
             </div>
           </div>
@@ -209,7 +216,7 @@ export function useNotice(id: string, key: string | null, build: () => Omit<Noti
       dismiss(id);
       return;
     }
-    notify({ ...buildRef.current(), id });
+    notify({ ...buildRef.current(), id }, () => buildRef.current());
   }, [id, key, notify, dismiss]);
   useEffect(() => () => dismiss(id), [id, dismiss]);
 }

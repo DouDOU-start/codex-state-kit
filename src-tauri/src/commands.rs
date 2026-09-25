@@ -16,6 +16,15 @@ use crate::state::{AppState, LoginSession};
 use codex_state_kit::{browser_login::BrowserLogin, login::LoginMethod};
 use std::sync::Arc;
 
+#[tauri::command]
+pub async fn set_ui_language(app: tauri::AppHandle, language: String) -> CommandResult<()> {
+    use tauri::Manager;
+    app.state::<crate::ui_language::UiLanguage>()
+        .set(&language)?;
+    crate::tray::refresh(&app).await;
+    Ok(())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionResult {

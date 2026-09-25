@@ -1,0 +1,51 @@
+name: Continuous integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: corepack pnpm install --frozen-lockfile
+      - name: Run localization tests
+        run: corepack pnpm test:i18n
+      - name: Build renderer
+        run: corepack pnpm build:renderer
+
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    env:
+      NO_PROXY: localhost,127.0.0.1
+      no_proxy: localhost,127.0.0.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check workspace
+        run: cargo check --workspace --locked
+      - name: Run workspace tests
+        run: cargo test --workspace --all-targets --locked
