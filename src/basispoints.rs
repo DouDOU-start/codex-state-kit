@@ -277,7 +277,43 @@ fn basispoints_effort(object: &Map<String, Value>) -> String {
         "low" => "low".into(),
         "high" => "high".into(),
         "xhigh" | "x-high" | "extra-high" | "extra_high" | "max" => "xhigh".into(),
+        "ultra" => "ultra".into(),
         _ => "medium".into(),
+    }
+}
+
+fn filter_tools_for_choice(tools: &mut HashMap<String, ToolSpec>, choice: Option<&Value>) {
+    let Some(choice) = choice else { return };
+    let Some(object) = choice.as_object() else {
+        return;
+    };
+    match object.get("type").and_then(Value::as_str) {
+        Some("allowed_tools") => {
+            let allowed: std::collections::HashSet<String> = object
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| {
+                    let name = tool.get("name").and_then(Value::as_str)?;
+                    let namespace = tool.get("namespace").and_then(Value::as_str);
+                    Some(
+                        namespace
+                            .map(|ns| format!("{ns}.{name}"))
+                            .unwrap_or_else(|| name.to_owned()),
+                    )
+                })
+                .collect();
+            tools.retain(|key, spec| allowed.contains(key) || allowed.contains(&spec.name));
+        }
+        Some("function") | Some("custom") => {
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            tools.retain(|key, spec| key == name || spec.name == name);
+        }
+        _ => {}
     }
 }
 
@@ -497,6 +533,7 @@ pub async fn prepare_request(
         .unwrap_or(true)
     {
         collect_tools(object.get("tools"), None, &mut tools);
+        filter_tools_for_choice(&mut tools, object.get("tool_choice"));
     }
     let mut guard = state.lock().await;
     if guard.lineages.len() > MAX_LINEAGES {
@@ -1063,6 +1100,28 @@ mod tests {
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(body["reasoning_effort"], "xhigh");
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[tokio::test]
+    async fn preserves_ultra_effort_and_filters_allowed_tools() {
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let request = json!({
+            "reasoning":{"effort":"ultra"},
+            "tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"get_weather"}]},
+            "tools":[
+                {"type":"function","name":"get_weather","parameters":{"type":"object"}},
+                {"type":"function","name":"write_file","parameters":{"type":"object"}}
+            ],
+            "input":"hello"
+        });
+        let prepared = prepare_request(&state, &serde_json::to_vec(&request).unwrap(), None)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(body["reasoning_effort"], "ultra");
+        let catalog = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(catalog.contains("get_weather"));
+        assert!(!catalog.contains("write_file"));
     }
 
     #[tokio::test]
