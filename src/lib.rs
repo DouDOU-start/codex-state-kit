@@ -16,6 +16,7 @@ pub mod pricing;
 pub mod proxy;
 pub mod settings;
 pub mod system_proxy;
+pub(crate) mod tls;
 pub mod traffic;
 pub mod update;
 pub mod ws_bridge;

@@ -54,6 +54,8 @@ export interface VmIdentityView {
   osVersion: string;
   arch: string;
   terminal: string;
+  terminalVersion: string;
+  terminalMultiplexer: string;
   userAgent: string;
 }
 
@@ -61,6 +63,9 @@ export interface VmProfile {
   platform: DevicePlatform;
   environment?: VirtualEnvironment;
   enabled?: boolean;
+  terminal?: string;
+  terminalVersion?: string;
+  terminalMultiplexer?: string;
 }
 
 export interface VirtualEnvironment {

@@ -21,17 +21,25 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 futures-util = "0.3"
 http = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks", "gzip", "zstd"] }
+## Real macOS hosts presenting the Mac profile use native-tls/Security.framework;
+## every other virtual-device HTTP combination uses the deterministic AWS-LC
+## rustls profile so Linux/Windows OpenSSL or SChannel details do not leak.
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "rustls-tls-no-provider", "http2", "stream", "json", "socks", "gzip", "zstd"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
 serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["full"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tokio-socks = "0.5"
 tokio-util = "0.7"
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Keep the Responses WebSocket transport aligned with Codex's client.  The
+# upstream client uses OpenAI's fork because crates.io tungstenite does not
+# implement RFC 7692 permessage-deflate yet.
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite.git", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", features = ["rustls-tls-native-roots"] }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs.git", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", features = ["deflate"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8"
 webpki-roots = "1"
 toml = "0.8"
 toml_edit = "0.22"

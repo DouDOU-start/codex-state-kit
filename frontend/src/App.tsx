@@ -549,7 +549,8 @@ export default function App() {
               ["Originator", vmIdentity?.originator],
               ["系统版本", vmIdentity ? `${vmIdentity.osType} ${vmIdentity.osVersion}` : undefined],
               ["架构", vmIdentity?.arch],
-              ["终端", vmIdentity?.terminal],
+              ["终端", vmIdentity ? `${vmIdentity.terminal}${vmIdentity.terminalVersion ? `/${vmIdentity.terminalVersion}` : ""}` : undefined],
+              ["终端复用器", vmIdentity?.terminalMultiplexer || "未检测到"],
               ["地区", vmIdentity?.environment?.region || "未识别"],
               ["模型时区", vmIdentity?.environment?.timezone || "沿用客户端"],
               ["语言区域", vmIdentity?.environment?.locale || "沿用客户端"],
@@ -587,7 +588,7 @@ export default function App() {
                 }} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} />
             </label>)}
           </div>}
-          <p className="panel__hint">{vmIdentity?.enabled ? "系统版本、架构和终端跟随所选系统，与官方 CLI 在该系统上上报的一致；CLI 版本跟随本机安装的 codex，Originator 固定为官方 CLI。" : "当前为纯透传模式，下面保存的虚拟设备参数不会改写请求。"}</p>
+          <p className="panel__hint">{vmIdentity?.enabled ? "系统版本、架构和终端跟随所选系统，与官方 CLI 在该系统上上报的一致；CLI 版本和终端信息跟随本机环境。" : "当前为纯透传模式，下面保存的虚拟设备参数不会改写请求。"}</p>
           <div className="vm-identity__actions">
             <button type="button" className="button button--ghost" disabled={fwd.busy !== null || !vmIdentity?.enabled} onClick={() => void fwd.detectVmVersion()}>检测本机 CLI</button>
             <button

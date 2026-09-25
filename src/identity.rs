@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::settings::{home_dir, is_dev_mode};
@@ -95,7 +96,19 @@ pub struct VmIdentity {
     pub os_type: String,
     pub os_version: String,
     pub arch: String,
+    /// Terminal name/token used in the Codex user agent. This remains named
+    /// `terminal` for compatibility with profiles written by older Kit
+    /// versions; the optional version and multiplexer fields below carry the
+    /// additional runtime terminal fingerprint detected by Codex.
     pub terminal: String,
+    #[serde(default)]
+    pub terminal_version: String,
+    #[serde(default)]
+    pub terminal_multiplexer: String,
+    /// A profile may explicitly choose a terminal. Explicit values must not
+    /// be replaced by runtime detection when the profile is loaded again.
+    #[serde(default, skip_serializing_if = "is_false")]
+    terminal_override: bool,
     #[serde(skip)]
     pub session_id: String,
     #[serde(skip)]
@@ -115,6 +128,14 @@ pub struct VmProfile {
     /// platform or environment.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Optional terminal override. Omitting these fields keeps the platform
+    /// preset and allows runtime terminal detection on the next load.
+    #[serde(default)]
+    pub terminal: Option<String>,
+    #[serde(default)]
+    pub terminal_version: Option<String>,
+    #[serde(default)]
+    pub terminal_multiplexer: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +165,17 @@ pub struct RequestContext {
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub parent_thread_id: Option<String>,
+    pub parent_turn_id: Option<String>,
+    pub root_turn_id: Option<String>,
+    pub forked_from_thread_id: Option<String>,
+    pub context_window_id: Option<String>,
+    pub window_number: Option<u64>,
+    pub agent_name: Option<String>,
+    pub thread_source: Option<String>,
+    pub turn_trigger: Option<String>,
+    pub request_kind: Option<String>,
+    pub sandbox: Option<String>,
+    pub sandbox_mode: Option<String>,
     pub subagent: Option<String>,
     pub turn_metadata: Option<String>,
 }
@@ -200,6 +232,8 @@ pub struct VmIdentityView {
     pub os_version: String,
     pub arch: String,
     pub terminal: String,
+    pub terminal_version: String,
+    pub terminal_multiplexer: String,
     pub user_agent: String,
 }
 
@@ -218,6 +252,9 @@ impl VmIdentity {
                 .unwrap_or_else(|_| Uuid::new_v4().to_string());
         identity.normalize();
         identity.fill_runtime();
+        if !identity.terminal_override {
+            identity.detect_runtime_terminal();
+        }
         #[cfg(not(test))]
         if let Some(version) = detect_local_cli_version() {
             identity.cli_version = version;
@@ -236,19 +273,72 @@ impl VmIdentity {
     }
 
     pub fn user_agent(&self) -> String {
-        format!(
+        let terminal = if self.terminal_version.trim().is_empty() {
+            self.terminal.clone()
+        } else {
+            format!("{}/{}", self.terminal, self.terminal_version)
+        };
+        let base = format!(
             "{}/{} ({} {}; {}) {}",
-            self.originator,
+            self.originator_value(),
             self.cli_version,
             self.os_type,
             self.os_version,
             self.arch,
-            self.terminal
-        )
+            terminal
+        );
+        match user_agent_suffix() {
+            Some(suffix) => format!("{base} ({suffix})"),
+            None => base,
+        }
+    }
+
+    /// The official client permits a process-level originator override. Keep
+    /// the persisted profile as the default while honoring that override for
+    /// every request path that shares this identity.
+    pub fn originator_value(&self) -> String {
+        std::env::var("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
+            .ok()
+            .and_then(|value| {
+                let value = value.trim();
+                (!value.is_empty()
+                    && value.len() <= 128
+                    && value.is_ascii()
+                    && !value.chars().any(char::is_control))
+                .then(|| value.to_owned())
+            })
+            .unwrap_or_else(|| self.originator.clone())
+    }
+
+    /// Builds the request User-Agent without loading or persisting the
+    /// virtual-device profile.  Login and auxiliary clients use this helper
+    /// so they expose the same runtime terminal metadata as the proxy while
+    /// keeping authentication side-effect free.
+    pub(crate) fn runtime_user_agent() -> String {
+        let mut identity = Self::ephemeral();
+        identity.detect_runtime_terminal();
+        #[cfg(not(test))]
+        if let Some(version) = detect_local_cli_version() {
+            identity.cli_version = version;
+        }
+        identity.user_agent()
     }
 
     pub fn routing_hint(&self, model: &str) -> String {
-        format!("model={}", model.trim())
+        self.routing_hint_with_tier(model, None)
+    }
+
+    pub fn routing_hint_with_tier(&self, model: &str, service_tier: Option<&str>) -> String {
+        let model = model.trim();
+        match service_tier.map(str::trim).filter(|tier| {
+            !tier.is_empty()
+                && tier.len() <= 64
+                && tier.is_ascii()
+                && !tier.chars().any(char::is_control)
+        }) {
+            Some(tier) => format!("model={model};tier={tier}"),
+            None => format!("model={model}"),
+        }
     }
 
     /// Maps a client session/window into this device's runtime namespace.
@@ -261,55 +351,69 @@ impl VmIdentity {
         if !self.enabled {
             return self.clone();
         }
-        let session_scope = context
-            .session_id
-            .as_deref()
-            .map(|value| ("session", value))
-            .or_else(|| context.window_id.as_deref().map(|value| ("window", value)))
-            .or_else(|| context.thread_id.as_deref().map(|value| ("thread", value)))
-            .unwrap_or(("fallback", fallback_scope));
         let window_scope = context
             .window_id
             .as_deref()
-            .map(|value| ("window", value))
+            .map(|value| ("window", value.to_owned()))
             .or_else(|| {
                 context
                     .session_id
                     .as_deref()
-                    .map(|value| ("session", value))
+                    .map(|value| ("session", value.to_owned()))
             })
-            .or_else(|| context.thread_id.as_deref().map(|value| ("thread", value)))
-            .unwrap_or(("fallback", fallback_scope));
-        // Include both the installation and runtime IDs: accounts remain
-        // isolated even if their clients use identical source identifiers,
-        // and restarting/resetting the device starts a new mapping namespace.
-        let namespace = Uuid::new_v5(
-            &Uuid::NAMESPACE_OID,
-            &serde_json::to_vec(&[
-                "codex-state-kit/request-identity",
-                &self.installation_id,
-                &self.session_id,
-                &self.window_id,
-                &self.thread_id,
-            ])
-            .expect("serializing string arrays cannot fail"),
-        );
-        let derive = |kind: &str, source: (&str, &str)| {
-            Uuid::new_v5(
-                &namespace,
-                &serde_json::to_vec(&[kind, source.0, source.1])
-                    .expect("serializing string arrays cannot fail"),
-            )
-            .to_string()
-        };
-        let mut scoped = self.clone();
-        scoped.session_id = derive("session", session_scope);
-        scoped.window_id = derive("window", window_scope);
-        scoped.thread_id = context
+            .or_else(|| {
+                context
+                    .thread_id
+                    .as_deref()
+                    .map(|value| ("thread", value.to_owned()))
+            })
+            .unwrap_or(("fallback", fallback_scope.to_owned()));
+        let thread_scope = context
             .thread_id
-            .clone()
-            .unwrap_or_else(|| derive("thread", ("fallback", fallback_scope)));
+            .as_deref()
+            .map(|value| ("thread", value.to_owned()))
+            .unwrap_or(("fallback", fallback_scope.to_owned()));
+        let mut scoped = self.clone();
+        // Codex keeps one root session across windows and uses UUIDv7 for all
+        // generated protocol identifiers.  Keep the process/root session and
+        // derive stable UUIDv7-shaped IDs for client-provided scopes so the
+        // same source window/thread maps consistently across HTTP and WS.
+        scoped.session_id = self.session_id.clone();
+        scoped.window_id = self.scoped_uuid_v7("window", &window_scope.0, &window_scope.1);
+        scoped.thread_id = self.scoped_uuid_v7("thread", &thread_scope.0, &thread_scope.1);
         scoped
+    }
+
+    fn scoped_uuid_v7(&self, kind: &str, scope_kind: &str, source: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"codex-state-kit/request-identity/v7\0");
+        hasher.update(self.installation_id.as_bytes());
+        hasher.update(self.session_id.as_bytes());
+        hasher.update(kind.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(scope_kind.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(source.as_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        // Preserve the root UUIDv7 timestamp when available, while using the
+        // digest for the remaining stable random bits. This yields a stable,
+        // sortable UUIDv7 family instead of exposing UUIDv5 version bits.
+        if let Ok(root) = Uuid::parse_str(&self.session_id) {
+            bytes[..6].copy_from_slice(&root.as_bytes()[..6]);
+        }
+        bytes[6] = (bytes[6] & 0x0f) | 0x70;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Uuid::from_bytes(bytes).to_string()
+    }
+
+    /// Maps a client-owned protocol identifier into this virtual device's
+    /// UUIDv7-shaped namespace.  The mapping is stable for the same source,
+    /// which keeps HTTP and WebSocket turns correlated without exposing the
+    /// client's UUID version or account lineage.
+    pub fn map_protocol_id(&self, kind: &str, source: &str) -> String {
+        self.scoped_uuid_v7(kind, kind, source)
     }
 
     pub fn view(&self) -> VmIdentityView {
@@ -320,11 +424,13 @@ impl VmIdentity {
             session_id: self.session_id.clone(),
             platform: self.platform(),
             cli_version: self.cli_version.clone(),
-            originator: self.originator.clone(),
+            originator: self.originator_value(),
             os_type: self.os_type.clone(),
             os_version: self.os_version.clone(),
             arch: self.arch.clone(),
             terminal: self.terminal.clone(),
+            terminal_version: self.terminal_version.clone(),
+            terminal_multiplexer: self.terminal_multiplexer.clone(),
             user_agent: self.user_agent(),
         }
     }
@@ -338,6 +444,18 @@ impl VmIdentity {
             self.enabled = enabled;
         }
         self.set_platform(profile.platform);
+        if let Some(terminal) = profile.terminal {
+            self.terminal = sanitize_terminal_token(&terminal);
+            self.terminal_override = !self.terminal.is_empty();
+        }
+        if let Some(version) = profile.terminal_version {
+            self.terminal_version = sanitize_terminal_token(&version);
+            self.terminal_override = true;
+        }
+        if let Some(multiplexer) = profile.terminal_multiplexer {
+            self.terminal_multiplexer = sanitize_terminal_token(&multiplexer);
+            self.terminal_override = true;
+        }
         if let Some(environment) = profile.environment {
             self.environment = environment;
         }
@@ -349,16 +467,42 @@ impl VmIdentity {
         self.os_version = os_version.into();
         self.arch = arch.into();
         self.terminal = terminal.into();
+        self.terminal_version.clear();
+        self.terminal_multiplexer.clear();
+        self.terminal_override = false;
         self.originator = ORIGINATOR.into();
     }
 
     /// Brings a stored identity (possibly hand-edited by an older version)
     /// back to its platform's preset.
     fn normalize(&mut self) {
+        let terminal_override = self.terminal_override;
+        let terminal = self.terminal.clone();
+        let terminal_version = self.terminal_version.clone();
+        let terminal_multiplexer = self.terminal_multiplexer.clone();
         self.set_platform(self.platform());
+        if terminal_override {
+            self.terminal = terminal;
+            self.terminal_version = terminal_version;
+            self.terminal_multiplexer = terminal_multiplexer;
+            self.terminal_override = true;
+        }
         if !is_version(self.cli_version.trim()) {
             self.cli_version = DEFAULT_VERSION.into();
         }
+    }
+
+    /// Detect the terminal environment once per identity load. The selected
+    /// virtual platform remains authoritative for OS/version/architecture;
+    /// terminal detection is safe to use independently because it is the
+    /// same environment metadata the official CLI includes in its UA.
+    fn detect_runtime_terminal(&mut self) {
+        let Some(detected) = detect_terminal_info() else {
+            return;
+        };
+        self.terminal = detected.name;
+        self.terminal_version = detected.version;
+        self.terminal_multiplexer = detected.multiplexer;
     }
 
     /// The same device profile on a new machine: new installation and
@@ -402,6 +546,9 @@ impl VmIdentity {
             os_version: String::new(),
             arch: String::new(),
             terminal: String::new(),
+            terminal_version: String::new(),
+            terminal_multiplexer: String::new(),
+            terminal_override: false,
             session_id: String::new(),
             window_id: String::new(),
             thread_id: String::new(),
@@ -666,7 +813,7 @@ fn ascii_json(value: &Value) -> String {
 
 fn valid_turn_metadata(value: Option<&Value>) -> Option<String> {
     let value = value.and_then(Value::as_str)?.trim();
-    if value.is_empty() || value.chars().any(char::is_control) {
+    if value.is_empty() || value.len() > 64 * 1024 {
         return None;
     }
     let parsed = serde_json::from_str::<Value>(&value).ok()?;
@@ -687,8 +834,22 @@ pub fn request_context_from_value(body: &Value) -> RequestContext {
         }),
         thread_id: metadata.and_then(|m| safe_metadata_string(m.get("thread_id"))),
         turn_id: metadata.and_then(|m| safe_metadata_string(m.get("turn_id"))),
-        parent_thread_id: metadata
-            .and_then(|m| safe_metadata_string(m.get("x-codex-parent-thread-id"))),
+        parent_thread_id: metadata.and_then(|m| {
+            safe_metadata_string(m.get("x-codex-parent-thread-id"))
+                .or_else(|| safe_metadata_string(m.get("parent_thread_id")))
+        }),
+        parent_turn_id: metadata.and_then(|m| safe_metadata_string(m.get("parent_turn_id"))),
+        root_turn_id: metadata.and_then(|m| safe_metadata_string(m.get("root_turn_id"))),
+        forked_from_thread_id: metadata
+            .and_then(|m| safe_metadata_string(m.get("forked_from_thread_id"))),
+        context_window_id: metadata.and_then(|m| safe_metadata_string(m.get("context_window_id"))),
+        window_number: metadata.and_then(|m| m.get("window_number").and_then(Value::as_u64)),
+        agent_name: metadata.and_then(|m| safe_metadata_string(m.get("agent_name"))),
+        thread_source: metadata.and_then(|m| safe_metadata_string(m.get("thread_source"))),
+        turn_trigger: metadata.and_then(|m| safe_metadata_string(m.get("turn_trigger"))),
+        request_kind: metadata.and_then(|m| safe_metadata_string(m.get("request_kind"))),
+        sandbox: metadata.and_then(|m| safe_metadata_string(m.get("sandbox"))),
+        sandbox_mode: metadata.and_then(|m| safe_metadata_string(m.get("sandbox_mode"))),
         subagent: metadata.and_then(|m| safe_metadata_string(m.get("x-openai-subagent"))),
         turn_metadata: metadata.and_then(|m| valid_turn_metadata(m.get("x-codex-turn-metadata"))),
     };
@@ -708,6 +869,40 @@ pub fn request_context_from_value(body: &Value) -> RequestContext {
             }
             if context.parent_thread_id.is_none() {
                 context.parent_thread_id = safe_metadata_string(snapshot.get("parent_thread_id"));
+            }
+            if context.parent_turn_id.is_none() {
+                context.parent_turn_id = safe_metadata_string(snapshot.get("parent_turn_id"));
+            }
+            if context.root_turn_id.is_none() {
+                context.root_turn_id = safe_metadata_string(snapshot.get("root_turn_id"));
+            }
+            if context.forked_from_thread_id.is_none() {
+                context.forked_from_thread_id =
+                    safe_metadata_string(snapshot.get("forked_from_thread_id"));
+            }
+            if context.context_window_id.is_none() {
+                context.context_window_id = safe_metadata_string(snapshot.get("context_window_id"));
+            }
+            if context.window_number.is_none() {
+                context.window_number = snapshot.get("window_number").and_then(Value::as_u64);
+            }
+            if context.agent_name.is_none() {
+                context.agent_name = safe_metadata_string(snapshot.get("agent_name"));
+            }
+            if context.thread_source.is_none() {
+                context.thread_source = safe_metadata_string(snapshot.get("thread_source"));
+            }
+            if context.turn_trigger.is_none() {
+                context.turn_trigger = safe_metadata_string(snapshot.get("turn_trigger"));
+            }
+            if context.request_kind.is_none() {
+                context.request_kind = safe_metadata_string(snapshot.get("request_kind"));
+            }
+            if context.sandbox.is_none() {
+                context.sandbox = safe_metadata_string(snapshot.get("sandbox"));
+            }
+            if context.sandbox_mode.is_none() {
+                context.sandbox_mode = safe_metadata_string(snapshot.get("sandbox_mode"));
             }
             if context.subagent.is_none() {
                 context.subagent = safe_metadata_string(snapshot.get("subagent_kind"));
@@ -744,29 +939,164 @@ fn update_turn_metadata_snapshot(
     let Ok(Value::Object(mut snapshot)) = serde_json::from_str::<Value>(raw) else {
         return;
     };
+    sanitize_turn_metadata_snapshot(&mut snapshot, identity);
     snapshot.insert("installation_id".into(), json!(identity.installation_id));
     snapshot.insert("session_id".into(), json!(identity.session_id));
     snapshot.insert("window_id".into(), json!(identity.window_id));
-    snapshot.insert(
-        "thread_id".into(),
-        json!(context
-            .thread_id
-            .as_deref()
-            .unwrap_or(identity.thread_id.as_str())),
-    );
+    snapshot.insert("thread_id".into(), json!(identity.thread_id));
     if let Some(turn_id) = context.turn_id.as_deref() {
-        snapshot.insert("turn_id".into(), json!(turn_id));
+        snapshot.insert(
+            "turn_id".into(),
+            json!(identity.map_protocol_id("turn", turn_id)),
+        );
     }
     if let Some(parent_thread_id) = context.parent_thread_id.as_deref() {
-        snapshot.insert("parent_thread_id".into(), json!(parent_thread_id));
+        snapshot.insert(
+            "parent_thread_id".into(),
+            json!(identity.map_protocol_id("thread", parent_thread_id)),
+        );
     }
     if let Some(subagent) = context.subagent.as_deref() {
         snapshot.insert("subagent_kind".into(), json!(subagent));
+    }
+    for (key, value) in [
+        ("agent_name", context.agent_name.as_deref()),
+        ("thread_source", context.thread_source.as_deref()),
+        ("turn_trigger", context.turn_trigger.as_deref()),
+        ("request_kind", context.request_kind.as_deref()),
+        ("sandbox", context.sandbox.as_deref()),
+        ("sandbox_mode", context.sandbox_mode.as_deref()),
+    ] {
+        if let Some(value) = value {
+            snapshot.insert(key.into(), json!(value));
+        }
+    }
+    if let Some(window_number) = context.window_number {
+        snapshot.insert("window_number".into(), json!(window_number));
+    }
+    for (key, kind) in [
+        ("parent_turn_id", "turn"),
+        ("root_turn_id", "turn"),
+        ("forked_from_thread_id", "thread"),
+        ("context_window_id", "context-window"),
+    ] {
+        let source = snapshot.get(key).and_then(Value::as_str).map(str::to_owned);
+        if let Some(source) = source {
+            snapshot.insert(key.into(), json!(identity.map_protocol_id(kind, &source)));
+        }
     }
     metadata.insert(
         "x-codex-turn-metadata".into(),
         Value::String(ascii_json(&Value::Object(snapshot))),
     );
+}
+
+/// Keep the upstream metadata shape while preventing old or custom clients
+/// from mixing host execution details into a newly virtualized lineage.  The
+/// official fields remain available; oversized tool/MCP/workspace payloads
+/// are dropped at the same boundary where Codex bounds them for headers.
+fn sanitize_turn_metadata_snapshot(
+    snapshot: &mut serde_json::Map<String, Value>,
+    identity: &VmIdentity,
+) {
+    const HOST_KEYS: &[&str] = &[
+        "cwd",
+        "shell",
+        "shell_version",
+        "hostname",
+        "host_name",
+        "host_id",
+        "machine_id",
+        "workspace_root",
+        "filesystem",
+        "filesystem_access",
+        "network",
+        "network_access",
+        "subagents",
+        "subagent_environment",
+        "environment_id",
+        "environment_ids",
+    ];
+    snapshot.retain(|key, _| !HOST_KEYS.iter().any(|host| key == host));
+    sanitize_workspace_metadata(snapshot, identity);
+    for key in [
+        "workspaces",
+        "tool_namespaces_info",
+        "mcp_attribution",
+        "extra",
+    ] {
+        let oversized = snapshot
+            .get(key)
+            .and_then(|value| serde_json::to_vec(value).ok())
+            .is_some_and(|bytes| bytes.len() > 16 * 1024);
+        if oversized {
+            snapshot.remove(key);
+        }
+    }
+}
+
+fn sanitize_workspace_metadata(
+    snapshot: &mut serde_json::Map<String, Value>,
+    identity: &VmIdentity,
+) {
+    let Some(Value::Object(workspaces)) = snapshot.remove("workspaces") else {
+        return;
+    };
+    let mut sanitized = serde_json::Map::new();
+    for (name, mut value) in workspaces.into_iter().take(32) {
+        let key = if name.len() <= 64
+            && name.is_ascii()
+            && !name
+                .chars()
+                .any(|ch| ch == '/' || ch == '\\' || ch.is_control())
+        {
+            name
+        } else {
+            identity.map_protocol_id("workspace", &name)
+        };
+        if let Value::Object(fields) = &mut value {
+            fields.retain(|field, _| {
+                matches!(
+                    field.as_str(),
+                    "associated_remote_urls" | "latest_git_commit_hash" | "has_changes"
+                )
+            });
+            if let Some(Value::String(hash)) = fields.get_mut("latest_git_commit_hash") {
+                if hash.len() > 128 || !hash.is_ascii() {
+                    fields.remove("latest_git_commit_hash");
+                }
+            }
+            if let Some(Value::Object(urls)) = fields.get_mut("associated_remote_urls") {
+                urls.retain(|remote, value| {
+                    if remote.len() > 64 || !remote.is_ascii() {
+                        return false;
+                    }
+                    let Some(url) = value.as_str() else {
+                        return false;
+                    };
+                    *value = Value::String(sanitize_remote_url(url));
+                    true
+                });
+            }
+        } else {
+            value = Value::Object(serde_json::Map::new());
+        }
+        sanitized.insert(key, value);
+    }
+    snapshot.insert("workspaces".into(), Value::Object(sanitized));
+}
+
+fn sanitize_remote_url(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return value
+            .chars()
+            .filter(|ch| ch.is_ascii_graphic())
+            .take(512)
+            .collect();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string().chars().take(512).collect()
 }
 
 /// Only a standalone harness environment message is eligible. Never rewrite
@@ -805,25 +1135,37 @@ fn rewrite_environment(body: &mut Value, identity: &VmIdentity) -> bool {
                 continue;
             }
             let mut next = original.to_string();
-            set_context_tag(
-                &mut next,
+            // The official environment_context has no virtual_device or
+            // locale elements. Remove Kit-private tags and replace the host
+            // execution fields with the selected virtual platform instead.
+            rewrite_environment_ids(&mut next, identity);
+            for tag in [
                 "virtual_device",
-                &format!(
-                    "{} {}; {}; {}",
-                    identity.os_type, identity.os_version, identity.arch, identity.terminal
-                ),
-            );
-            if let Ok(tz) = environment.timezone.parse::<chrono_tz::Tz>() {
-                set_context_tag(&mut next, "timezone", &environment.timezone);
-                let date = chrono::Utc::now()
-                    .with_timezone(&tz)
-                    .format("%Y-%m-%d")
-                    .to_string();
-                set_context_tag(&mut next, "current_date", &date);
+                "locale",
+                "shell_version",
+                "network_access",
+                "network",
+                "filesystem",
+                "filesystem_access",
+                "subagents",
+            ] {
+                remove_context_tag_all(&mut next, tag);
             }
-            if !environment.locale.is_empty() && environment.validate().is_ok() {
-                set_context_tag(&mut next, "locale", &environment.locale);
-            }
+            set_context_tag_all(&mut next, "cwd", virtual_cwd(identity));
+            set_context_tag_all(&mut next, "shell", virtual_shell(identity));
+            let timezone = environment
+                .timezone
+                .parse::<chrono_tz::Tz>()
+                .ok()
+                .map(|_| environment.timezone.as_str())
+                .unwrap_or("UTC");
+            let tz = timezone.parse::<chrono_tz::Tz>().unwrap_or(chrono_tz::UTC);
+            set_context_tag_all(&mut next, "timezone", timezone);
+            let date = chrono::Utc::now()
+                .with_timezone(&tz)
+                .format("%Y-%m-%d")
+                .to_string();
+            set_context_tag_all(&mut next, "current_date", &date);
             if next != original {
                 *text = Value::String(next);
                 changed = true;
@@ -844,6 +1186,106 @@ fn set_context_tag(text: &mut String, name: &str, value: &str) {
         }
     } else if let Some(end) = text.rfind("</environment_context>") {
         text.insert_str(end, &format!("  {open}{value}{close}\n"));
+    }
+}
+
+/// Environment IDs are protocol lineage, not a reason to expose the source
+/// harness's identifiers.  Keep their ordering and UUID shape while mapping
+/// every nested `<environment id="…">` into the virtual device namespace.
+fn rewrite_environment_ids(text: &mut String, identity: &VmIdentity) {
+    let mut cursor = 0;
+    let mut ordinal = 0u64;
+    loop {
+        let Some(offset) = text[cursor..].find("<environment") else {
+            break;
+        };
+        let start = cursor + offset;
+        let name_end = start + "<environment".len();
+        let Some(next) = text[name_end..].chars().next() else {
+            break;
+        };
+        // Do not treat the root `<environment_context>` element as an
+        // execution environment.
+        if next == '_' || (!next.is_whitespace() && next != '>') {
+            cursor = name_end;
+            continue;
+        }
+        let Some(end_offset) = text[name_end..].find('>') else {
+            break;
+        };
+        let end = name_end + end_offset;
+        let tag = text[start..=end].to_owned();
+        let marker = tag
+            .find(" id=\"")
+            .map(|offset| (offset + " id=\"".len(), '"'))
+            .or_else(|| {
+                tag.find(" id='")
+                    .map(|offset| (offset + " id='".len(), '\''))
+            });
+        if let Some((value_offset, quote)) = marker {
+            if let Some(close_offset) = tag[value_offset..].find(quote) {
+                let value_start = start + value_offset;
+                let value_end = value_start + close_offset;
+                let source = text[value_start..value_end].to_owned();
+                let mapped = identity
+                    .map_protocol_id("environment", &format!("{ordinal}:{}", source.trim()));
+                text.replace_range(value_start..value_end, &mapped);
+                ordinal = ordinal.saturating_add(1);
+            }
+        }
+        cursor = end.saturating_add(1);
+    }
+}
+
+fn set_context_tag_all(text: &mut String, name: &str, value: &str) {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let mut search_from = 0;
+    let mut found = false;
+    while let Some(open_start) = text[search_from..].find(&open) {
+        let open_start = search_from + open_start;
+        let value_start = open_start + open.len();
+        let Some(close_offset) = text[value_start..].find(&close) else {
+            break;
+        };
+        let close_start = value_start + close_offset;
+        text.replace_range(value_start..close_start, value);
+        search_from = value_start + value.len() + close.len();
+        found = true;
+    }
+    if !found {
+        set_context_tag(text, name, value);
+    }
+}
+
+fn remove_context_tag_all(text: &mut String, name: &str) {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let mut search_from = 0;
+    while let Some(open_offset) = text[search_from..].find(&open) {
+        let open_start = search_from + open_offset;
+        let Some(close_offset) = text[open_start + open.len()..].find(&close) else {
+            break;
+        };
+        let end = open_start + open.len() + close_offset + close.len();
+        text.replace_range(open_start..end, "");
+        search_from = open_start;
+    }
+}
+
+fn virtual_cwd(identity: &VmIdentity) -> &'static str {
+    match identity.platform() {
+        DevicePlatform::Mac => "/Users/codex",
+        DevicePlatform::Windows => "C:\\Users\\codex",
+        DevicePlatform::Linux => "/home/codex",
+    }
+}
+
+fn virtual_shell(identity: &VmIdentity) -> &'static str {
+    match identity.platform() {
+        DevicePlatform::Mac => "/bin/zsh",
+        DevicePlatform::Windows => "powershell",
+        DevicePlatform::Linux => "/bin/bash",
     }
 }
 
@@ -873,6 +1315,39 @@ pub fn rewrite_client_metadata_value_with_context(
         }
         if context.parent_thread_id.is_none() {
             context.parent_thread_id = request_context.parent_thread_id.clone();
+        }
+        if context.parent_turn_id.is_none() {
+            context.parent_turn_id = request_context.parent_turn_id.clone();
+        }
+        if context.root_turn_id.is_none() {
+            context.root_turn_id = request_context.root_turn_id.clone();
+        }
+        if context.forked_from_thread_id.is_none() {
+            context.forked_from_thread_id = request_context.forked_from_thread_id.clone();
+        }
+        if context.context_window_id.is_none() {
+            context.context_window_id = request_context.context_window_id.clone();
+        }
+        if context.window_number.is_none() {
+            context.window_number = request_context.window_number;
+        }
+        if context.agent_name.is_none() {
+            context.agent_name = request_context.agent_name.clone();
+        }
+        if context.thread_source.is_none() {
+            context.thread_source = request_context.thread_source.clone();
+        }
+        if context.turn_trigger.is_none() {
+            context.turn_trigger = request_context.turn_trigger.clone();
+        }
+        if context.request_kind.is_none() {
+            context.request_kind = request_context.request_kind.clone();
+        }
+        if context.sandbox.is_none() {
+            context.sandbox = request_context.sandbox.clone();
+        }
+        if context.sandbox_mode.is_none() {
+            context.sandbox_mode = request_context.sandbox_mode.clone();
         }
         if context.subagent.is_none() {
             context.subagent = request_context.subagent.clone();
@@ -917,18 +1392,36 @@ pub fn rewrite_client_metadata_value_with_context(
     );
     metadata.insert("session_id".into(), json!(identity.session_id));
     metadata.insert("x-codex-window-id".into(), json!(identity.window_id));
-    metadata.insert(
-        "thread_id".into(),
-        json!(context
-            .thread_id
-            .as_deref()
-            .unwrap_or(identity.thread_id.as_str())),
-    );
-    if let Some(turn_id) = context.turn_id.as_deref() {
-        metadata.insert("turn_id".into(), json!(turn_id));
+    metadata.insert("thread_id".into(), json!(identity.thread_id));
+    for (key, kind, source) in [
+        ("turn_id", "turn", context.turn_id.as_deref()),
+        (
+            "parent_thread_id",
+            "thread",
+            context.parent_thread_id.as_deref(),
+        ),
+        ("parent_turn_id", "turn", context.parent_turn_id.as_deref()),
+        ("root_turn_id", "turn", context.root_turn_id.as_deref()),
+        (
+            "forked_from_thread_id",
+            "thread",
+            context.forked_from_thread_id.as_deref(),
+        ),
+        (
+            "context_window_id",
+            "context-window",
+            context.context_window_id.as_deref(),
+        ),
+    ] {
+        if let Some(source) = source {
+            metadata.insert(key.into(), json!(identity.map_protocol_id(kind, source)));
+        }
     }
     if let Some(parent_thread_id) = context.parent_thread_id.as_deref() {
-        metadata.insert("x-codex-parent-thread-id".into(), json!(parent_thread_id));
+        metadata.insert(
+            "x-codex-parent-thread-id".into(),
+            json!(identity.map_protocol_id("thread", parent_thread_id)),
+        );
     }
     if let Some(subagent) = context.subagent.as_deref() {
         metadata.insert("x-openai-subagent".into(), json!(subagent));
@@ -1091,8 +1584,179 @@ fn is_version(value: &str) -> bool {
     semver::Version::parse(value).is_ok()
 }
 
+/// Mirrors Codex's process-wide `USER_AGENT_SUFFIX` hook while keeping the
+/// value safe for an HTTP header.  `CODEX_USER_AGENT_SUFFIX` is accepted as a
+/// namespaced alias for shells that reserve the generic variable name.
+fn user_agent_suffix() -> Option<String> {
+    ["USER_AGENT_SUFFIX", "CODEX_USER_AGENT_SUFFIX"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find_map(|value| {
+            let value = sanitize_user_agent_suffix(&value);
+            (!value.is_empty()).then_some(value)
+        })
+}
+
+fn sanitize_user_agent_suffix(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_graphic() || ch == ' ' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect()
+}
+
 fn valid_uuid(value: &str) -> bool {
     Uuid::parse_str(value).is_ok()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DetectedTerminal {
+    name: String,
+    version: String,
+    multiplexer: String,
+}
+
+/// Detect terminal metadata using the same environment precedence as the
+/// upstream Codex terminal-detection crate. The raw values are sanitized
+/// before they can reach a User-Agent header or persisted profile.
+fn detect_terminal_info() -> Option<DetectedTerminal> {
+    detect_terminal_info_with(|name| std::env::var(name).ok())
+}
+
+fn detect_terminal_info_with<F>(get: F) -> Option<DetectedTerminal>
+where
+    F: Fn(&str) -> Option<String> + Copy,
+{
+    let multiplexer = detect_multiplexer_with(get);
+
+    if let Some(term_program) = env_non_empty_with(get, "TERM_PROGRAM") {
+        if !term_program.eq_ignore_ascii_case("tmux") {
+            return Some(DetectedTerminal {
+                name: sanitize_terminal_token(&term_program),
+                version: env_non_empty_with(get, "TERM_PROGRAM_VERSION")
+                    .map(|value| sanitize_terminal_token(&value))
+                    .unwrap_or_default(),
+                multiplexer,
+            });
+        }
+    }
+
+    let detected = if get("GHOSTTY_RESOURCES_DIR").is_some() {
+        Some(("Ghostty".to_string(), None))
+    } else if get("WEZTERM_VERSION").is_some() {
+        Some((
+            "WezTerm".to_string(),
+            env_non_empty_with(get, "WEZTERM_VERSION"),
+        ))
+    } else if get("ITERM_SESSION_ID").is_some()
+        || get("ITERM_PROFILE").is_some()
+        || get("ITERM_PROFILE_NAME").is_some()
+    {
+        Some(("iTerm.app".to_string(), None))
+    } else if get("TERM_SESSION_ID").is_some() {
+        Some(("Apple_Terminal".to_string(), None))
+    } else if get("KITTY_WINDOW_ID").is_some()
+        || get("TERM")
+            .map(|value| value.contains("kitty"))
+            .unwrap_or(false)
+    {
+        Some(("kitty".to_string(), None))
+    } else if get("ALACRITTY_SOCKET").is_some()
+        || get("TERM")
+            .map(|value| value == "alacritty")
+            .unwrap_or(false)
+    {
+        Some(("Alacritty".to_string(), None))
+    } else if get("KONSOLE_VERSION").is_some() {
+        Some((
+            "Konsole".to_string(),
+            env_non_empty_with(get, "KONSOLE_VERSION"),
+        ))
+    } else if get("GNOME_TERMINAL_SCREEN").is_some() {
+        Some(("gnome-terminal".to_string(), None))
+    } else if get("VTE_VERSION").is_some() {
+        Some(("VTE".to_string(), env_non_empty_with(get, "VTE_VERSION")))
+    } else if get("WT_SESSION").is_some() {
+        Some(("WindowsTerminal".to_string(), None))
+    } else {
+        env_non_empty_with(get, "TERM").map(|term| (term, None))
+    };
+
+    detected.map(|(name, version)| DetectedTerminal {
+        name: sanitize_terminal_token(&name),
+        version: version
+            .as_deref()
+            .map(sanitize_terminal_token)
+            .unwrap_or_default(),
+        multiplexer,
+    })
+}
+
+fn detect_multiplexer_with<F>(get: F) -> String
+where
+    F: Fn(&str) -> Option<String> + Copy,
+{
+    if get("TMUX").is_some() || get("TMUX_PANE").is_some() {
+        let version = if get("TERM_PROGRAM")
+            .map(|value| value.eq_ignore_ascii_case("tmux"))
+            .unwrap_or(false)
+        {
+            env_non_empty_with(get, "TERM_PROGRAM_VERSION")
+        } else {
+            None
+        };
+        return format_multiplexer("tmux", version.as_deref());
+    }
+    if get("ZELLIJ").is_some()
+        || get("ZELLIJ_SESSION_NAME").is_some()
+        || get("ZELLIJ_VERSION").is_some()
+    {
+        return format_multiplexer(
+            "zellij",
+            env_non_empty_with(get, "ZELLIJ_VERSION").as_deref(),
+        );
+    }
+    String::new()
+}
+
+fn format_multiplexer(name: &str, version: Option<&str>) -> String {
+    let name = sanitize_terminal_token(name);
+    match version.map(sanitize_terminal_token) {
+        Some(version) if !version.is_empty() => format!("{name}/{version}"),
+        _ => name,
+    }
+}
+
+fn env_non_empty_with<F>(get: F, name: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get(name).filter(|value| !value.trim().is_empty())
+}
+
+fn sanitize_terminal_token(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1122,9 +1786,10 @@ mod tests {
         assert_eq!(body["input"][3], original["input"][3]);
         let text = body["input"][1]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("<timezone>America/Los_Angeles</timezone>"));
-        assert!(text.contains("<locale>en-US</locale>"));
-        assert!(text.contains("<shell>powershell</shell>"));
-        assert!(text.contains("<virtual_device>Mac OS"));
+        assert!(text.contains("<cwd>/Users/codex</cwd>"));
+        assert!(text.contains("<shell>/bin/zsh</shell>"));
+        assert!(!text.contains("<locale>"));
+        assert!(!text.contains("<virtual_device>"));
         assert!(!text.contains("2000-01-01"));
         let wire = serde_json::to_vec(&original).unwrap();
         let compressed = zstd::encode_all(wire.as_slice(), 3).unwrap();
@@ -1167,7 +1832,7 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot["installation_id"], identity.installation_id);
         assert_eq!(snapshot["session_id"], identity.session_id);
-        assert_eq!(snapshot["thread_id"], "thread");
+        assert_eq!(snapshot["thread_id"], identity.thread_id);
         assert_eq!(body["client_metadata"]["window_id"], identity.window_id);
         assert!(is_vm_identity_header("X-OpenAI-Subagent"));
         assert!(is_vm_identity_header("Session-Id"));
@@ -1198,6 +1863,136 @@ mod tests {
     }
 
     #[test]
+    fn newer_canonical_metadata_is_preserved_but_protocol_ids_are_virtualized() {
+        let identity = VmIdentity::ephemeral();
+        let mut body = json!({
+            "model": "m",
+            "input": [],
+            "client_metadata": {
+                "x-codex-turn-metadata": r#"{
+                    "installation_id":"old-install",
+                    "session_id":"old-session",
+                    "window_id":"old-window",
+                    "thread_id":"old-thread",
+                    "turn_id":"old-turn",
+                    "window_number":3,
+                    "context_window_id":"old-context",
+                    "parent_turn_id":"old-parent",
+                    "thread_source":"user",
+                    "request_kind":"turn",
+                    "sandbox_mode":"workspace-write"
+                }"#
+            }
+        });
+        assert!(rewrite_client_metadata_value(&mut body, &identity));
+        let snapshot: Value = serde_json::from_str(
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["installation_id"], identity.installation_id);
+        assert_eq!(snapshot["session_id"], identity.session_id);
+        assert_eq!(snapshot["thread_id"], identity.thread_id);
+        assert_eq!(snapshot["window_number"], 3);
+        assert_eq!(snapshot["thread_source"], "user");
+        assert_eq!(snapshot["request_kind"], "turn");
+        assert_eq!(snapshot["sandbox_mode"], "workspace-write");
+        for key in ["context_window_id", "parent_turn_id", "turn_id"] {
+            assert_ne!(snapshot[key], Value::String(format!("old-{key}")));
+            assert_eq!(
+                Uuid::parse_str(snapshot[key].as_str().unwrap())
+                    .unwrap()
+                    .get_version_num(),
+                7
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_metadata_drops_host_fields_but_keeps_bounded_protocol_extensions() {
+        let identity = VmIdentity::ephemeral();
+        let mut body = json!({
+            "model": "m",
+            "input": [],
+            "client_metadata": {
+                "x-codex-turn-metadata": serde_json::json!({
+                    "request_kind": "turn",
+                    "hostname": "real-host",
+                    "workspace_root": "/Users/real/project",
+                    "analytics_enabled": true,
+                    "future_protocol_field": "kept"
+                }).to_string()
+            }
+        });
+        assert!(rewrite_client_metadata_value(&mut body, &identity));
+        let snapshot: Value = serde_json::from_str(
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(snapshot.get("hostname").is_none());
+        assert!(snapshot.get("workspace_root").is_none());
+        assert_eq!(snapshot["analytics_enabled"], true);
+        assert_eq!(snapshot["future_protocol_field"], "kept");
+    }
+
+    #[test]
+    fn workspace_metadata_maps_paths_and_strips_git_credentials() {
+        let identity = VmIdentity::ephemeral();
+        let mut body = json!({
+            "model": "m",
+            "input": [],
+            "client_metadata": {
+                "x-codex-turn-metadata": serde_json::json!({
+                    "request_kind": "turn",
+                    "workspaces": {
+                        "/Users/real/project": {
+                            "associated_remote_urls": {
+                                "origin": "https://user:secret@example.com/repo.git"
+                            },
+                            "latest_git_commit_hash": "abc"
+                        }
+                    }
+                }).to_string()
+            }
+        });
+        assert!(rewrite_client_metadata_value(&mut body, &identity));
+        let snapshot: Value = serde_json::from_str(
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let workspace = snapshot["workspaces"].as_object().unwrap();
+        assert!(!workspace.contains_key("/Users/real/project"));
+        let remote = workspace.values().next().unwrap()["associated_remote_urls"]["origin"]
+            .as_str()
+            .unwrap();
+        assert_eq!(remote, "https://example.com/repo.git");
+    }
+
+    #[test]
+    fn nested_environment_context_replaces_all_host_execution_fields() {
+        let identity = VmIdentity::ephemeral();
+        let text = "<environment_context><environments><environment id=\"one\"><cwd>/host/a</cwd><shell>/bin/fish</shell><shell_version>3</shell_version></environment><environment id=\"two\"><cwd>/host/b</cwd><shell>/bin/fish</shell></environment></environments><current_date>2000-01-01</current_date><timezone>Asia/Tokyo</timezone><network>allowed</network><filesystem>host</filesystem><subagents>host</subagents></environment_context>";
+        let mut body =
+            json!({"input":[{"role":"user","content":[{"type":"input_text","text":text}]}]});
+        assert!(rewrite_client_metadata_value(&mut body, &identity));
+        let rendered = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(rendered.matches("<cwd>/Users/codex</cwd>").count(), 2);
+        assert_eq!(rendered.matches("<shell>/bin/zsh</shell>").count(), 2);
+        assert!(!rendered.contains("id=\"one\"") && !rendered.contains("id=\"two\""));
+        assert!(!rendered.contains("/host/"));
+        assert!(!rendered.contains("shell_version"));
+        assert!(!rendered.contains("<network>"));
+        assert!(!rendered.contains("<filesystem>"));
+        assert!(!rendered.contains("<subagents>"));
+        assert!(!rendered.contains("2000-01-01"));
+    }
+
+    #[test]
     fn scoped_identity_is_stable_and_separates_windows_and_accounts() {
         let root = VmIdentity::ephemeral();
         let first = RequestContext {
@@ -1217,7 +2012,7 @@ mod tests {
         let second_mapping = root.scoped_for_request(&second_window, "http-3");
         assert_eq!(first_mapping.session_id, first_again.session_id);
         assert_eq!(first_mapping.window_id, first_again.window_id);
-        assert_eq!(first_mapping.thread_id, "thread-a");
+        assert_ne!(first_mapping.thread_id, "thread-a");
         assert_ne!(first_mapping.window_id, second_mapping.window_id);
         assert_eq!(first_mapping.session_id, second_mapping.session_id);
 
@@ -1249,7 +2044,7 @@ mod tests {
         let second = root.scoped_for_request(&context, "socket-b");
         assert_eq!(first.session_id, same.session_id);
         assert_eq!(first.window_id, same.window_id);
-        assert_ne!(first.session_id, second.session_id);
+        assert_eq!(first.session_id, second.session_id);
         assert_ne!(first.window_id, second.window_id);
         assert_ne!(first.thread_id, root.thread_id);
     }
@@ -1303,10 +2098,11 @@ mod tests {
     #[test]
     fn user_agent_matches_the_codex_cli_shape() {
         let identity = VmIdentity::ephemeral();
-        assert_eq!(
-            identity.user_agent(),
-            "codex_cli_rs/0.155.0 (Mac OS 15.5.0; arm64) xterm-256color"
-        );
+        assert!(identity.user_agent().starts_with(&format!(
+            "{}/0.155.0 (Mac OS 15.5.0; arm64) ",
+            identity.originator_value()
+        )));
+        assert!(identity.user_agent().contains("xterm-256color"));
         assert_eq!(identity.routing_hint("gpt-6-astra"), "model=gpt-6-astra");
     }
 
@@ -1381,8 +2177,14 @@ mod tests {
             value["client_metadata"]["session_id"],
             json!(identity.session_id)
         );
-        assert_eq!(value["client_metadata"]["thread_id"], json!("thread-1"));
-        assert_eq!(value["client_metadata"]["turn_id"], json!("turn-1"));
+        assert_eq!(
+            value["client_metadata"]["thread_id"],
+            json!(identity.thread_id)
+        );
+        assert_eq!(
+            value["client_metadata"]["turn_id"],
+            json!(identity.map_protocol_id("turn", "turn-1"))
+        );
         assert_eq!(value["model"], json!("m"));
     }
 
@@ -1457,25 +2259,36 @@ mod tests {
             platform: DevicePlatform::Windows,
             environment: None,
             enabled: None,
+            terminal: None,
+            terminal_version: None,
+            terminal_multiplexer: None,
         });
         assert_eq!(identity.platform(), DevicePlatform::Windows);
-        assert_eq!(
-            identity.user_agent(),
-            "codex_cli_rs/0.155.0 (Windows 10.0.26100; x86_64) WindowsTerminal"
-        );
+        assert!(identity.user_agent().starts_with(&format!(
+            "{}/0.155.0 (Windows 10.0.26100; x86_64) ",
+            identity.originator_value()
+        )));
+        assert!(identity.user_agent().contains("WindowsTerminal"));
         identity.apply_profile(VmProfile {
             platform: DevicePlatform::Linux,
             environment: None,
             enabled: None,
+            terminal: None,
+            terminal_version: None,
+            terminal_multiplexer: None,
         });
-        assert_eq!(
-            identity.user_agent(),
-            "codex_cli_rs/0.155.0 (Ubuntu 24.4.0; x86_64) xterm-256color"
-        );
+        assert!(identity.user_agent().starts_with(&format!(
+            "{}/0.155.0 (Ubuntu 24.4.0; x86_64) ",
+            identity.originator_value()
+        )));
+        assert!(identity.user_agent().contains("xterm-256color"));
         identity.apply_profile(VmProfile {
             platform: DevicePlatform::Linux,
             environment: None,
             enabled: Some(false),
+            terminal: None,
+            terminal_version: None,
+            terminal_multiplexer: None,
         });
         assert!(!identity.enabled);
     }
@@ -1491,10 +2304,11 @@ mod tests {
         let installation = identity.installation_id.clone();
         let identity = identity.with_runtime_ids();
         assert_eq!(identity.installation_id, installation);
-        assert_eq!(
-            identity.user_agent(),
-            "codex_cli_rs/0.155.0 (Windows 10.0.26100; x86_64) WindowsTerminal"
-        );
+        assert!(identity.user_agent().starts_with(&format!(
+            "{}/0.155.0 (Windows 10.0.26100; x86_64) ",
+            identity.originator_value()
+        )));
+        assert!(identity.user_agent().contains("WindowsTerminal"));
         // Old files carrying the retired version lock still load.
         let raw = r#"{"installationId":"00000000-0000-4000-8000-000000000000","cliVersion":"0.160.0",
             "originator":"codex_cli_rs","osType":"Linux","osVersion":"6.8.0","arch":"x86_64",
@@ -1523,5 +2337,89 @@ mod tests {
         );
         assert_eq!(parse_cli_version("no version").as_deref(), None);
         assert_eq!(parse_cli_version("codex 0.162\n").as_deref(), None);
+    }
+
+    #[test]
+    fn detects_terminal_program_version_and_multiplexer() {
+        let values = std::collections::HashMap::from([
+            ("TERM_PROGRAM", "iTerm2"),
+            ("TERM_PROGRAM_VERSION", "3.5.1"),
+            ("TMUX", "/tmp/tmux-1000/default,1,0"),
+            ("TERM", "xterm-256color"),
+        ]);
+        let detected =
+            detect_terminal_info_with(|name| values.get(name).map(|value| value.to_string()))
+                .unwrap();
+        assert_eq!(detected.name, "iTerm2");
+        assert_eq!(detected.version, "3.5.1");
+        assert_eq!(detected.multiplexer, "tmux");
+    }
+
+    #[test]
+    fn tmux_term_program_falls_back_to_underlying_terminal() {
+        let values = std::collections::HashMap::from([
+            ("TERM_PROGRAM", "tmux"),
+            ("TERM_PROGRAM_VERSION", "3.4"),
+            ("TMUX", "1"),
+            ("TERM", "screen-256color"),
+        ]);
+        let detected =
+            detect_terminal_info_with(|name| values.get(name).map(|value| value.to_string()))
+                .unwrap();
+        assert_eq!(detected.name, "screen-256color");
+        assert_eq!(detected.version, "");
+        assert_eq!(detected.multiplexer, "tmux/3.4");
+    }
+
+    #[test]
+    fn terminal_version_is_included_in_user_agent_without_changing_legacy_shape() {
+        let mut identity = VmIdentity::ephemeral();
+        identity.terminal = "Ghostty".into();
+        identity.terminal_version = "1.2.3".into();
+        identity.terminal_multiplexer = "zellij/0.40".into();
+        assert!(identity.user_agent().starts_with(&format!(
+            "{}/0.155.0 (Mac OS 15.5.0; arm64) Ghostty/1.2.3",
+            identity.originator_value()
+        )));
+        let value = serde_json::to_value(&identity).unwrap();
+        assert_eq!(value["terminalVersion"], "1.2.3");
+        assert_eq!(value["terminalMultiplexer"], "zellij/0.40");
+    }
+
+    #[test]
+    fn user_agent_suffix_is_sanitized_for_header_use() {
+        assert_eq!(
+            sanitize_user_agent_suffix("  mcp\nclient\u{1f600}  "),
+            "mcp_client_  ".trim()
+        );
+    }
+
+    #[test]
+    fn old_profiles_default_new_terminal_fields() {
+        let raw = r#"{
+            "installationId":"00000000-0000-4000-8000-000000000000",
+            "cliVersion":"0.160.0",
+            "originator":"codex_cli_rs",
+            "osType":"Linux",
+            "osVersion":"6.8.0",
+            "arch":"x86_64",
+            "terminal":"xterm-256color"
+        }"#;
+        let identity: VmIdentity = serde_json::from_str(raw).unwrap();
+        assert_eq!(identity.terminal_version, "");
+        assert_eq!(identity.terminal_multiplexer, "");
+        assert!(!identity.terminal_override);
+    }
+
+    #[test]
+    fn old_vm_profiles_default_optional_terminal_overrides() {
+        let profile: VmProfile =
+            serde_json::from_str(r#"{"platform":"windows","environment":null,"enabled":true}"#)
+                .unwrap();
+        assert_eq!(profile.platform, DevicePlatform::Windows);
+        assert_eq!(profile.enabled, Some(true));
+        assert!(profile.terminal.is_none());
+        assert!(profile.terminal_version.is_none());
+        assert!(profile.terminal_multiplexer.is_none());
     }
 }
