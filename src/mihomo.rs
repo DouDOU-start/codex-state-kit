@@ -661,6 +661,29 @@ fn parse_vmess(rest: &str) -> Option<ProxyNode> {
     if network != "tcp" {
         fields.push(("network", yaml_str(network)));
     }
+    if network == "ws" {
+        let path = json
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .filter(|path| !path.is_empty());
+        let host = json
+            .get("host")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|host| !host.is_empty());
+        if path.is_some() || host.is_some() {
+            let mut ws_opts = serde_yaml::Mapping::new();
+            if let Some(path) = path {
+                ws_opts.insert(yaml_str("path"), yaml_str(path));
+            }
+            if let Some(host) = host {
+                let mut headers = serde_yaml::Mapping::new();
+                headers.insert(yaml_str("Host"), yaml_str(host));
+                ws_opts.insert(yaml_str("headers"), serde_yaml::Value::Mapping(headers));
+            }
+            fields.push(("ws-opts", serde_yaml::Value::Mapping(ws_opts)));
+        }
+    }
     if json.get("tls").and_then(JsonValue::as_str) == Some("tls") {
         fields.push(("tls", serde_yaml::Value::Bool(true)));
         if let Some(sni) = json
@@ -1228,6 +1251,11 @@ proxies:
     port: 8388
     cipher: aes-256-gcm
     password: secret
+    network: ws
+    ws-opts:
+      path: /chat
+      headers:
+        Host: cdn.example
   - name: alpha
     type: trojan
     server: example.test
@@ -1242,6 +1270,9 @@ proxies:
         assert!(config.contains("mixed-port"));
         assert!(config.contains("name: Kit"));
         assert!(config.contains("MATCH,Kit"));
+        assert!(config.contains("ws-opts:"));
+        assert!(config.contains("path: /chat"));
+        assert!(config.contains("Host: cdn.example"));
         assert!(!config.contains("tun:"));
         assert!(config.contains("password: secret"));
     }
@@ -1261,7 +1292,7 @@ proxies:
     #[test]
     fn parses_vmess_and_rejects_empty() {
         let payload = base64::engine::general_purpose::STANDARD.encode(
-            br#"{"add":"vmess.example","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"ws","tls":"tls","ps":"edge"}"#,
+            br#"{"add":"vmess.example","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"ws","tls":"tls","host":"cdn.example","path":"/chat","ps":"edge"}"#,
         );
         let nodes = parse_subscription(&format!("vmess://{payload}"))
             .unwrap()
@@ -1270,6 +1301,13 @@ proxies:
         let text = serde_yaml::to_string(&nodes[0].spec).unwrap();
         assert!(text.contains("type: vmess"));
         assert!(text.contains("network: ws"));
+        assert!(text.contains("ws-opts:"));
+        assert!(text.contains("path: /chat"));
+        assert!(text.contains("Host: cdn.example"));
+        let config = render_config(&nodes_only(nodes), 17891, "127.0.0.1:17892", "secret");
+        assert!(config.contains("ws-opts:"));
+        assert!(config.contains("path: /chat"));
+        assert!(config.contains("Host: cdn.example"));
         assert!(parse_subscription("   ").is_err());
         assert!(parse_subscription("not a subscription").is_err());
     }
