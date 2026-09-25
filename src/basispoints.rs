@@ -221,7 +221,7 @@ fn developer_catalog(tools: &HashMap<String, ToolSpec>) -> String {
         entries.push(json!({"name": key, "tool": tool.name, "namespace": tool.namespace, "type": tool.kind, "parameters": tool.schema, "description": tool.description, "format": tool.format}));
     }
     format!(
-        "This request is relayed through the Basispoints Responses API. Client tools are available through the native {TRANSPORT_NAME} transport; it never executes OfficeJS. Call {TRANSPORT_NAME} exactly once per client tool request. Its code field is JSON text containing one object with name and arguments (or input for custom tools). Do not put JavaScript or another transport envelope in code. Available client tools: {}",
+        "This request is relayed through the Basispoints Responses API. Client tools are available through the native {TRANSPORT_NAME} transport; it never executes OfficeJS. Call {TRANSPORT_NAME} exactly once per client tool request. Its code field is JSON text containing one object with tool and args (args is an object for function tools and raw text for custom tools). Do not put JavaScript or another transport envelope in code. Available client tools: {}",
         serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into())
     )
 }
@@ -285,10 +285,15 @@ fn fallback_transport_call(item: &Value) -> Value {
     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
     let call_id = string_field(item.get("call_id")).unwrap_or_else(|| "call_unknown".into());
     let mut inner = Map::new();
-    inner.insert("name".into(), json!(name));
+    let tool_name = item
+        .get("namespace")
+        .and_then(Value::as_str)
+        .map(|namespace| format!("{namespace}.{name}"))
+        .unwrap_or_else(|| name.to_owned());
+    inner.insert("tool".into(), json!(tool_name));
     if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
         inner.insert(
-            "input".into(),
+            "args".into(),
             item.get("input").cloned().unwrap_or_else(|| json!("")),
         );
     } else {
@@ -297,7 +302,7 @@ fn fallback_transport_call(item: &Value) -> Value {
             .and_then(Value::as_str)
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
             .unwrap_or_else(|| json!({}));
-        inner.insert("arguments".into(), arguments);
+        inner.insert("args".into(), arguments);
     }
     let outer = json!({
         "summary": format!("Run client tool {name}"),
@@ -811,7 +816,18 @@ pub async fn transform_event(
             let guard = state.lock().await;
             let lineage_state = guard.lineages.get(lineage)?;
             (
-                lineage_state.tools.get(&name)?.clone(),
+                lineage_state
+                    .tools
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| ToolSpec {
+                        name: name.clone(),
+                        kind: "function".into(),
+                        namespace: None,
+                        schema: json!({}),
+                        description: Value::Null,
+                        format: Value::Null,
+                    }),
                 string_field(native.get("call_id")).unwrap_or_else(|| "call_unknown".into()),
             )
         };
@@ -961,6 +977,29 @@ mod tests {
             .unwrap()
             .contains("get_weather"));
         assert_eq!(body["metadata"]["agent_iteration"], "1");
+    }
+
+    #[tokio::test]
+    async fn fallback_transport_uses_plugin_tool_args_protocol() {
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let request = json!({
+            "input":[{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"}],
+            "tools":[{"type":"function","name":"get_weather","parameters":{"type":"object"}}]
+        });
+        let prepared = prepare_request(&state, &serde_json::to_vec(&request).unwrap(), None)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let call = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        let outer: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        let inner: Value = serde_json::from_str(outer["code"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["tool"], "get_weather");
+        assert_eq!(inner["args"]["city"], "Tokyo");
     }
 
     #[tokio::test]
