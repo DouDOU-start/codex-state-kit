@@ -323,9 +323,14 @@ fn normalize_message_item(item: &Value) -> Option<Value> {
         return None;
     }
     let role = if role == "system" { "developer" } else { &role };
+    let text_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
     let mut content = Vec::new();
     match item.get("content") {
-        Some(Value::String(text)) => content.push(json!({"type":"input_text","text":text})),
+        Some(Value::String(text)) => content.push(json!({"type":text_type,"text":text})),
         Some(Value::Array(parts)) => {
             for part in parts {
                 let Some(kind) = part.get("type").and_then(Value::as_str) else {
@@ -334,7 +339,7 @@ fn normalize_message_item(item: &Value) -> Option<Value> {
                 match kind {
                     "input_text" | "output_text" => {
                         if let Some(text) = part.get("text").and_then(Value::as_str) {
-                            content.push(json!({"type":"input_text","text":text}));
+                            content.push(json!({"type":text_type,"text":text}));
                         }
                     }
                     "input_image" | "image" => {
@@ -349,7 +354,7 @@ fn normalize_message_item(item: &Value) -> Option<Value> {
                             .map(|url| format!(" URL: {url}"))
                             .unwrap_or_default();
                         content.push(json!({
-                            "type":"input_text",
+                            "type":text_type,
                             "text":format!("[Image input is unavailable on the Basispoints Excel upstream.{hint}]")
                         }));
                     }
@@ -1013,6 +1018,28 @@ mod tests {
         assert!(content.iter().all(|part| part["type"] == "input_text"));
         assert!(content[1]["text"].as_str().unwrap().contains("Image input"));
         assert!(serde_json::to_string(&body).unwrap().contains("AAAA") == false);
+    }
+
+    #[tokio::test]
+    async fn uses_output_text_for_assistant_history() {
+        let state = Arc::new(Mutex::new(BpsState::default()));
+        let request = json!({
+            "input":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}
+            ]
+        });
+        let prepared = prepare_request(&state, &serde_json::to_vec(&request).unwrap(), None)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let assistant = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["role"] == "assistant")
+            .unwrap();
+        assert_eq!(assistant["content"][0]["type"], "output_text");
     }
 
     #[test]
