@@ -13,6 +13,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::state::AppState;
+use crate::ui_language::UiLanguage;
 
 pub const TRAY_ID: &str = "main";
 /// Emitted after the tray switched accounts so the window can reload.
@@ -48,11 +49,12 @@ async fn codex_home<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
 }
 
 fn build_menu<R: Runtime>(app: &AppHandle<R>, accounts: &[AccountView]) -> tauri::Result<Menu<R>> {
+    let language = app.state::<UiLanguage>();
     let menu = Menu::new(app)?;
     menu.append(&MenuItem::with_id(
         app,
         "title",
-        "切换账号",
+        language.text("切换账号", "Сменить аккаунт"),
         false,
         None::<&str>,
     )?)?;
@@ -60,7 +62,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, accounts: &[AccountView]) -> tauri
         menu.append(&MenuItem::with_id(
             app,
             "empty",
-            "还没有保存的账号",
+            language.text("还没有保存的账号", "Нет сохранённых аккаунтов"),
             false,
             None::<&str>,
         )?)?;
@@ -70,7 +72,10 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, accounts: &[AccountView]) -> tauri
         let text = if account.usable {
             name
         } else {
-            format!("{name}（凭据失效）")
+            format!(
+                "{name}{}",
+                language.text("（凭据失效）", " (нужна авторизация)")
+            )
         };
         menu.append(&CheckMenuItem::with_id(
             app,
@@ -85,14 +90,14 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, accounts: &[AccountView]) -> tauri
     menu.append(&MenuItem::with_id(
         app,
         SHOW_ID,
-        "显示主窗口",
+        language.text("显示主窗口", "Показать окно"),
         true,
         None::<&str>,
     )?)?;
     menu.append(&MenuItem::with_id(
         app,
         QUIT_ID,
-        format!("退出 {APP_NAME}"),
+        format!("{} {APP_NAME}", language.text("退出", "Выйти из")),
         true,
         None::<&str>,
     )?)?;
@@ -142,13 +147,18 @@ fn switch_from_tray<R: Runtime>(app: &AppHandle<R>, account_id: String) {
         let home = codex_home(&app).await;
         let proxy = app.state::<AppState>().proxy.clone();
         let payload = match proxy.switch_account(&home, &account_id).await {
-            Ok(status) => AccountsChanged {
-                ok: true,
-                message: format!(
-                    "已切换到 {}，后续请求立即使用该账号",
-                    status.email.unwrap_or(account_id)
-                ),
-            },
+            Ok(status) => {
+                let name = status.email.unwrap_or(account_id);
+                let chinese = format!("已切换到 {name}，后续请求立即使用该账号");
+                let russian = format!("Выбран {name}. Новые запросы сразу используют этот аккаунт");
+                AccountsChanged {
+                    ok: true,
+                    message: app
+                        .state::<UiLanguage>()
+                        .text(&chinese, &russian)
+                        .to_string(),
+                }
+            }
             Err(error) => AccountsChanged {
                 ok: false,
                 message: format!("{error:#}"),

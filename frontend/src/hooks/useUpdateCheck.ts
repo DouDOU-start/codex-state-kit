@@ -1,3 +1,4 @@
+import { t } from "@/lib/i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isTauri } from "@/lib/api";
 import { checkUpdate, openReleasePage, type UpdateInfo } from "@/lib/update";
@@ -18,7 +19,7 @@ export function useUpdateCheck() {
 
   const check = useCallback(async (manual = false) => {
     if (!isTauri) {
-      if (manual) setMessage("浏览器预览不检查更新，请在桌面应用中使用，或直接查看发布页面。");
+      if (manual) setMessage(t("浏览器预览不检查更新，请在桌面应用中使用，或直接查看发布页面。"));
       return;
     }
     if (busy.current || installer.current || installing.current) return;
@@ -32,11 +33,11 @@ export function useUpdateCheck() {
       if (manual) {
         setDismissed(null);
         setMessage(result.available ? null : result.latestVersion
-          ? `当前 v${result.currentVersion}，暂无更新（最新正式版 v${result.latestVersion}）。`
-          : "尚无可用的正式发布版本。");
+          ? t("当前 v{0}，暂无更新（最新正式版 v{1}）。", [result.currentVersion, result.latestVersion])
+          : t("尚无可用的正式发布版本。"));
       }
     } catch (error) {
-      if (manual && alive.current) setMessage(`检查更新失败：${String(error)}`);
+      if (manual && alive.current) setMessage(t("检查更新失败：{0}", [String(error)]));
     } finally {
       busy.current = false;
       if (alive.current) setChecking(false);
@@ -54,7 +55,7 @@ export function useUpdateCheck() {
 
   const open = useCallback(async (tag?: string | null) => {
     try { await openReleasePage(tag); }
-    catch { if (alive.current) setMessage("无法打开浏览器，请访问 github.com/DouDOU-start/codex-state-kit/releases。"); }
+    catch { if (alive.current) setMessage(t("无法打开浏览器，请访问 github.com/DouDOU-start/codex-state-kit/releases。")); }
   }, []);
 
   useEffect(() => () => {
@@ -70,8 +71,8 @@ export function useUpdateCheck() {
     let update: Update | null = null;
     try {
       update = await checkInstaller({ timeout: 15_000 });
-      if (!update) throw new Error("当前平台暂无可安装的更新，请稍后重试或前往发布页面。");
-      if (update.version !== info?.latestVersion) throw new Error("发布版本已变化，请重新检查更新。");
+      if (!update) throw new Error(t("当前平台暂无可安装的更新，请稍后重试或前往发布页面。"));
+      if (update.version !== info?.latestVersion) throw new Error(t("发布版本已变化，请重新检查更新。"));
       let received = 0;
       let total = 0;
       await update.download((event) => {
@@ -90,7 +91,7 @@ export function useUpdateCheck() {
       await update?.close().catch(() => {});
       if (alive.current) {
         setPhase("idle");
-        setMessage(`自动更新包下载或校验失败：${String(error)} 可前往发布页面手动安装。`);
+        setMessage(t("自动更新包下载或校验失败：{0} 可前往发布页面手动安装。", [String(error)]));
       }
     } finally { busy.current = false; }
   }, [info?.latestVersion]);
@@ -107,13 +108,13 @@ export function useUpdateCheck() {
     } catch (error) {
       let recoveryError = "";
       try { await invoke("resume_after_update_failure"); }
-      catch { recoveryError = " 服务恢复失败，请重新启动应用。"; }
+      catch { recoveryError = t(" 服务恢复失败，请重新启动应用。"); }
       await installer.current?.close().catch(() => {});
       installer.current = null;
       installing.current = false;
       if (alive.current) {
         setPhase("idle");
-        setMessage(`安装更新失败：${String(error)}${recoveryError}`);
+        setMessage(t("安装更新失败：{0}{1}", [String(error), recoveryError]));
       }
     }
   }, []);

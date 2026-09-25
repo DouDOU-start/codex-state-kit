@@ -1,3 +1,5 @@
+import { t } from "@/lib/i18n";
+import { useLocale } from "@/hooks/useLocale";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.js";
 import { Select } from "@/components/Select";
 
@@ -19,17 +21,18 @@ interface RefreshControlProps {
 
 /** A manual refresh button next to the auto-refresh interval. */
 export function RefreshControl({ loading, onRefresh, intervalMs, onIntervalChange }: RefreshControlProps) {
+  useLocale();
   return (
     <div className="refresh-control">
       <button className="billing-panel__refresh" type="button" disabled={loading} onClick={onRefresh}>
         <RefreshCw size={13} className={loading ? "is-spinning" : undefined} />
-        {loading ? "读取中" : "刷新"}
+        {loading ? t("读取中") : t("刷新")}
       </button>
       <Select
         variant="compact"
-        ariaLabel="自动刷新"
+        ariaLabel={t("自动刷新")}
         value={String(intervalMs)}
-        options={REFRESH_OPTIONS}
+        options={REFRESH_OPTIONS.map((option) => ({ ...option, label: t(option.label) }))}
         onChange={(value) => onIntervalChange(Number(value))}
       />
     </div>

@@ -2,6 +2,7 @@ mod commands;
 mod error;
 mod state;
 mod tray;
+mod ui_language;
 mod window_shape;
 
 use tauri::{Manager, RunEvent, WindowEvent};
@@ -12,6 +13,7 @@ use state::AppState;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(ui_language::UiLanguage::default())
         // Must be registered first: a second launch exits here before it can
         // re-attach Codex, back up auth.json or bind the proxy port again,
         // and the running Kit's window is brought to the front instead.
@@ -63,6 +65,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::set_ui_language,
             commands::get_status,
             commands::get_billing_summary,
             commands::get_billing_records,

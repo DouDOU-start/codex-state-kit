@@ -1,3 +1,5 @@
+import { t } from "@/lib/i18n";
+import { useLocale } from "@/hooks/useLocale";
 import { useEffect, useMemo, useRef, useState } from "react";
 import X from "lucide-react/dist/esm/icons/x.js";
 import type { ProxyGroup } from "@/types";
@@ -14,6 +16,7 @@ export function MihomoGroupPanel({
   onSelect: (node: string) => void;
   onProbe: () => void;
 }) {
+  useLocale();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -39,12 +42,12 @@ export function MihomoGroupPanel({
   return (
     <div className="mihomo-picker">
       <div className="mihomo-picker__current">
-        <span>当前节点</span>
-        <strong>{group.now || "未选择"}</strong>
+        <span>{t("当前节点")}</span>
+        <strong>{group.now || t("未选择")}</strong>
         <small>
           {current?.nodeType ?? group.groupType}
           {current?.delay != null ? ` · ${current.delay} ms` : ""}
-          {` · ${group.all.length} 个`}
+          {t(" · {0} 个", [group.all.length])}
         </small>
       </div>
       <div className="mihomo-picker__actions">
@@ -57,8 +60,7 @@ export function MihomoGroupPanel({
             setOpen(true);
           }}
         >
-          选择节点
-        </button>
+          {t("选择节点")} </button>
         <LatencyProbe
           probing={probing}
           disabled={!group.now}
@@ -70,7 +72,7 @@ export function MihomoGroupPanel({
         <dialog
           ref={dialogRef}
           className="node-picker"
-          aria-label="选择节点"
+          aria-label={t("选择节点")}
           onCancel={(event) => {
             event.preventDefault();
             setOpen(false);
@@ -81,26 +83,26 @@ export function MihomoGroupPanel({
         >
           <header className="node-picker__header">
             <div>
-              <h2>选择节点</h2>
-              <p>{group.name} · {group.all.length} 个</p>
+              <h2>{t("选择节点")}</h2>
+              <p>{group.name} · {group.all.length}  {t("个")}</p>
             </div>
-            <button type="button" className="network-log-close" aria-label="关闭" onClick={() => setOpen(false)}>
+            <button type="button" className="network-log-close" aria-label={t("关闭")} onClick={() => setOpen(false)}>
               <X size={16} />
             </button>
           </header>
           <label className="node-picker__search">
-            <span>筛选</span>
+            <span>{t("筛选")}</span>
             <input
               type="text"
               spellCheck={false}
               autoComplete="off"
-              placeholder="节点名称"
+              placeholder={t("节点名称")}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
           </label>
           <div className="node-picker__list">
-            {nodes.length === 0 ? <p className="node-picker__empty">没有匹配的节点</p> : nodes.map((node) => {
+            {nodes.length === 0 ? <p className="node-picker__empty">{t("没有匹配的节点")}</p> : nodes.map((node) => {
               const active = node.name === group.now;
               return (
                 <button
@@ -116,7 +118,7 @@ export function MihomoGroupPanel({
                   <small>
                     {node.nodeType}
                     {node.delay != null ? ` · ${node.delay} ms` : ""}
-                    {active ? " · 当前" : ""}
+                    {active ? t(" · 当前") : ""}
                   </small>
                 </button>
               );

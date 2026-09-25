@@ -1,3 +1,5 @@
+import { t } from "@/lib/i18n";
+import { useLocale } from "@/hooks/useLocale";
 import ChevronLeft from "lucide-react/dist/esm/icons/chevron-left.js";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right.js";
 import { Select } from "@/components/Select";
@@ -30,21 +32,22 @@ function pageItems(page: number, pageCount: number): (number | null)[] {
 }
 
 export function Pager({ page, pageSize, total, disabled, onPage, onPageSize }: PagerProps) {
+  useLocale();
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   return (
-    <nav className="pager" aria-label="分页">
+    <nav className="pager" aria-label={t("分页")}>
       <div className="pager__summary">
-        <span>共 {total} 条</span>
+        <span>{t("共 {0} 条", [total])}</span>
         <Select
           variant="compact"
-          ariaLabel="每页条数"
+          ariaLabel={t("每页条数")}
           value={String(pageSize)}
-          options={PAGE_SIZES.map((size) => ({ value: String(size), label: `${size} 条/页` }))}
+          options={PAGE_SIZES.map((size) => ({ value: String(size), label: t("{0} 条/页", [size]) }))}
           onChange={(value) => onPageSize(Number(value))}
         />
       </div>
       <div className="pager__pages">
-        <button type="button" className="pager__step" aria-label="上一页" disabled={disabled || page === 0} onClick={() => onPage(page - 1)}>
+        <button type="button" className="pager__step" aria-label={t("上一页")} disabled={disabled || page === 0} onClick={() => onPage(page - 1)}>
           <ChevronLeft size={14} />
         </button>
         {pageItems(page, pageCount).map((item, index) => item === null ? (
@@ -61,7 +64,7 @@ export function Pager({ page, pageSize, total, disabled, onPage, onPageSize }: P
             {item + 1}
           </button>
         ))}
-        <button type="button" className="pager__step" aria-label="下一页" disabled={disabled || page + 1 >= pageCount} onClick={() => onPage(page + 1)}>
+        <button type="button" className="pager__step" aria-label={t("下一页")} disabled={disabled || page + 1 >= pageCount} onClick={() => onPage(page + 1)}>
           <ChevronRight size={14} />
         </button>
       </div>

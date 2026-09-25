@@ -1,3 +1,5 @@
+import { t } from "@/lib/i18n";
+import { useLocale } from "@/hooks/useLocale";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import Check from "lucide-react/dist/esm/icons/check.js";
 import ChevronDown from "lucide-react/dist/esm/icons/chevron-down.js";
@@ -35,12 +37,13 @@ export function Select({
   options,
   onChange,
   ariaLabel,
-  placeholder = "请选择",
+  placeholder = t("请选择"),
   disabled = false,
   variant = "field",
   icon,
   className,
 }: SelectProps) {
+  useLocale();
   const id = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLUListElement>(null);

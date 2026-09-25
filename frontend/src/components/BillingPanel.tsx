@@ -1,3 +1,5 @@
+import { t, getLocale } from "@/lib/i18n";
+import { useLocale } from "@/hooks/useLocale";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Select } from "@/components/Select";
 import { useNotice } from "@/components/Notifier";
@@ -47,14 +49,14 @@ function formatMoney(costNanos: number | null | undefined): string {
   const amount = Number(costNanos) / 1_000_000_000;
   if (!Number.isFinite(amount)) return "—";
   const digits = amount >= 100 ? 2 : amount >= 1 ? 4 : 6;
-  return `$${amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: digits })}`;
+  return `$${amount.toLocaleString(getLocale(), { minimumFractionDigits: 2, maximumFractionDigits: digits })}`;
 }
 
 function formatDay(iso?: string | null): string {
   if (!iso) return "—";
   const date = new Date(iso);
   if (Number.isNaN(date.valueOf())) return iso.slice(0, 10);
-  return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
+  return date.toLocaleDateString(getLocale());
 }
 
 /** Show failed and active requests separately from missing usage and prices. */
@@ -65,17 +67,17 @@ function unpricedNote(totals?: BillingUsageTotals): string {
   const missing = Math.max(0, totals.missingUsageCount ?? (totals.unknownUsageCount - errors - pending));
   const unpriced = Math.max(0, totals.unpricedCount - totals.unknownUsageCount);
   const parts: string[] = [];
-  if (errors > 0) parts.push(`${errors} 条转发错误`);
-  if (pending > 0) parts.push(`${pending} 条处理中`);
-  if (missing > 0) parts.push(`${missing} 条缺少用量`);
-  if (unpriced > 0) parts.push(`${unpriced} 条价格未匹配`);
+  if (errors > 0) parts.push(t("{0} 条转发错误", [errors]));
+  if (pending > 0) parts.push(t("{0} 条处理中", [pending]));
+  if (missing > 0) parts.push(t("{0} 条缺少用量", [missing]));
+  if (unpriced > 0) parts.push(t("{0} 条价格未匹配", [unpriced]));
   return parts.length ? ` · ${parts.join(" · ")}` : "";
 }
 
 function formatTokens(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
-  return new Intl.NumberFormat("zh-CN").format(value);
+  return new Intl.NumberFormat(getLocale()).format(value);
 }
 
 function formatDuration(ms: number): string {
@@ -95,6 +97,7 @@ function tokenSum(records: BillingRecord[]): number {
 }
 
 export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccounts, active, refreshMs, onRefreshMsChange }: BillingPanelProps) {
+  useLocale();
   const [summary, setSummary] = useState<BillingSummary | null>(null);
   /** All-time totals, for the cumulative cost. */
   const [lifetime, setLifetime] = useState<BillingSummary | null>(null);
@@ -139,9 +142,9 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
   }, [currentAccountId]);
   useNotice("billing-error", error, () => ({
     kind: "error",
-    title: "读取使用统计失败",
+    title: t("读取使用统计失败"),
     message: error,
-    actions: [{ label: "重试", primary: true, onClick: () => void reload() }],
+    actions: [{ label: t("重试"), primary: true, onClick: () => void reload() }],
   }));
 
   useEffect(() => {
@@ -187,7 +190,7 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
   const models = useMemo(() => {
     const buckets = new Map<string, { count: number; costNanos: number | null }>();
     for (const record of mine) {
-      const name = record.sentModel || record.requestedModel || "未知模型";
+      const name = record.sentModel || record.requestedModel || "";
       const current = buckets.get(name) ?? { count: 0, costNanos: null };
       current.count += 1;
       if (record.costNanos != null) current.costNanos = (current.costNanos ?? 0) + record.costNanos;
@@ -207,17 +210,17 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
   const dailyCost = activeDays ? recentCost / activeDays : null;
 
   return (
-    <section className="usage-dash panel" aria-label="使用统计">
+    <section className="usage-dash panel" aria-label={t("使用统计")}>
       <header className="usage-dash__header">
         <div>
-          <h2>使用统计</h2>
-          <p>{chosen ? `${accountLabel(chosen.accountId, chosen.email || (chosen.accountId === currentAccountId ? currentAccountEmail : null), savedAccounts)} · 近 30 天用量 · ChatGPT` : "近 30 天用量"}{!isTauri ? " · 浏览器示例" : ""}</p>
+          <h2>{t("使用统计")}</h2>
+          <p>{chosen ? t("{0} · 近 30 天用量 · ChatGPT", [accountLabel(chosen.accountId, chosen.email || (chosen.accountId === currentAccountId ? currentAccountEmail : null), savedAccounts)]) : t("近 30 天用量")}{!isTauri ? t(" · 浏览器示例") : ""}</p>
         </div>
         <div className="usage-dash__tools">
           {accounts.length > 1 ? (
             <Select
               variant="compact"
-              ariaLabel="统计账号"
+              ariaLabel={t("统计账号")}
               value={chosen?.accountId ?? ""}
               options={accounts.map((account) => ({ value: account.accountId, label: accountLabel(account.accountId, account.email, savedAccounts) }))}
               onChange={setSelectedAccountId}
@@ -227,68 +230,68 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
         </div>
       </header>
       {error ? (
-        <div className="billing-panel__empty" role="status">使用统计暂不可用</div>
+        <div className="billing-panel__empty" role="status">{t("使用统计暂不可用")}</div>
       ) : (
         <>
           <div className="usage-dash__cards">
             <article>
-              <span>累计成本</span>
+              <span>{t("累计成本")}</span>
               <strong>{formatMoney(allTime ? allTime.total.pricedCostNanos : null)}</strong>
-              <small>{allTime ? `自 ${formatDay(allTime.firstSeenAt)} · ${new Intl.NumberFormat("zh-CN").format(allTime.total.requestCount)} 次请求${unpricedNote(allTime.total)}` : "还没有记录"}</small>
+              <small>{allTime ? t("自 {0} · {1} 次请求{2}", [formatDay(allTime.firstSeenAt), new Intl.NumberFormat(getLocale()).format(allTime.total.requestCount), unpricedNote(allTime.total)]) : t("还没有记录")}</small>
             </article>
-            <article><span>30 天总成本</span><strong>{formatMoney(recentCost)}</strong><small>{`已计价请求${unpricedNote(selected?.total)}`}</small></article>
-            <article><span>30 天总请求</span><strong>{new Intl.NumberFormat("zh-CN").format(requestCount)}</strong><small>累计调用</small></article>
-            <article><span>日均成本</span><strong>{formatMoney(dailyCost)}</strong><small>基于 {activeDays} 个有数据的日期</small></article>
-            <article><span>日均请求</span><strong>{dailyRequests ? dailyRequests.toFixed(0) : "0"}</strong><small>日均使用量</small></article>
+            <article><span>{t("30 天总成本")}</span><strong>{formatMoney(recentCost)}</strong><small>{t("已计价请求{0}", [unpricedNote(selected?.total)])}</small></article>
+            <article><span>{t("30 天总请求")}</span><strong>{new Intl.NumberFormat(getLocale()).format(requestCount)}</strong><small>{t("累计调用")}</small></article>
+            <article><span>{t("日均成本")}</span><strong>{formatMoney(dailyCost)}</strong><small>{t("基于 {0} 个有数据的日期", [activeDays])}</small></article>
+            <article><span>{t("日均请求")}</span><strong>{dailyRequests ? dailyRequests.toFixed(0) : "0"}</strong><small>{t("日均使用量")}</small></article>
           </div>
           <div className="usage-dash__columns">
             <section>
-              <h3>今日</h3>
+              <h3>{t("今日")}</h3>
               <dl>
-                <div><dt>成本</dt><dd>{formatMoney(sumNanos(today))}</dd></div>
-                <div><dt>请求</dt><dd>{today.length}</dd></div>
+                <div><dt>{t("成本")}</dt><dd>{formatMoney(sumNanos(today))}</dd></div>
+                <div><dt>{t("请求")}</dt><dd>{today.length}</dd></div>
                 <div><dt>Tokens</dt><dd>{formatTokens(tokenSum(today))}</dd></div>
               </dl>
             </section>
             <section>
-              <h3>成本最高日</h3>
+              <h3>{t("成本最高日")}</h3>
               <dl>
-                <div><dt>日期</dt><dd>{peak?.label ?? "—"}</dd></div>
-                <div><dt>成本</dt><dd>{formatMoney(peak?.costNanos)}</dd></div>
-                <div><dt>请求</dt><dd>{peak?.requests ?? 0}</dd></div>
+                <div><dt>{t("日期")}</dt><dd>{peak?.label ?? "—"}</dd></div>
+                <div><dt>{t("成本")}</dt><dd>{formatMoney(peak?.costNanos)}</dd></div>
+                <div><dt>{t("请求")}</dt><dd>{peak?.requests ?? 0}</dd></div>
               </dl>
             </section>
             <section>
-              <h3>性能与活跃</h3>
+              <h3>{t("性能与活跃")}</h3>
               <dl>
-                <div><dt>累计 Tokens</dt><dd>{formatTokens(tokenSum(mine))}</dd></div>
-                <div><dt>平均耗时</dt><dd>{averageMs == null ? "—" : formatDuration(averageMs)}</dd></div>
-                <div><dt>活跃天数</dt><dd>{activeDays} / 30</dd></div>
+                <div><dt>{t("累计 Tokens")}</dt><dd>{formatTokens(tokenSum(mine))}</dd></div>
+                <div><dt>{t("平均耗时")}</dt><dd>{averageMs == null ? "—" : formatDuration(averageMs)}</dd></div>
+                <div><dt>{t("活跃天数")}</dt><dd>{activeDays} / 30</dd></div>
               </dl>
             </section>
           </div>
           <div className="usage-dash__bottom">
             <section>
-              <h3>用量趋势</h3>
+              <h3>{t("用量趋势")}</h3>
               {days.length ? (
                 <div className="usage-chart" aria-hidden="true">
                   {days.map((day) => (
-                    <div key={day.label} className="usage-chart__col" title={`${day.label} · ${day.requests} 次 · ${formatMoney(day.costNanos)}`}>
+                    <div key={day.label} className="usage-chart__col" title={t("{0} · {1} 次 · {2}", [day.label, day.requests, formatMoney(day.costNanos)])}>
                       <span style={{ height: `${Math.max(8, Math.round((day.requests / maxRequests) * 72))}px` }} />
                       <small>{day.label.slice(3)}</small>
                     </div>
                   ))}
                 </div>
-              ) : <p className="usage-dash__empty">还没有可绘制的用量。</p>}
+              ) : <p className="usage-dash__empty">{t("还没有可绘制的用量。")}</p>}
             </section>
             <section>
-              <h3>模型分布</h3>
+              <h3>{t("模型分布")}</h3>
               {models.length ? models.slice(0, 5).map((model) => (
                 <div key={model.name} className="usage-model">
-                  <div><strong>{model.name}</strong><span>{model.count} · {formatMoney(model.costNanos)}</span></div>
+                   <div><strong>{model.name || t("未知模型")}</strong><span>{model.count} · {formatMoney(model.costNanos)}</span></div>
                   <i style={{ width: `${model.width}%` }} />
                 </div>
-              )) : <p className="usage-dash__empty">完成请求后按模型汇总。</p>}
+              )) : <p className="usage-dash__empty">{t("完成请求后按模型汇总。")}</p>}
             </section>
           </div>
         </>

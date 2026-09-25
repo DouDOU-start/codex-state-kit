@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -11,13 +11,14 @@ import ts from "typescript";
 const output = mkdtempSync(join(tmpdir(), "codex-state-kit-i18n-"));
 writeFileSync(join(output, "package.json"), '{"type":"commonjs"}\n');
 const program = ts.createProgram([
-  "frontend/src/lib/i18n.ts", "frontend/src/locales/ru.ts",
+  "frontend/src/lib/i18n.ts", "frontend/src/locales/ru.ts", "frontend/src/lib/accountNetwork.ts",
 ], { outDir: output, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, skipLibCheck: true });
 const emitted = program.emit();
 assert.equal(emitted.emitSkipped, false);
 const require = createRequire(import.meta.url);
 const { t, getLocale, setLocale, subscribeLocale, readLocale, LOCALE_STORAGE_KEY } = require(join(output, "lib/i18n.js"));
 const { ru } = require(join(output, "locales/ru.js"));
+const { accountNetwork } = require(join(output, "lib/accountNetwork.js"));
 after(() => rmSync(output, { recursive: true, force: true }));
 
 test("preserves Chinese by default and switches both ways", () => {
@@ -73,4 +74,37 @@ test("Russian translations are nonempty and preserve every interpolation slot", 
     assert.ok(translated.trim(), source);
     assert.deepEqual(translated.match(/\{\d+\}/g)?.sort() ?? [], source.match(/\{\d+\}/g)?.sort() ?? [], source);
   }
+});
+
+test("all literal translation calls have Russian entries and matching parameters", () => {
+  for (const name of readdirSync("frontend/src", { recursive: true })) {
+    if (!/\.tsx?$/.test(name)) continue;
+    const file = join("frontend/src", name);
+    const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+    function visit(node) {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "t") {
+        const [key, values] = node.arguments;
+        if (key && ts.isStringLiteral(key)) {
+          assert.ok(Object.hasOwn(ru, key.text), `${file}: ${key.text}`);
+          const indices = [...key.text.matchAll(/\{(\d+)\}/g)].map(match => Number(match[1]));
+          if (indices.length) {
+            assert.ok(values && ts.isArrayLiteralExpression(values), key.text);
+            assert.equal(values.elements.length, Math.max(...indices) + 1, key.text);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(source);
+  }
+});
+
+test("account network labels preserve node names, addresses and unknown backend formats", () => {
+  setLocale("ru");
+  assert.equal(accountNetwork("手动代理 · 未配置"), "Ручной прокси · Не настроен");
+  assert.equal(accountNetwork("手动代理 · socks5://proxy.example:1234"), "Ручной прокси · socks5://proxy.example:1234");
+  assert.equal(accountNetwork("订阅节点 · Kit → 香港 01"), "Узлы подписки · Kit → 香港 01");
+  assert.equal(accountNetwork("custom · 中文"), "custom · 中文");
+  setLocale("zh-CN");
+  assert.equal(accountNetwork("手动代理 · 未配置"), "手动代理 · 未配置");
 });
