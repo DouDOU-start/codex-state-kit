@@ -9,12 +9,12 @@
 //! 闲置一段时间后关闭。空闲时被对端断开的连接，在下一轮发送前后自动重连重发。
 //! 握手失败后退避一段时间，期间 HTTP 请求直接走 SSE，不再逐个尝试 WebSocket。
 //!
-//! tungstenite 0.26 的 `WebSocketConfig` 没有 permessage-deflate，这里用默认配置。
+//! Responses WebSocket 握手启用上游 Codex 使用的 `permessage-deflate`。
 
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,10 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, Notify, OwnedMutexGuard};
+use tokio_tungstenite::tungstenite::extensions::{
+    compression::deflate::DeflateConfig, ExtensionsConfig,
+};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tokio_tungstenite::WebSocketStream;
 use url::Url;
@@ -44,6 +48,15 @@ const BACKOFF_MAX: Duration = Duration::from_secs(120);
 /// 每条连接记住它产生的最近这么多个响应 ID，用来把续跑送回原连接。
 const REMEMBERED_RESPONSES: usize = 256;
 const OPENAI_BETA: &str = "responses_websockets=2026-02-06";
+
+fn websocket_config() -> WebSocketConfig {
+    let mut extensions = ExtensionsConfig::default();
+    extensions.permessage_deflate = Some(DeflateConfig::default());
+
+    let mut config = WebSocketConfig::default();
+    config.extensions = extensions;
+    config
+}
 
 #[derive(Clone)]
 pub struct WsDial {
@@ -672,9 +685,10 @@ async fn connect_upstream(dial: &WsDial) -> Result<(WebSocketStream<BoxIo>, http
         insert_header(headers, name, value);
     }
     let io = dial_io(&url, &dial.proxy).await?;
-    let (stream, response) = tokio_tungstenite::client_async_with_config(request, io, None)
-        .await
-        .context("上游 WebSocket 握手失败")?;
+    let (stream, response) =
+        tokio_tungstenite::client_async_with_config(request, io, Some(websocket_config()))
+            .await
+            .context("上游 WebSocket 握手失败")?;
     Ok((stream, response.headers().clone()))
 }
 
@@ -696,7 +710,9 @@ async fn dial_io(url: &Url, proxy: &str) -> Result<BoxIo> {
         .port_or_known_default()
         .context("上游 WebSocket 缺少端口")?;
     let io = if proxy.trim().is_empty() {
-        BoxIo::new(TcpStream::connect((host.as_str(), port)).await?)
+        let stream = TcpStream::connect((host.as_str(), port)).await?;
+        stream.set_nodelay(true).ok();
+        BoxIo::new(stream)
     } else {
         connect_via_proxy(proxy.trim(), &host, port).await?
     };
@@ -718,15 +734,12 @@ async fn tls_wrap(host: &str, io: BoxIo) -> Result<BoxIo> {
 }
 
 fn tls_connector() -> &'static tokio_rustls::TlsConnector {
-    static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
-    CONNECTOR.get_or_init(|| {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tokio_rustls::TlsConnector::from(Arc::new(config))
-    })
+    // Keep the connector and root store shared across pooled sockets, while
+    // deriving the actual config in the common TLS module so HTTP/WS updates
+    // cannot accidentally select different providers or root sets.
+    static CONNECTOR: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
+    CONNECTOR
+        .get_or_init(|| tokio_rustls::TlsConnector::from(crate::tls::websocket_client_config()))
 }
 
 async fn connect_via_proxy(proxy: &str, host: &str, port: u16) -> Result<BoxIo> {
@@ -746,6 +759,7 @@ async fn connect_via_http_proxy(proxy: &Url, host: &str, port: u16) -> Result<Bo
     let mut stream = TcpStream::connect((proxy_host, proxy_port))
         .await
         .context("连接 HTTP 代理失败")?;
+    stream.set_nodelay(true).ok();
     let target = host_port(host, port);
     let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
     if !proxy.username().is_empty() {
@@ -786,6 +800,7 @@ async fn connect_via_socks5(proxy: &Url, host: &str, port: u16) -> Result<BoxIo>
         .await
         .context("SOCKS5 认证连接失败")?
     };
+    stream.set_nodelay(true).ok();
     Ok(BoxIo::new(stream))
 }
 
@@ -802,6 +817,7 @@ async fn connect_via_socks4(proxy: &Url, host: &str, port: u16) -> Result<BoxIo>
             .await
             .context("SOCKS4 认证连接失败")?
     };
+    stream.set_nodelay(true).ok();
     Ok(BoxIo::new(stream))
 }
 
@@ -961,6 +977,11 @@ mod tests {
     }
 
     #[test]
+    fn websocket_config_enables_permessage_deflate() {
+        assert!(websocket_config().extensions.permessage_deflate.is_some());
+    }
+
+    #[test]
     fn scope_key_is_ordered_and_ignores_turn_metadata() {
         let mut first = local_dial("127.0.0.1:1".parse().unwrap());
         first.extra_headers = vec![
@@ -986,15 +1007,23 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_hdr_async(
+            let mut ws = tokio_tungstenite::accept_hdr_async_with_config(
                 stream,
-                |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                  mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("sec-websocket-extensions")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("permessage-deflate; client_max_window_bits")
+                    );
                     response
                         .headers_mut()
                         .insert("openai-model", http::HeaderValue::from_static("gpt-5.6-luna"));
                     Ok(response)
                 },
+                Some(websocket_config()),
             )
             .await
             .unwrap();
@@ -1057,7 +1086,10 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
                 .unwrap();
-            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_async_with_config(stream, Some(websocket_config()))
+                    .await
+                    .unwrap();
             let _ = ws.next().await.unwrap().unwrap();
             ws.send(Message::text(r#"{"type":"response.completed"}"#))
                 .await
@@ -1088,7 +1120,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (first, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(first).await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_async_with_config(first, Some(websocket_config()))
+                    .await
+                    .unwrap();
             let _ = ws.next().await.unwrap().unwrap();
             ws.send(Message::text(
                 r#"{"type":"error","error":{"code":"websocket_connection_limit_reached"}}"#,
@@ -1096,7 +1131,10 @@ mod tests {
             .await
             .unwrap();
             let (second, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(second).await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_async_with_config(second, Some(websocket_config()))
+                    .await
+                    .unwrap();
             let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
             assert!(text.contains("response.create"));
             ws.send(Message::text(r#"{"type":"response.completed"}"#))
@@ -1130,7 +1168,10 @@ mod tests {
         let pool = WsUpstreamPool::new();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_async_with_config(stream, Some(websocket_config()))
+                    .await
+                    .unwrap();
             let first = ws.next().await.unwrap().unwrap().into_text().unwrap();
             assert!(first.contains("previous_response_id"));
             ws.send(Message::text(
@@ -1210,7 +1251,12 @@ mod tests {
                 let index = counter.fetch_add(1, Ordering::SeqCst);
                 let release = release.clone();
                 tokio::spawn(async move {
-                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let mut ws = tokio_tungstenite::accept_async_with_config(
+                        stream,
+                        Some(websocket_config()),
+                    )
+                    .await
+                    .unwrap();
                     let mut turn = 0;
                     while let Some(Ok(message)) = ws.next().await {
                         match message {

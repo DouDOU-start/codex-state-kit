@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
@@ -146,7 +146,80 @@ pub struct App {
     http: Mutex<PooledUpstream>,
     pub sidecar_wake: Notify,
     vm_identity: Mutex<VmIdentity>,
+    /// Sticky routing state is scoped to the credential account and the
+    /// conversation turn.  It must never be copied between accounts when the
+    /// live login changes.
+    turn_state: Mutex<TurnStateStore>,
     ws_upstream: WsUpstreamPool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct TurnStateKey {
+    account_id: String,
+    thread_id: String,
+    turn_id: String,
+}
+
+#[derive(Default)]
+struct TurnStateStore {
+    values: HashMap<TurnStateKey, String>,
+    order: VecDeque<TurnStateKey>,
+    active_account: Option<String>,
+}
+
+impl TurnStateStore {
+    fn clear(&mut self) {
+        self.values.clear();
+        self.order.clear();
+        self.active_account = None;
+    }
+
+    fn observe_account(&mut self, account_id: Option<&str>) {
+        let Some(account_id) = account_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            return;
+        };
+        if self.active_account.as_deref() != Some(account_id) {
+            self.values.clear();
+            self.order.clear();
+            self.active_account = Some(account_id.to_owned());
+        }
+    }
+
+    fn get(&self, key: &TurnStateKey) -> Option<String> {
+        self.values.get(key).cloned()
+    }
+
+    fn update(&mut self, key: TurnStateKey, value: Option<String>) {
+        match value {
+            Some(value) if !value.is_empty() => {
+                if !self.values.contains_key(&key) {
+                    self.order.push_back(key.clone());
+                }
+                self.values.insert(key, value);
+                while self.order.len() > 256 {
+                    if let Some(oldest) = self.order.pop_front() {
+                        self.values.remove(&oldest);
+                    }
+                }
+            }
+            _ => {
+                self.values.remove(&key);
+                self.order.retain(|entry| entry != &key);
+            }
+        }
+    }
+}
+
+fn turn_state_key(
+    account_id: Option<&str>,
+    context: &identity::RequestContext,
+) -> Option<TurnStateKey> {
+    Some(TurnStateKey {
+        account_id: account_id.unwrap_or_default().trim().to_owned(),
+        thread_id: context.thread_id.as_deref()?.trim().to_owned(),
+        turn_id: context.turn_id.as_deref()?.trim().to_owned(),
+    })
+    .filter(|key| !key.thread_id.is_empty() && !key.turn_id.is_empty())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,8 +259,16 @@ impl App {
             remove_legacy_ticket_cache();
         }
         crate::system_proxy::set_enabled(settings.chain_system_proxy);
+        let vm_identity = if cfg!(test) {
+            VmIdentity::ephemeral()
+        } else {
+            VmIdentity::load_or_create()
+        };
         let business_proxy = resolved_proxy(&settings, &mihomo);
-        let http = pooled_upstream(business_proxy_key(&business_proxy, None)?)?;
+        let http = pooled_upstream_for_platform(
+            business_proxy_key(&business_proxy, None)?,
+            tls_platform(&vm_identity),
+        )?;
         let billing_path = crate::home_dir().join(if cfg!(debug_assertions) {
             ".codex-state-kit-dev-billing.sqlite3"
         } else {
@@ -219,11 +300,8 @@ impl App {
             request_identity_cache: Mutex::new(None),
             http: Mutex::new(http),
             sidecar_wake: Notify::new(),
-            vm_identity: Mutex::new(if cfg!(test) {
-                VmIdentity::ephemeral()
-            } else {
-                VmIdentity::load_or_create()
-            }),
+            vm_identity: Mutex::new(vm_identity),
+            turn_state: Mutex::new(TurnStateStore::default()),
             ws_upstream: WsUpstreamPool::new(),
         })
     }
@@ -328,14 +406,23 @@ impl App {
     async fn refresh_business_http(&self) -> Result<()> {
         let settings = self.settings.lock().await.clone();
         let proxy = resolved_proxy(&settings, &self.mihomo);
-        *self.http.lock().await = pooled_upstream(business_proxy_key(&proxy, None)?)?;
+        let platform = {
+            let vm = self.vm_identity.lock().await;
+            tls_platform(&vm)
+        };
+        *self.http.lock().await =
+            pooled_upstream_for_platform(business_proxy_key(&proxy, None)?, platform)?;
         Ok(())
     }
 
     async fn business_client(&self, key: &str) -> Result<reqwest::Client> {
+        let platform = {
+            let vm = self.vm_identity.lock().await;
+            tls_platform(&vm)
+        };
         let mut slot = self.http.lock().await;
-        if slot.key != key {
-            *slot = pooled_upstream(key.to_string())?;
+        if slot.key != key || slot.platform != platform {
+            *slot = pooled_upstream_for_platform(key.to_string(), platform)?;
         }
         Ok(slot.client.clone())
     }
@@ -466,6 +553,10 @@ impl ProxyHandle {
             identity.apply_profile(profile);
             identity.save()?;
         }
+        // The HTTP transport selects native-tls only for a Mac host presenting
+        // the Mac profile. Rebuild the pool when the profile changes so an
+        // already-open client cannot keep the previous TLS backend.
+        self.app.refresh_business_http().await?;
         self.app.ws_upstream.invalidate().await;
         self.remember_account_environment().await;
         Ok(self.managed_status().await)
@@ -477,6 +568,7 @@ impl ProxyHandle {
             identity.regenerate_installation_id();
             identity.save()?;
         }
+        self.app.turn_state.lock().await.clear();
         self.app.ws_upstream.invalidate().await;
         self.remember_account_environment().await;
         Ok(self.managed_status().await)
@@ -733,6 +825,10 @@ impl ProxyHandle {
             next.save()?;
             *live = next;
         }
+        // Account environments can change the virtual platform even when the
+        // outbound network stays the same; refresh the pooled HTTP backend so
+        // Mac native-tls and the cross-platform rustls profile do not mix.
+        self.app.refresh_business_http().await?;
         self.app.ws_upstream.invalidate().await;
         let mut next = self.app.settings.lock().await.clone();
         let network = &target.network;
@@ -832,8 +928,15 @@ impl ProxyHandle {
         let _change = self.settings_change.lock().await;
         let old = self.app.settings.lock().await.clone();
         let next_business = resolved_proxy(&next, &self.app.mihomo);
+        let vm_platform = {
+            let vm = self.app.vm_identity.lock().await;
+            tls_platform(&vm)
+        };
         let next_http = if resolved_proxy(&old, &self.app.mihomo) != next_business {
-            Some(pooled_upstream(business_proxy_key(&next_business, None)?)?)
+            Some(pooled_upstream_for_platform(
+                business_proxy_key(&next_business, None)?,
+                vm_platform,
+            )?)
         } else {
             None
         };
@@ -1668,6 +1771,18 @@ fn business_network_details(settings: &Settings, upstream: &str, proxy: &str) ->
 struct PooledUpstream {
     key: String,
     client: reqwest::Client,
+    platform: identity::DevicePlatform,
+}
+
+fn tls_platform(identity: &VmIdentity) -> identity::DevicePlatform {
+    if identity.enabled {
+        identity.platform()
+    } else {
+        // Disabled virtual-device mode is pure passthrough. On a Mac host the
+        // native TLS stack should follow the real client regardless of an old
+        // saved platform value.
+        identity::DevicePlatform::Mac
+    }
 }
 
 fn business_proxy_key(template: &str, session: Option<&str>) -> Result<String> {
@@ -1680,9 +1795,21 @@ fn business_proxy_key(template: &str, session: Option<&str>) -> Result<String> {
     }
 }
 
+#[cfg(test)]
 fn pooled_upstream(key: String) -> Result<PooledUpstream> {
-    let client = upstream_http_client(&key)?;
-    Ok(PooledUpstream { key, client })
+    pooled_upstream_for_platform(key, identity::DevicePlatform::Mac)
+}
+
+fn pooled_upstream_for_platform(
+    key: String,
+    platform: identity::DevicePlatform,
+) -> Result<PooledUpstream> {
+    let client = upstream_http_client(&key, platform)?;
+    Ok(PooledUpstream {
+        key,
+        client,
+        platform,
+    })
 }
 
 #[cfg(test)]
@@ -1690,9 +1817,14 @@ fn business_http_client(template: &str, session: Option<&str>) -> Result<reqwest
     Ok(pooled_upstream(business_proxy_key(template, session)?)?.client)
 }
 
-fn upstream_http_client(proxy: &str) -> Result<reqwest::Client> {
+fn upstream_http_client(
+    proxy: &str,
+    platform: identity::DevicePlatform,
+) -> Result<reqwest::Client> {
     let proxy = crate::settings::normalize_proxy(proxy, "上游转发代理")?;
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::tls::http_client_builder_for(platform)
+        // On a Mac host this selects Security.framework for a virtual Mac;
+        // other platforms use the deterministic rustls profile.
         .connect_timeout(Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::limited(5))
         .pool_idle_timeout(Duration::from_secs(90))
@@ -1844,6 +1976,8 @@ async fn forward_http_tracked(
             .map(|id| logs::safe_text(id, 128));
     }
     let request_model = crate::body_model::extract_model_from_body(&bytes);
+    let request_service_tier =
+        crate::body_model::extract_str_field(&bytes, content_encoding.as_deref(), "service_tier");
     details.model = request_model
         .as_deref()
         .map(|model| logs::safe_text(model, 80))
@@ -1915,6 +2049,10 @@ async fn forward_http_tracked(
         *activity = Some(app.traffic.begin(account, Instant::now()));
     }
     let root_vm = app.vm_identity.lock().await.clone();
+    let account_scope = request_identity
+        .as_ref()
+        .map(|(credentials, _)| credentials.account_id.clone())
+        .or_else(|| effective_account.clone());
     let mut request_context =
         identity::request_context_from_body(&bytes, content_encoding.as_deref())
             .unwrap_or_default();
@@ -1944,6 +2082,14 @@ async fn forward_http_tracked(
             }
         }
     }
+    let turn_state_key = turn_state_key(account_scope.as_deref(), &request_context);
+    let sticky_turn_state = if vm.enabled {
+        let mut store = app.turn_state.lock().await;
+        store.observe_account(account_scope.as_deref());
+        turn_state_key.as_ref().and_then(|key| store.get(key))
+    } else {
+        None
+    };
     // HTTP clients stay on the native HTTP SSE path.  The HTTP→WebSocket
     // bridge can receive the generated content but lose the upstream
     // `response.completed` usage event when the WS closes, which leaves the
@@ -1971,7 +2117,11 @@ async fn forward_http_tracked(
         if is_hop(name)
             || name.as_str().starts_with("sec-websocket-")
             || (vm.enabled && identity::is_vm_identity_header(name.as_str()))
-            || name.as_str().eq_ignore_ascii_case("x-codex-turn-state")
+            // Attestation binds the real client installation. Forwarding it
+            // after virtualizing IDs would create a mixed fingerprint, and
+            // the Kit must never invent a replacement attestation.
+            || (vm.enabled && name.as_str().eq_ignore_ascii_case("x-oai-attestation"))
+            || (vm.enabled && name.as_str().eq_ignore_ascii_case("x-codex-turn-state"))
         {
             continue;
         }
@@ -1980,21 +2130,20 @@ async fn forward_http_tracked(
     if vm.enabled {
         builder = builder
             .header("user-agent", vm.user_agent())
-            .header("originator", &vm.originator)
-            .header("version", &vm.cli_version)
+            .header("originator", vm.originator_value())
             .header("x-codex-installation-id", &vm.installation_id)
             .header("x-codex-window-id", &vm.window_id)
             // `session-id`/`thread-id` are the official Codex headers.
             .header("session-id", &vm.session_id);
-        let thread_id = request_context
-            .thread_id
-            .as_deref()
-            .unwrap_or(vm.thread_id.as_str());
+        let thread_id = vm.thread_id.as_str();
         builder = builder
             .header("thread-id", thread_id)
             .header("x-client-request-id", thread_id);
         if let Some(parent_thread_id) = request_context.parent_thread_id.as_deref() {
-            builder = builder.header("x-codex-parent-thread-id", parent_thread_id);
+            builder = builder.header(
+                "x-codex-parent-thread-id",
+                vm.map_protocol_id("thread", parent_thread_id),
+            );
         }
         if let Some(subagent) = request_context.subagent.as_deref() {
             builder = builder.header("x-openai-subagent", subagent);
@@ -2007,12 +2156,20 @@ async fn forward_http_tracked(
                 builder = builder.header("x-codex-turn-metadata", turn_metadata);
             }
         }
+        if let Some(turn_state) = sticky_turn_state.as_deref() {
+            builder = builder.header("x-codex-turn-state", turn_state);
+        }
         if let Some(model) = request_model
             .as_deref()
             .map(str::trim)
             .filter(|model| !model.is_empty() && !model.chars().any(char::is_control))
         {
-            builder = builder.header("x-codex-routing-hint", vm.routing_hint(model));
+            if request_context.subagent.as_deref() != Some("guardian_review") {
+                builder = builder.header(
+                    "x-codex-routing-hint",
+                    vm.routing_hint_with_tier(model, request_service_tier.as_deref()),
+                );
+            }
         }
     }
     let upstream_resp = match builder.send().await {
@@ -2022,6 +2179,18 @@ async fn forward_http_tracked(
             return Err(error).context("upstream http");
         }
     };
+    let response_turn_state = upstream_resp
+        .headers()
+        .get("x-codex-turn-state")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if vm.enabled {
+        if let Some(key) = turn_state_key {
+            app.turn_state.lock().await.update(key, response_turn_state);
+        }
+    }
     let response_header_ms = started.elapsed().as_millis();
     details.response_header_ms = Some(response_header_ms);
     if let Some(content_type) = upstream_resp
@@ -2106,16 +2275,70 @@ async fn forward_responses_over_ws(
         &identity,
         Some(&request_context),
     );
+    if identity.enabled {
+        if let Some(metadata) = frame
+            .get_mut("client_metadata")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.insert(
+                "x-codex-ws-stream-request-start-ms".into(),
+                serde_json::json!(chrono::Utc::now().timestamp_millis()),
+            );
+        }
+    }
     let mut request_context = identity::request_context_from_value(&frame);
     merge_request_context_from_headers(&mut request_context, headers);
     let model = frame
         .get("model")
         .and_then(|value| value.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_owned();
+    let service_tier = frame
+        .get("service_tier")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let account_id = header_string(headers, "chatgpt-account-id");
+    let ws_turn_state_key = turn_state_key(
+        (!account_id.is_empty()).then_some(account_id.as_str()),
+        &request_context,
+    );
+    let sticky_turn_state = if identity.enabled {
+        let sticky_turn_state = {
+            let mut store = app.turn_state.lock().await;
+            store.observe_account((!account_id.is_empty()).then_some(account_id.as_str()));
+            ws_turn_state_key.as_ref().and_then(|key| store.get(key))
+        };
+        apply_turn_state_to_frame(&mut frame, sticky_turn_state.as_deref());
+        sticky_turn_state
+    } else {
+        None
+    };
     // The pool's sticky `{session}`, so turns reuse the same connections.
     let proxy = app.ws_upstream.resolve_proxy(proxy, None).await?;
-    let dial = ws_dial(target, &proxy, headers, &identity, model, &request_context)?;
+    let dial = ws_dial(
+        target,
+        &proxy,
+        headers,
+        &identity,
+        &model,
+        service_tier.as_deref(),
+        sticky_turn_state.as_deref(),
+        &request_context,
+    )?;
     let (rx, handshake) = app.ws_upstream.open_turn(dial, frame).await?;
+    if identity.enabled {
+        remember_turn_state(
+            app,
+            ws_turn_state_key,
+            handshake
+                .get("x-codex-turn-state")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        )
+        .await;
+    }
     let header_ms = started.elapsed().as_millis();
     details.transport = "http_to_ws".into();
     details.response_header_ms = Some(header_ms);
@@ -2163,18 +2386,16 @@ fn ws_dial(
     headers: &HeaderMap,
     identity: &VmIdentity,
     model: &str,
+    service_tier: Option<&str>,
+    turn_state: Option<&str>,
     request_context: &identity::RequestContext,
 ) -> Result<WsDial> {
     let url = ws_bridge::upstream_to_ws_url(target).map_err(|err| anyhow::anyhow!(err))?;
     let mut extra_headers = if identity.enabled {
-        let thread_id = request_context
-            .thread_id
-            .as_deref()
-            .unwrap_or(identity.thread_id.as_str());
+        let thread_id = identity.thread_id.as_str();
         vec![
             ("user-agent".into(), identity.user_agent()),
-            ("originator".into(), identity.originator.clone()),
-            ("version".into(), identity.cli_version.clone()),
+            ("originator".into(), identity.originator_value()),
             (
                 "x-codex-installation-id".into(),
                 identity.installation_id.clone(),
@@ -2201,8 +2422,11 @@ fn ws_dial(
         if let Some(parent_thread_id) = request_context.parent_thread_id.as_deref() {
             extra_headers.push((
                 "x-codex-parent-thread-id".into(),
-                parent_thread_id.to_string(),
+                identity.map_protocol_id("thread", parent_thread_id),
             ));
+        }
+        if let Some(turn_state) = turn_state.filter(|value| !value.is_empty()) {
+            extra_headers.push(("x-codex-turn-state".into(), turn_state.to_owned()));
         }
         if let Some(subagent) = request_context.subagent.as_deref() {
             extra_headers.push(("x-openai-subagent".into(), subagent.to_string()));
@@ -2215,9 +2439,25 @@ fn ws_dial(
                 extra_headers.push(("x-codex-turn-metadata".into(), turn_metadata.to_string()));
             }
         }
+        for (name, value) in headers
+            .iter()
+            .filter(|(name, _)| is_ws_compatibility_header(name))
+        {
+            if let Ok(value) = value.to_str() {
+                if !value.chars().any(char::is_control) {
+                    extra_headers.push((name.as_str().to_owned(), value.to_owned()));
+                }
+            }
+        }
         let model = model.trim();
-        if !model.is_empty() && !model.chars().any(char::is_control) {
-            extra_headers.push(("x-codex-routing-hint".into(), identity.routing_hint(model)));
+        if !model.is_empty()
+            && !model.chars().any(char::is_control)
+            && request_context.subagent.as_deref() != Some("guardian_review")
+        {
+            extra_headers.push((
+                "x-codex-routing-hint".into(),
+                identity.routing_hint_with_tier(model, service_tier),
+            ));
         }
     }
     Ok(WsDial {
@@ -2228,6 +2468,62 @@ fn ws_dial(
         extra_headers,
         preserve_client_identity: !identity.enabled,
     })
+}
+
+fn is_ws_compatibility_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "x-codex-beta-features"
+            | "x-responsesapi-include-timing-metrics"
+            | "x-openai-internal-codex-responses-lite"
+            | "x-openai-memgen-request"
+            | "x-openai-internal-codex-residency"
+            | "traceparent"
+            | "tracestate"
+    )
+}
+
+fn apply_turn_state_to_frame(frame: &mut serde_json::Value, state: Option<&str>) {
+    let Some(metadata) = frame
+        .get_mut("client_metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        if state.is_none() {
+            return;
+        }
+        frame["client_metadata"] = serde_json::Value::Object(serde_json::Map::new());
+        return apply_turn_state_to_frame(frame, state);
+    };
+    match state {
+        Some(state) if !state.is_empty() => {
+            metadata.insert("x-codex-turn-state".into(), serde_json::json!(state));
+        }
+        _ => {
+            metadata.remove("x-codex-turn-state");
+        }
+    }
+}
+
+fn turn_state_from_event(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let state = [
+        value.get("x-codex-turn-state"),
+        value.pointer("/response/x-codex-turn-state"),
+        value.pointer("/response/metadata/x-codex-turn-state"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(serde_json::Value::as_str)
+    .map(str::trim)
+    .filter(|state| !state.is_empty())
+    .map(str::to_owned);
+    state
+}
+
+async fn remember_turn_state(app: &App, key: Option<TurnStateKey>, value: Option<String>) {
+    if let Some(key) = key {
+        app.turn_state.lock().await.update(key, value);
+    }
 }
 
 fn is_ws_passthrough_excluded(name: &HeaderName) -> bool {
@@ -2284,34 +2580,51 @@ fn merge_request_context_from_headers(context: &mut identity::RequestContext, he
     }
     if context.turn_metadata.is_none() {
         if let Some(value) = header_value(headers, "x-codex-turn-metadata") {
-            if let Ok(serde_json::Value::Object(snapshot)) =
-                serde_json::from_str::<serde_json::Value>(&value)
-            {
-                context.turn_metadata = Some(value);
-                if context.thread_id.is_none() {
-                    context.thread_id = snapshot
-                        .get("thread_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned);
-                }
-                if context.turn_id.is_none() {
-                    context.turn_id = snapshot
-                        .get("turn_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned);
-                }
-                if context.parent_thread_id.is_none() {
-                    context.parent_thread_id = snapshot
-                        .get("parent_thread_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned);
-                }
-                if context.subagent.is_none() {
-                    context.subagent = snapshot
-                        .get("subagent_kind")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned);
-                }
+            let parsed = identity::request_context_from_value(&serde_json::json!({
+                "client_metadata": {"x-codex-turn-metadata": value}
+            }));
+            context.turn_metadata = parsed.turn_metadata;
+            if context.session_id.is_none() {
+                context.session_id = parsed.session_id;
+            }
+            if context.window_id.is_none() {
+                context.window_id = parsed.window_id;
+            }
+            if context.thread_id.is_none() {
+                context.thread_id = parsed.thread_id;
+            }
+            if context.turn_id.is_none() {
+                context.turn_id = parsed.turn_id;
+            }
+            if context.parent_thread_id.is_none() {
+                context.parent_thread_id = parsed.parent_thread_id;
+            }
+            if context.parent_turn_id.is_none() {
+                context.parent_turn_id = parsed.parent_turn_id;
+            }
+            if context.root_turn_id.is_none() {
+                context.root_turn_id = parsed.root_turn_id;
+            }
+            if context.subagent.is_none() {
+                context.subagent = parsed.subagent;
+            }
+            if context.agent_name.is_none() {
+                context.agent_name = parsed.agent_name;
+            }
+            if context.thread_source.is_none() {
+                context.thread_source = parsed.thread_source;
+            }
+            if context.turn_trigger.is_none() {
+                context.turn_trigger = parsed.turn_trigger;
+            }
+            if context.request_kind.is_none() {
+                context.request_kind = parsed.request_kind;
+            }
+            if context.sandbox.is_none() {
+                context.sandbox = parsed.sandbox;
+            }
+            if context.sandbox_mode.is_none() {
+                context.sandbox_mode = parsed.sandbox_mode;
             }
         }
     }
@@ -2354,7 +2667,7 @@ async fn client_ws_session(
         let mut header_context = identity::RequestContext::default();
         merge_request_context_from_headers(&mut header_context, &client_headers);
         let root_identity = app.vm_identity.lock().await.clone();
-        let (frame, client_model, scoped_identity) = prepare_client_ws_frame(
+        let (mut frame, client_model, scoped_identity) = prepare_client_ws_frame(
             &app,
             &text,
             Some(&header_context),
@@ -2367,6 +2680,10 @@ async fn client_ws_session(
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_string();
+        let service_tier = frame
+            .get("service_tier")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
         let diag_req = diag::Request {
             id: diag::next_id(),
             flow: "business".into(),
@@ -2380,6 +2697,27 @@ async fn client_ws_session(
             json!({"method": "WS", "path": "/responses"}),
         );
         let account = ws_billing_account(&app, &client_headers).await;
+        let mut request_context = identity::request_context_from_value(&frame);
+        merge_request_context_from_headers(&mut request_context, &client_headers);
+        let ws_turn_state_key = turn_state_key(
+            account.as_ref().map(|account| account.id.as_str()),
+            &request_context,
+        );
+        let sticky_turn_state = if scoped_identity.enabled {
+            let sticky_turn_state = {
+                let mut store = app.turn_state.lock().await;
+                store.observe_account(account.as_ref().map(|account| account.id.as_str()));
+                ws_turn_state_key.as_ref().and_then(|key| store.get(key))
+            };
+            apply_turn_state_to_frame(&mut frame, sticky_turn_state.as_deref());
+            sticky_turn_state
+        } else {
+            None
+        };
+        // A client WebSocket can carry multiple response.create turns. Track
+        // each turn separately so the live account metrics cover the whole
+        // upstream exchange, including dial/handshake failures.
+        let _activity = begin_ws_traffic(&app, account.as_ref(), started);
         let billing = account.as_ref().and_then(|account| {
             app.begin_ws_billing(
                 started,
@@ -2392,12 +2730,12 @@ async fn client_ws_session(
                     .map(str::to_string),
             )
         });
-        let mut request_context = identity::request_context_from_value(&frame);
-        merge_request_context_from_headers(&mut request_context, &client_headers);
         let dial = match current_ws_dial(
             &app,
             &client_headers,
             &model,
+            service_tier.as_deref(),
+            sticky_turn_state.as_deref(),
             &request_context,
             &scoped_identity,
         )
@@ -2450,12 +2788,30 @@ async fn client_ws_session(
         };
         let mut metrics = logs::ResponseBodyMetrics::new("");
         metrics.observe_headers(&handshake);
+        if scoped_identity.enabled {
+            remember_turn_state(
+                &app,
+                ws_turn_state_key.clone(),
+                handshake
+                    .get("x-codex-turn-state")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+            )
+            .await;
+        }
         let mut failed = false;
         let mut failure_kind = None;
         let mut failure_message = None;
         while let Some(event) = rx.recv().await {
             match event {
                 Ok(json) => {
+                    if scoped_identity.enabled {
+                        if let Some(state) = turn_state_from_event(&json) {
+                            remember_turn_state(&app, ws_turn_state_key.clone(), Some(state)).await;
+                        }
+                    }
                     // Native WS frames are already complete JSON events. Parse
                     // them before forwarding so a large terminal frame cannot
                     // be discarded by the bounded SSE inspector.
@@ -2534,6 +2890,39 @@ async fn prepare_client_ws_frame(
         if frame_context.parent_thread_id.is_none() {
             frame_context.parent_thread_id = request_context.parent_thread_id.clone();
         }
+        if frame_context.parent_turn_id.is_none() {
+            frame_context.parent_turn_id = request_context.parent_turn_id.clone();
+        }
+        if frame_context.root_turn_id.is_none() {
+            frame_context.root_turn_id = request_context.root_turn_id.clone();
+        }
+        if frame_context.forked_from_thread_id.is_none() {
+            frame_context.forked_from_thread_id = request_context.forked_from_thread_id.clone();
+        }
+        if frame_context.context_window_id.is_none() {
+            frame_context.context_window_id = request_context.context_window_id.clone();
+        }
+        if frame_context.window_number.is_none() {
+            frame_context.window_number = request_context.window_number;
+        }
+        if frame_context.agent_name.is_none() {
+            frame_context.agent_name = request_context.agent_name.clone();
+        }
+        if frame_context.thread_source.is_none() {
+            frame_context.thread_source = request_context.thread_source.clone();
+        }
+        if frame_context.turn_trigger.is_none() {
+            frame_context.turn_trigger = request_context.turn_trigger.clone();
+        }
+        if frame_context.request_kind.is_none() {
+            frame_context.request_kind = request_context.request_kind.clone();
+        }
+        if frame_context.sandbox.is_none() {
+            frame_context.sandbox = request_context.sandbox.clone();
+        }
+        if frame_context.sandbox_mode.is_none() {
+            frame_context.sandbox_mode = request_context.sandbox_mode.clone();
+        }
         if frame_context.subagent.is_none() {
             frame_context.subagent = request_context.subagent.clone();
         }
@@ -2547,6 +2936,16 @@ async fn prepare_client_ws_frame(
         &identity,
         Some(&frame_context),
     );
+    if identity.enabled {
+        let metadata = frame
+            .get_mut("client_metadata")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| anyhow::anyhow!("client_metadata 改写后不是对象"))?;
+        metadata.insert(
+            "x-codex-ws-stream-request-start-ms".into(),
+            serde_json::json!(chrono::Utc::now().timestamp_millis()),
+        );
+    }
     Ok((frame, client_model, identity))
 }
 
@@ -2554,6 +2953,14 @@ async fn prepare_client_ws_frame(
 struct BillingAccount {
     id: String,
     email: Option<String>,
+}
+
+fn begin_ws_traffic(
+    app: &App,
+    account: Option<&BillingAccount>,
+    started: Instant,
+) -> Option<RequestActivity> {
+    account.map(|account| app.traffic.begin(&account.id, started))
 }
 
 /// The account a WebSocket turn runs as, decided the same way as for HTTP
@@ -2577,10 +2984,22 @@ async fn current_ws_dial(
     app: &App,
     client_headers: &HeaderMap,
     model: &str,
+    service_tier: Option<&str>,
+    turn_state: Option<&str>,
     request_context: &identity::RequestContext,
     identity: &VmIdentity,
 ) -> Result<WsDial> {
-    business_ws_dial(app, client_headers, model, request_context, identity, false).await
+    business_ws_dial(
+        app,
+        client_headers,
+        model,
+        service_tier,
+        turn_state,
+        request_context,
+        identity,
+        false,
+    )
+    .await
 }
 
 /// The dial the pool keeps warm: Kit's own login, since there is no client
@@ -2600,6 +3019,8 @@ async fn warm_ws_dial(app: &App) -> Result<WsDial> {
         app,
         &HeaderMap::new(),
         &model,
+        None,
+        None,
         &identity::RequestContext::default(),
         &identity,
         true,
@@ -2611,6 +3032,8 @@ async fn business_ws_dial(
     app: &App,
     client_headers: &HeaderMap,
     model: &str,
+    service_tier: Option<&str>,
+    turn_state: Option<&str>,
     request_context: &identity::RequestContext,
     identity: &VmIdentity,
     require_login: bool,
@@ -2647,6 +3070,8 @@ async fn business_ws_dial(
         &headers,
         &identity,
         model,
+        service_tier,
+        turn_state,
         request_context,
     )
 }
@@ -2778,6 +3203,17 @@ mod account_switch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_vm_uses_host_mac_tls_profile() {
+        let mut identity = VmIdentity::ephemeral();
+        identity.os_type = "Windows".into();
+        identity.enabled = false;
+        assert_eq!(tls_platform(&identity), identity::DevicePlatform::Mac);
+
+        identity.enabled = true;
+        assert_eq!(tls_platform(&identity), identity::DevicePlatform::Windows);
+    }
 
     #[test]
     fn mihomo_without_sidecar_does_not_use_saved_manual_proxy() {
@@ -2971,14 +3407,14 @@ mod tests {
             .unwrap();
         let (headers, body) = received.recv().await.unwrap();
         assert_eq!(headers["user-agent"], identity.user_agent());
-        assert_eq!(headers["originator"], identity.originator);
-        assert_eq!(headers["version"], identity.cli_version);
+        assert_eq!(headers["originator"], identity.originator_value());
+        assert!(headers.get("version").is_none());
         assert_eq!(headers["session-id"], expected_identity.session_id);
         assert!(headers.get("session_id").is_none());
         assert_eq!(headers["x-codex-installation-id"], identity.installation_id);
         assert_eq!(headers["x-codex-window-id"], expected_identity.window_id);
-        assert_eq!(headers["thread-id"], "thread-keep");
-        assert_eq!(headers["x-client-request-id"], "thread-keep");
+        assert_eq!(headers["thread-id"], expected_identity.thread_id);
+        assert_eq!(headers["x-client-request-id"], expected_identity.thread_id);
         assert_eq!(headers["x-codex-routing-hint"], "model=gpt-test");
         assert!(headers.get("x-codex-turn-metadata").is_none());
         assert!(headers.get(header::COOKIE).is_none());
@@ -2991,8 +3427,11 @@ mod tests {
         );
         assert_eq!(metadata["session_id"], expected_identity.session_id);
         assert_eq!(metadata["x-codex-window-id"], expected_identity.window_id);
-        assert_eq!(metadata["thread_id"], "thread-keep");
-        assert_eq!(metadata["turn_id"], "turn-keep");
+        assert_eq!(metadata["thread_id"], expected_identity.thread_id);
+        assert_eq!(
+            metadata["turn_id"],
+            expected_identity.map_protocol_id("turn", "turn-keep")
+        );
         server.abort();
     }
 
@@ -3068,6 +3507,8 @@ mod tests {
             &headers,
             &identity,
             "gpt-test",
+            Some("priority"),
+            Some("sticky-state"),
             &identity::RequestContext::default(),
         )
         .unwrap();
@@ -3087,7 +3528,11 @@ mod tests {
         assert_eq!(extra("x-codex-window-id"), identity.window_id);
         assert_eq!(extra("thread-id"), identity.thread_id);
         assert_eq!(extra("x-client-request-id"), identity.thread_id);
-        assert_eq!(extra("x-codex-routing-hint"), "model=gpt-test");
+        assert_eq!(extra("x-codex-turn-state"), "sticky-state");
+        assert_eq!(
+            extra("x-codex-routing-hint"),
+            "model=gpt-test;tier=priority"
+        );
         assert!(!extra("user-agent").contains("client-ua"));
     }
 
@@ -3109,6 +3554,8 @@ mod tests {
             &headers,
             &identity,
             "gpt-test",
+            None,
+            None,
             &identity::RequestContext::default(),
         )
         .unwrap();
@@ -3167,8 +3614,15 @@ mod tests {
             frame["client_metadata"]["x-codex-window-id"],
             expected_identity.window_id
         );
-        assert_eq!(frame["client_metadata"]["thread_id"], "keep");
-        assert_eq!(frame["client_metadata"]["turn_id"], "turn");
+        assert_eq!(
+            frame["client_metadata"]["thread_id"],
+            expected_identity.thread_id
+        );
+        assert_eq!(
+            frame["client_metadata"]["turn_id"],
+            expected_identity.map_protocol_id("turn", "turn")
+        );
+        assert!(frame["client_metadata"]["x-codex-ws-stream-request-start-ms"].is_number());
         // The forced model is sent; the client's own model is kept for records.
         assert_eq!(frame["model"], "gpt-forced");
         assert_eq!(client_model.as_deref(), Some("gpt-test"));
@@ -3249,9 +3703,71 @@ mod tests {
     }
 
     #[test]
+    fn websocket_turn_traffic_is_tracked_until_the_turn_finishes() {
+        let app = App::new(Settings::default()).unwrap();
+        let account = BillingAccount {
+            id: "account-traffic".into(),
+            email: None,
+        };
+        let started = Instant::now();
+        let activity = begin_ws_traffic(&app, Some(&account), started);
+        assert_eq!(
+            app.traffic.view(Some("account-traffic"), Instant::now()),
+            AccountTraffic {
+                concurrent_requests: 1,
+                rpm: 1,
+            }
+        );
+        drop(activity);
+        assert_eq!(
+            app.traffic.view(Some("account-traffic"), Instant::now()),
+            AccountTraffic {
+                concurrent_requests: 0,
+                rpm: 1,
+            }
+        );
+    }
+
+    #[test]
     fn idle_timeout_is_longer_before_the_first_chunk() {
         assert_eq!(business_stream_idle_timeout(0), Duration::from_secs(180));
         assert_eq!(business_stream_idle_timeout(2), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn turn_state_is_scoped_to_account_thread_and_turn() {
+        let context = identity::RequestContext {
+            thread_id: Some("thread-a".into()),
+            turn_id: Some("turn-a".into()),
+            ..Default::default()
+        };
+        let key_a = turn_state_key(Some("account-a"), &context).unwrap();
+        let key_b = turn_state_key(Some("account-b"), &context).unwrap();
+        let mut store = TurnStateStore::default();
+        store.observe_account(Some("account-a"));
+        store.update(key_a.clone(), Some("state-a".into()));
+        assert_eq!(store.get(&key_a).as_deref(), Some("state-a"));
+        assert!(store.get(&key_b).is_none());
+        // A live account switch clears the previous account's state before a
+        // new token can be used, preventing cross-account sticky routing.
+        store.observe_account(Some("account-b"));
+        assert!(store.get(&key_a).is_none());
+        store.update(key_b.clone(), Some("state-b".into()));
+        assert_eq!(store.get(&key_b).as_deref(), Some("state-b"));
+        store.update(key_b.clone(), None);
+        assert!(store.get(&key_b).is_none());
+    }
+
+    #[test]
+    fn websocket_turn_state_is_written_to_client_metadata() {
+        let mut frame = serde_json::json!({"type":"response.create"});
+        apply_turn_state_to_frame(&mut frame, Some("sticky-token"));
+        assert_eq!(
+            frame["client_metadata"]["x-codex-turn-state"],
+            "sticky-token"
+        );
+        apply_turn_state_to_frame(&mut frame, None);
+        assert!(frame["client_metadata"].get("x-codex-turn-state").is_none());
     }
 
     #[tokio::test]

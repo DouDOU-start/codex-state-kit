@@ -149,7 +149,7 @@ impl MihomoRuntime {
             "节点不在当前分组中"
         );
         let url = crate::latency::node_delay_url(&controller, node, target)?;
-        let client = reqwest::Client::builder()
+        let client = crate::tls::http_client_builder()
             .no_proxy()
             .timeout(Duration::from_secs(6))
             .build()?;
@@ -439,7 +439,7 @@ async fn load_subscription(raw: &str) -> Result<String> {
         return Ok(text);
     }
     if raw.starts_with("http://") || raw.starts_with("https://") {
-        let client = reqwest::Client::builder()
+        let client = crate::tls::http_client_builder()
             .timeout(Duration::from_secs(20))
             .build()
             .context("无法创建订阅客户端")?;
@@ -947,7 +947,7 @@ fn apply_groups(view: &mut MihomoStatus, groups: &[ProxyGroup]) {
 }
 
 async fn fetch_groups(controller: &str, secret: &str) -> Result<Vec<ProxyGroup>> {
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()
@@ -1051,7 +1051,7 @@ async fn wait_until_ready(
     child: &mut OwnedChild,
     log_path: &Path,
 ) -> Result<()> {
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
@@ -1078,7 +1078,7 @@ async fn wait_until_ready(
 }
 
 async fn select_node(controller: &str, secret: &str, group: &str, name: &str) -> Result<()> {
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()?;

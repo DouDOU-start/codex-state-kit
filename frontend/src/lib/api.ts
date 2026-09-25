@@ -68,6 +68,8 @@ const defaultStatus = (): Status => ({
     osVersion: "15.5.0",
     arch: "arm64",
     terminal: "xterm-256color",
+    terminalVersion: "",
+    terminalMultiplexer: "",
     userAgent: "codex_cli_rs/0.155.0 (Mac OS 15.5.0; arm64) xterm-256color",
   },
   chainSystemProxy: true,
@@ -264,14 +266,15 @@ export async function mihomoGroupDelay(group: string, node?: string): Promise<La
 }
 
 /** Mirrors the backend presets (src/identity.rs) for the browser preview. */
-const MOCK_PLATFORMS: Record<VmProfile["platform"], Pick<VmIdentityView, "osType" | "osVersion" | "arch" | "terminal">> = {
-  mac: { osType: "Mac OS", osVersion: "15.5.0", arch: "arm64", terminal: "xterm-256color" },
-  windows: { osType: "Windows", osVersion: "10.0.26100", arch: "x86_64", terminal: "WindowsTerminal" },
-  linux: { osType: "Ubuntu", osVersion: "24.4.0", arch: "x86_64", terminal: "xterm-256color" },
+const MOCK_PLATFORMS: Record<VmProfile["platform"], Pick<VmIdentityView, "osType" | "osVersion" | "arch" | "terminal" | "terminalVersion" | "terminalMultiplexer">> = {
+  mac: { osType: "Mac OS", osVersion: "15.5.0", arch: "arm64", terminal: "xterm-256color", terminalVersion: "", terminalMultiplexer: "" },
+  windows: { osType: "Windows", osVersion: "10.0.26100", arch: "x86_64", terminal: "WindowsTerminal", terminalVersion: "", terminalMultiplexer: "" },
+  linux: { osType: "Ubuntu", osVersion: "24.4.0", arch: "x86_64", terminal: "xterm-256color", terminalVersion: "", terminalMultiplexer: "" },
 };
 
 function mockUserAgent(identity: VmIdentityView): string {
-  return `${identity.originator}/${identity.cliVersion} (${identity.osType} ${identity.osVersion}; ${identity.arch}) ${identity.terminal}`;
+  const terminal = identity.terminalVersion ? `${identity.terminal}/${identity.terminalVersion}` : identity.terminal;
+  return `${identity.originator}/${identity.cliVersion} (${identity.osType} ${identity.osVersion}; ${identity.arch}) ${terminal}`;
 }
 
 export async function updateVmIdentity(profile: VmProfile): Promise<Status> {
@@ -281,6 +284,9 @@ export async function updateVmIdentity(profile: VmProfile): Promise<Status> {
     ...(profile.enabled === undefined ? {} : { enabled: profile.enabled }),
     platform: profile.platform,
     ...MOCK_PLATFORMS[profile.platform],
+    ...(profile.terminal === undefined ? {} : { terminal: profile.terminal }),
+    ...(profile.terminalVersion === undefined ? {} : { terminalVersion: profile.terminalVersion }),
+    ...(profile.terminalMultiplexer === undefined ? {} : { terminalMultiplexer: profile.terminalMultiplexer }),
   };
   if (profile.environment) vmIdentity.environment = profile.environment;
   mockStatus = { ...mockStatus, vmIdentity: { ...vmIdentity, userAgent: mockUserAgent(vmIdentity) } };

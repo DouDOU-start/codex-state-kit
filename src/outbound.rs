@@ -58,16 +58,16 @@ pub async fn detect_proxy_geo(proxy: &str) -> Result<ProxyGeo> {
     );
     // `proxy` is already resolved by the business WebSocket pool, including
     // its sticky session and system-proxy relay. Do not route it twice.
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .no_proxy()
         .proxy(reqwest::Proxy::all(proxy).context("地区探测代理无效")?)
         .timeout(Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::none())
+        .user_agent(crate::identity::VmIdentity::runtime_user_agent())
         .build()?;
     let response = client
         .get("https://ipapi.co/json/")
         .header("accept", "application/json")
-        .header("user-agent", "codex-state-kit")
         .send()
         .await
         .context("请求代理出口地区")?;
@@ -125,9 +125,9 @@ pub fn apply_bound_session(raw: &str, session: Option<&str>) -> Result<String> {
 }
 
 pub fn http_client(outbound_proxy: &str) -> Result<reqwest::Client> {
-    // 与官方 CLI 一样走 TLS ALPN，由对端协商 HTTP/2。
-    // 不用 http2_prior_knowledge：那是明文 h2c，HTTPS 和经 CONNECT 的隧道都会失败。
-    let mut builder = reqwest::Client::builder()
+    // Keep this auxiliary client on the same selected TLS profile as business
+    // traffic. Do not force h2c: HTTPS and CONNECT tunnels are not plaintext.
+    let mut builder = crate::tls::http_client_builder()
         .timeout(Duration::from_secs(25))
         .connect_timeout(Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::none())

@@ -756,7 +756,7 @@ mod tests {
         })));
         // The socks server is local in this test, so relay it explicitly.
         let relay = relay_port("127.0.0.1", socks_port).unwrap();
-        let client = reqwest::Client::builder()
+        let client = crate::tls::http_client_builder()
             .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{relay}")).unwrap())
             .build()
             .unwrap();

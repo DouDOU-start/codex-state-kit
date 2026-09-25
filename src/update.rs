@@ -69,8 +69,8 @@ fn evaluate_release(current: &str, release: Option<Release>) -> Result<UpdateInf
 
 pub async fn check_update(current: &str) -> Result<UpdateInfo> {
     // Update checks use the default network; the business proxy and token route are independent.
-    let client = reqwest::Client::builder()
-        .user_agent(format!("codex-state-kit/{current}"))
+    let client = crate::tls::http_client_builder()
+        .user_agent(crate::identity::VmIdentity::runtime_user_agent())
         .timeout(Duration::from_secs(12))
         .connect_timeout(Duration::from_secs(5))
         .build()?;
@@ -215,7 +215,7 @@ mod tests {
                 });
                 axum::serve(listener, router).await.unwrap();
             });
-            let client = reqwest::Client::builder()
+            let client = crate::tls::http_client_builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(2))
                 .build()

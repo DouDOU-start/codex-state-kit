@@ -542,7 +542,7 @@ async fn upstream_proxy_https_connect_uses_proxy_auth_then_tls() {
             assert_eq!(socket.read_u8().await.unwrap(), 0x16);
         });
         // The mock ends after ClientHello; no public service or certificate bypass is needed.
-        assert!(upstream_http_client(&proxy)
+        assert!(upstream_http_client(&proxy, identity::DevicePlatform::Mac)
             .unwrap()
             .get("https://upstream.invalid/events")
             .send()

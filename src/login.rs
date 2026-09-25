@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+fn user_agent() -> String {
+    crate::identity::VmIdentity::runtime_user_agent()
+}
+
 /// Kit 独立登录文件。接入期间会覆盖官方 `auth.json`，退出时从备份还原。
 pub const KIT_AUTH_FILE: &str = "auth.codex-state-kit.json";
 pub const OFFICIAL_AUTH_BACKUP_FILE: &str = "auth.json.codex-state-kit.bak";
@@ -23,7 +27,6 @@ pub enum LoginMethod {
 }
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const USER_AGENT: &str = "codex-state-kit";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
 const VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
@@ -160,7 +163,7 @@ enum ResolvedAuthMode {
 /// follow the system proxy, like a browser.
 fn auth_client_builder(outbound_proxy: &str) -> Result<reqwest::ClientBuilder> {
     let proxy = crate::outbound::dial_proxy_for_client(outbound_proxy.trim());
-    let builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+    let builder = crate::tls::http_client_builder().timeout(Duration::from_secs(30));
     Ok(if proxy.is_empty() {
         builder.proxy(crate::system_proxy::reqwest_proxy())
     } else {
@@ -483,7 +486,7 @@ pub async fn start_device_login(
     let response = client
         .post(&endpoints.usercode_url)
         .header("Content-Type", "application/json")
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", user_agent())
         .json(&json!({ "client_id": CLIENT_ID }))
         .send()
         .await
@@ -535,7 +538,7 @@ pub async fn poll_device_login(
     let response = client
         .post(&endpoints.poll_url)
         .header("Content-Type", "application/json")
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", user_agent())
         .json(&json!({
             "device_auth_id": pending.device_auth_id,
             "user_code": pending.user_code,
@@ -637,7 +640,7 @@ pub(crate) async fn exchange_tokens(
     .context("encode oauth form")?;
     let response = client
         .post(token_url)
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", user_agent())
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
@@ -671,7 +674,7 @@ async fn exchange_refresh_token_at(
     }
     let response = client
         .post(token_url)
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", user_agent())
         .header("Originator", "codex_cli_rs")
         .json(&json!({
             "client_id": CLIENT_ID,
