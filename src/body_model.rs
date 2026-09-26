@@ -114,11 +114,58 @@ pub fn strip_previous_response_id(bytes: &[u8], encoding: Option<&str>) -> Vec<u
     stripped.unwrap_or_else(|| bytes.to_vec())
 }
 
+/// Normalize a standard OpenAI Responses request for the ChatGPT Codex
+/// upstream.  The public Responses API defaults `store` to true and permits
+/// `max_output_tokens`, while the Codex endpoint requires `store: false` and
+/// rejects `max_output_tokens`.  HTTP chaining also uses a client-side
+/// `previous_response_id`, which the endpoint cannot resolve, so remove it in
+/// the same pass.
+///
+/// Invalid or non-JSON bodies are passed through unchanged.  The request may
+/// be compressed, so preserve the original encoding when the JSON is changed.
+pub fn adapt_responses_request(bytes: &[u8], encoding: Option<&str>) -> Vec<u8> {
+    let adapted = match detect_body_compression(bytes, encoding) {
+        None => adapt_responses_json(bytes),
+        Some("zstd") => zstd::decode_all(std::io::Cursor::new(bytes))
+            .ok()
+            .and_then(|plain| adapt_responses_json(&plain))
+            .and_then(|plain| zstd::encode_all(plain.as_slice(), 0).ok()),
+        Some("gzip") => decompress_named(bytes, "gzip")
+            .and_then(|plain| adapt_responses_json(&plain))
+            .and_then(|plain| compress_gzip(&plain).ok()),
+        Some("deflate") => decompress_named(bytes, "deflate")
+            .or_else(|| decompress_named(bytes, "raw_deflate"))
+            .and_then(|plain| adapt_responses_json(&plain))
+            .and_then(|plain| compress_deflate(&plain).ok()),
+        Some(_) => None,
+    };
+    adapted.unwrap_or_else(|| bytes.to_vec())
+}
+
 /// 字段不存在或正文不是 JSON 对象时返回 `None`，表示无需改写。
 fn strip_previous_response_id_json(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(bytes).ok()?;
     value.as_object_mut()?.remove("previous_response_id")?;
     serde_json::to_vec(&value).ok()
+}
+
+fn adapt_responses_json(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(bytes).ok()?;
+    let object = value.as_object_mut()?;
+    let mut changed = false;
+
+    if object.get("store").and_then(Value::as_bool) != Some(false) {
+        object.insert("store".into(), Value::Bool(false));
+        changed = true;
+    }
+    if object.remove("max_output_tokens").is_some() {
+        changed = true;
+    }
+    if object.remove("previous_response_id").is_some() {
+        changed = true;
+    }
+
+    changed.then(|| serde_json::to_vec(&value).ok()).flatten()
 }
 
 fn detect_body_compression(bytes: &[u8], encoding: Option<&str>) -> Option<&'static str> {
@@ -276,6 +323,39 @@ mod tests {
                 Some("gpt-6-astra"),
                 "{encoding}"
             );
+        }
+    }
+
+    #[test]
+    fn adapt_responses_request_forces_codex_compatible_fields() {
+        let input = br#"{"model":"gpt-6-astra","input":[],"store":true,"max_output_tokens":128,"previous_response_id":"resp_1"}"#;
+        let value: Value = serde_json::from_slice(&adapt_responses_request(input, None)).unwrap();
+        assert_eq!(value.get("store").and_then(Value::as_bool), Some(false));
+        assert!(value.get("max_output_tokens").is_none());
+        assert!(value.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn adapt_responses_request_handles_compressed_bodies() {
+        let plain = br#"{"model":"gpt-6-astra","input":[],"store":true,"max_output_tokens":128}"#;
+        let cases = [
+            ("zstd", zstd::encode_all(plain.as_slice(), 3).unwrap()),
+            ("gzip", compress_gzip(plain).unwrap()),
+            ("deflate", compress_deflate(plain).unwrap()),
+        ];
+        for (encoding, compressed) in cases {
+            let result = adapt_responses_request(&compressed, Some(encoding));
+            let decompressed = match encoding {
+                "zstd" => zstd::decode_all(std::io::Cursor::new(&result)).unwrap(),
+                other => decompress_named(&result, other).unwrap(),
+            };
+            let value: Value = serde_json::from_slice(&decompressed).unwrap();
+            assert_eq!(
+                value.get("store").and_then(Value::as_bool),
+                Some(false),
+                "{encoding}"
+            );
+            assert!(value.get("max_output_tokens").is_none(), "{encoding}");
         }
     }
 }

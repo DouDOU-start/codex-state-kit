@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::settings::{home_dir, is_dev_mode};
 
-const DEFAULT_VERSION: &str = "0.155.0";
+pub const DEFAULT_VERSION: &str = "0.155.0";
 const ORIGINATOR: &str = "codex_cli_rs";
 const INSTALLATION_ID_FILENAME: &str = ".codex-state-kit-installation_id";
 const DEV_INSTALLATION_ID_FILENAME: &str = ".codex-state-kit-dev-installation_id";

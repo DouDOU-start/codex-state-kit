@@ -51,7 +51,26 @@ pub fn http_body_to_ws_request(bytes: &[u8]) -> Result<Value, String> {
     if !object.contains_key("type") {
         object.insert("type".to_string(), json!("response.create"));
     }
+    adapt_responses_frame(&mut value);
     Ok(value)
+}
+
+/// Normalize a response.create frame for the ChatGPT Codex upstream.  The
+/// public Responses API defaults `store` to true and allows
+/// `max_output_tokens`, but Codex requires `store: false` and rejects the
+/// token-limit field.
+pub fn adapt_responses_frame(frame: &mut Value) {
+    let is_create = frame
+        .get("type")
+        .and_then(Value::as_str)
+        .is_none_or(|kind| kind == "response.create");
+    if !is_create {
+        return;
+    }
+    if let Some(object) = frame.as_object_mut() {
+        object.insert("store".to_string(), json!(false));
+        object.remove("max_output_tokens");
+    }
 }
 
 pub fn rewrite_model_in_ws_frame(frame: &mut Value, model: &str) {
@@ -172,6 +191,26 @@ mod tests {
             .expect("json");
         assert_eq!(frame["type"], json!("response.create"));
         assert_eq!(frame["model"], json!("codex-mini-latest"));
+        assert_eq!(frame["store"], json!(false));
+    }
+
+    #[test]
+    fn response_create_frame_drops_unsupported_token_limit() {
+        let mut frame = json!({
+            "type": "response.create",
+            "store": true,
+            "max_output_tokens": 128,
+        });
+        adapt_responses_frame(&mut frame);
+        assert_eq!(frame["store"], json!(false));
+        assert!(frame.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn non_create_frames_are_untouched() {
+        let mut frame = json!({"type":"response.cancel","max_output_tokens":128});
+        adapt_responses_frame(&mut frame);
+        assert_eq!(frame["max_output_tokens"], json!(128));
     }
 
     #[test]

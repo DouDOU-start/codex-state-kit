@@ -2105,6 +2105,26 @@ fn is_backend_upstream(upstream: &str) -> bool {
     })
 }
 
+fn is_models_path(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    path == "/models"
+        || path == "/v1/models"
+        || path.starts_with("/models/")
+        || path.starts_with("/v1/models/")
+}
+
+/// ChatGPT's model-list endpoint requires the Codex client version query even
+/// when the downstream client uses the standard OpenAI `/v1/models` route.
+/// Add Kit's virtual CLI version only when the client did not provide one.
+fn ensure_codex_client_version(target: &str) -> Result<String> {
+    let mut url = Url::parse(target).context("upstream url")?;
+    if !url.query_pairs().any(|(key, _)| key == "client_version") {
+        url.query_pairs_mut()
+            .append_pair("client_version", identity::DEFAULT_VERSION);
+    }
+    Ok(url.to_string())
+}
+
 fn append_upstream_path(url: &mut Url, suffix: &str) {
     let base = url.path().trim_end_matches('/');
     let suffix = suffix.trim_start_matches('/');
@@ -2367,12 +2387,15 @@ async fn forward_http_tracked(
     }
     let (mut parts, body) = req.into_parts();
     let realtime_call = is_realtime_call_path(&parts.method, parts.uri.path());
-    let target = if realtime_call && is_backend_upstream(&upstream) {
+    let path = parts.uri.path();
+    let mut target = if realtime_call && is_backend_upstream(&upstream) {
         realtime_call_target(&upstream, &parts.uri)?
     } else {
         join_upstream(&upstream, &parts.uri)?
     };
-    let path = parts.uri.path();
+    if parts.method == http::Method::GET && is_models_path(path) && is_backend_upstream(&upstream) {
+        target = ensure_codex_client_version(&target)?;
+    }
 
     // 先读取 body，以便从中提取或改写 model 字段
     let mut bytes = axum::body::to_bytes(body, 32 * 1024 * 1024)
@@ -2586,14 +2609,19 @@ async fn forward_http_tracked(
     // durable billing row interrupted and impossible to price.  Native SSE
     // carries the complete usage record reliably.  Real WebSocket clients
     // still use the upstream WebSocket path in `proxy_ws` below.
-    // WebSocket 链式续跑才认 previous_response_id；走 HTTP 时必须去掉，
-    // 否则上游返回 "Invalid previous_response_id"。
+    // Normalize the public Responses request before forwarding. HTTP chaining
+    // cannot resolve a client-side previous_response_id at any upstream, while
+    // the ChatGPT Codex endpoint additionally requires store=false and
+    // rejects max_output_tokens.
     let http = app.business_client(&resolved_proxy).await?;
     if parts.method == http::Method::POST && path.contains("/responses") {
-        let stripped =
-            crate::body_model::strip_previous_response_id(&bytes, content_encoding.as_deref());
-        if stripped.as_slice() != bytes.as_ref() {
-            bytes = stripped.into();
+        let adapted = if is_backend_upstream(&upstream) {
+            crate::body_model::adapt_responses_request(&bytes, content_encoding.as_deref())
+        } else {
+            crate::body_model::strip_previous_response_id(&bytes, content_encoding.as_deref())
+        };
+        if adapted.as_slice() != bytes.as_ref() {
+            bytes = adapted.into();
             details.body_bytes = bytes.len();
         }
     }
@@ -3514,6 +3542,7 @@ async fn prepare_client_ws_frame(
     if frame.get("type").is_none() {
         frame["type"] = serde_json::json!("response.create");
     }
+    ws_bridge::adapt_responses_frame(&mut frame);
     let mut frame_context = identity::request_context_from_value(&frame);
     if let Some(request_context) = request_context {
         if frame_context.session_id.is_none() {
@@ -4004,6 +4033,48 @@ mod tests {
     }
 
     #[test]
+    fn model_aliases_are_detected_without_matching_similar_paths() {
+        for path in [
+            "/models",
+            "/models/",
+            "/models/gpt-6-astra",
+            "/v1/models",
+            "/v1/models/",
+        ] {
+            assert!(is_models_path(path), "{path}");
+        }
+        for path in [
+            "/v10/models",
+            "/v1beta/models",
+            "/files/v1/models",
+            "/model",
+        ] {
+            assert!(!is_models_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn model_target_gets_virtual_codex_client_version() {
+        let target = ensure_codex_client_version(
+            "https://chatgpt.com/backend-api/codex/models?region=us%2Fcentral",
+        )
+        .unwrap();
+        assert_eq!(
+            target,
+            "https://chatgpt.com/backend-api/codex/models?region=us%2Fcentral&client_version=0.155.0"
+        );
+
+        let already_set = ensure_codex_client_version(
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.87.1&region=us",
+        )
+        .unwrap();
+        assert_eq!(
+            already_set,
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.87.1&region=us"
+        );
+    }
+
+    #[test]
     fn joins_optional_v1_aliases_without_changing_the_upstream_base() {
         for base in [
             "https://chatgpt.com/backend-api/codex",
@@ -4380,6 +4451,59 @@ mod tests {
         assert_eq!(headers["x-codex-window-id"], "client-window");
         assert_eq!(headers["x-codex-routing-hint"], "model=client");
         assert_eq!(forwarded, body);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn business_forward_adapts_standard_responses_for_backend_upstream() {
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<(Uri, Vec<u8>)>();
+        let upstream = axum::Router::new().fallback(move |req: Request<Body>| {
+            let sent = sent.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap();
+                sent.send((parts.uri, bytes.to_vec())).unwrap();
+                "ok"
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = Arc::new(
+            App::new(Settings {
+                upstream: format!(
+                    "http://{}/backend-api/codex",
+                    listener.local_addr().unwrap()
+                ),
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        app.vm_identity.lock().await.enabled = false;
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let response = proxy_http(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-test","input":[],"store":true,"max_output_tokens":64,"previous_response_id":"resp_1"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+
+        let (uri, body) = received.recv().await.unwrap();
+        assert_eq!(uri.path(), "/backend-api/codex/responses");
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["store"], false);
+        assert!(value.get("max_output_tokens").is_none());
+        assert!(value.get("previous_response_id").is_none());
         server.abort();
     }
 
