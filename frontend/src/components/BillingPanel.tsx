@@ -1,4 +1,4 @@
-import { t, formatNumber, getLocale } from "@/lib/i18n";
+import { t, formatNumber, formatCompactTokens, getLocale } from "@/lib/i18n";
 import { useLocale } from "@/hooks/useLocale";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Select } from "@/components/Select";
@@ -70,12 +70,6 @@ function unpricedNote(totals?: BillingUsageTotals): string {
   if (missing > 0) parts.push(t("{0} 条缺少用量", [missing]));
   if (unpriced > 0) parts.push(t("{0} 条价格未匹配", [unpriced]));
   return parts.length ? ` · ${parts.join(" · ")}` : "";
-}
-
-function formatTokens(value: number): string {
-  if (value >= 1_000_000) return `${formatNumber(value / 1_000_000, { minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false })}M`;
-  if (value >= 1_000) return `${formatNumber(value / 1_000, { minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false })}K`;
-  return formatNumber(value);
 }
 
 function formatDuration(ms: number): string {
@@ -266,7 +260,7 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
               <dl>
                 <div><dt>{t("成本")}</dt><dd>{formatMoney(sumNanos(today))}</dd></div>
                 <div><dt>{t("请求")}</dt><dd>{today.length}</dd></div>
-                <div><dt>Tokens</dt><dd>{formatTokens(tokenSum(today))}</dd></div>
+                <div><dt>Tokens</dt><dd>{formatCompactTokens(tokenSum(today))}</dd></div>
               </dl>
             </section>
             <section>
@@ -280,7 +274,7 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
             <section>
               <h3>{t("性能与活跃")}</h3>
               <dl>
-                <div><dt>{t("累计 Tokens")}</dt><dd>{formatTokens(tokenSum(mine))}</dd></div>
+                <div><dt>{t("累计 Tokens")}</dt><dd>{formatCompactTokens(tokenSum(mine))}</dd></div>
                 <div><dt>{t("平均耗时")}</dt><dd>{averageMs == null ? "—" : formatDuration(averageMs)}</dd></div>
                 <div><dt>{t("活跃天数")}</dt><dd>{activeDays} / 30</dd></div>
               </dl>

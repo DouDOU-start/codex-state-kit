@@ -23,6 +23,22 @@ export function formatNumber(value: number, options: Intl.NumberFormatOptions = 
   return new Intl.NumberFormat(getLocale(), options).format(value);
 }
 
+/** Format large token counts with a compact unit for dashboard metrics. */
+export function formatCompactTokens(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  const absolute = Math.abs(value);
+  if (absolute >= 1_000_000_000) {
+    return `${formatNumber(value / 1_000_000_000, { minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false })}B`;
+  }
+  if (absolute >= 1_000_000) {
+    return `${formatNumber(value / 1_000_000, { minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false })}M`;
+  }
+  if (absolute >= 1_000) {
+    return `${formatNumber(value / 1_000, { minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false })}K`;
+  }
+  return formatNumber(value);
+}
+
 export function subscribeLocale(listener: () => void): () => void {
   listeners.add(listener);
   return () => { listeners.delete(listener); };

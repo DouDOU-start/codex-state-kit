@@ -1,4 +1,4 @@
-import { t, getLocale } from "@/lib/i18n";
+import { t, formatCompactTokens, getLocale } from "@/lib/i18n";
 import { useLocale } from "@/hooks/useLocale";
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import Shield from "lucide-react/dist/esm/icons/shield.js";
@@ -320,7 +320,7 @@ export default function App() {
             </div>
             <div title={t("滚动最近 60 秒内已收到用量统计的输入和输出 token 数；上游尚未返回用量的请求不会计入。")}>
               <dt>TPM <span>{t("最近 60 秒")}</span></dt>
-              <dd>{loggedIn ? fwd.status.accountTraffic?.tpm ?? "—" : "—"}<span>{t("tokens / 分钟")}</span></dd>
+              <dd>{loggedIn ? formatCompactTokens(fwd.status.accountTraffic?.tpm) : "—"}<span>{t("tokens / 分钟")}</span></dd>
             </div>
           </dl>
         </section>
