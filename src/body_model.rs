@@ -92,6 +92,97 @@ pub fn extract_str_field(bytes: &[u8], encoding: Option<&str>, key: &str) -> Opt
         .map(str::to_owned)
 }
 
+/// Read a top-level boolean field from a JSON request, including the request
+/// compression formats accepted by the Codex endpoint.
+pub fn extract_bool_field(bytes: &[u8], encoding: Option<&str>, key: &str) -> Option<bool> {
+    let plain = match detect_body_compression(bytes, encoding) {
+        None => bytes.to_vec(),
+        Some("zstd") => zstd::decode_all(std::io::Cursor::new(bytes)).ok()?,
+        Some("gzip") => decompress_named(bytes, "gzip")?,
+        Some("deflate") => {
+            decompress_named(bytes, "deflate").or_else(|| decompress_named(bytes, "raw_deflate"))?
+        }
+        Some(_) => return None,
+    };
+    serde_json::from_slice::<Value>(&plain)
+        .ok()?
+        .get(key)
+        .and_then(Value::as_bool)
+}
+
+/// Decode a response body while preserving the formats Kit can inspect.
+pub fn decode_body(bytes: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    match detect_body_compression(bytes, encoding) {
+        None => Ok(bytes.to_vec()),
+        Some("zstd") => zstd::decode_all(std::io::Cursor::new(bytes))
+            .map_err(|_| "无法解压 zstd 响应体".to_string()),
+        Some("gzip") => {
+            decompress_named(bytes, "gzip").ok_or_else(|| "无法解压 gzip 响应体".to_string())
+        }
+        Some("deflate") => decompress_named(bytes, "deflate")
+            .or_else(|| decompress_named(bytes, "raw_deflate"))
+            .ok_or_else(|| "无法解压 deflate 响应体".to_string()),
+        Some(other) => Err(format!("不支持的响应体压缩: {other}")),
+    }
+}
+
+/// Convert the terminal event of a streamed Responses response to the normal
+/// non-streaming Responses JSON envelope expected by standard clients.
+pub fn responses_sse_to_json(bytes: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    let plain = decode_body(bytes, encoding)?;
+    if let Ok(value) = serde_json::from_slice::<Value>(&plain) {
+        return serde_json::to_vec(&value).map_err(|_| "无法序列化 Responses 响应".to_string());
+    }
+
+    let mut event_data = Vec::new();
+    let mut terminal = None;
+    let mut consume_event = |data: &[u8]| {
+        let data = data.strip_suffix(b"\n").unwrap_or(data);
+        if data.is_empty() || data == b"[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(data) else {
+            return;
+        };
+        let event_type = value.get("type").and_then(Value::as_str);
+        if matches!(
+            event_type,
+            Some(
+                "response.completed"
+                    | "response.done"
+                    | "response.failed"
+                    | "response.incomplete"
+                    | "response.cancelled"
+                    | "response.canceled"
+            )
+        ) {
+            terminal = Some(value.get("response").cloned().unwrap_or(value));
+        }
+    };
+
+    for line in plain.split(|byte| *byte == b'\n' || *byte == b'\r') {
+        if line.is_empty() {
+            consume_event(&event_data);
+            event_data.clear();
+            continue;
+        }
+        let Some(data) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let data = data.strip_prefix(b" ").unwrap_or(data);
+        event_data.extend_from_slice(data);
+        event_data.push(b'\n');
+    }
+    consume_event(&event_data);
+
+    terminal
+        .map(|value| {
+            serde_json::to_vec(&value).map_err(|_| "无法序列化 Responses 响应".to_string())
+        })
+        .transpose()?
+        .ok_or_else(|| "上游 SSE 响应缺少终止 Responses 事件".to_string())
+}
+
 /// Codex HTTP `/responses` 不接受 `previous_response_id`（只有 WebSocket 链式续跑会用），
 /// 走 HTTP 转发前去掉它，否则上游返回 `Invalid previous_response_id`。
 /// 字段不存在、正文无法解析或无法重新压缩时原样返回。
@@ -116,10 +207,10 @@ pub fn strip_previous_response_id(bytes: &[u8], encoding: Option<&str>) -> Vec<u
 
 /// Normalize a standard OpenAI Responses request for the ChatGPT Codex
 /// upstream.  The public Responses API defaults `store` to true and permits
-/// `max_output_tokens`, while the Codex endpoint requires `store: false` and
-/// rejects `max_output_tokens`.  HTTP chaining also uses a client-side
-/// `previous_response_id`, which the endpoint cannot resolve, so remove it in
-/// the same pass.
+/// `max_output_tokens`, while the Codex endpoint requires `store: false`,
+/// `stream: true`, and rejects `max_output_tokens`. HTTP chaining also uses a
+/// client-side `previous_response_id`, which the endpoint cannot resolve, so
+/// remove it in the same pass.
 ///
 /// Invalid or non-JSON bodies are passed through unchanged.  The request may
 /// be compressed, so preserve the original encoding when the JSON is changed.
@@ -156,6 +247,10 @@ fn adapt_responses_json(bytes: &[u8]) -> Option<Vec<u8>> {
 
     if object.get("store").and_then(Value::as_bool) != Some(false) {
         object.insert("store".into(), Value::Bool(false));
+        changed = true;
+    }
+    if object.get("stream").and_then(Value::as_bool) != Some(true) {
+        object.insert("stream".into(), Value::Bool(true));
         changed = true;
     }
     if object.remove("max_output_tokens").is_some() {
@@ -331,6 +426,7 @@ mod tests {
         let input = br#"{"model":"gpt-6-astra","input":[],"store":true,"max_output_tokens":128,"previous_response_id":"resp_1"}"#;
         let value: Value = serde_json::from_slice(&adapt_responses_request(input, None)).unwrap();
         assert_eq!(value.get("store").and_then(Value::as_bool), Some(false));
+        assert_eq!(value.get("stream").and_then(Value::as_bool), Some(true));
         assert!(value.get("max_output_tokens").is_none());
         assert!(value.get("previous_response_id").is_none());
     }
@@ -355,7 +451,36 @@ mod tests {
                 Some(false),
                 "{encoding}"
             );
+            assert_eq!(
+                value.get("stream").and_then(Value::as_bool),
+                Some(true),
+                "{encoding}"
+            );
             assert!(value.get("max_output_tokens").is_none(), "{encoding}");
         }
+    }
+
+    #[test]
+    fn responses_sse_to_json_returns_terminal_response() {
+        let body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-astra\",\"usage\":{\"input_tokens\":7,\"output_tokens\":5}}}\n\n",
+        );
+        let value: Value =
+            serde_json::from_slice(&responses_sse_to_json(body.as_bytes(), None).unwrap()).unwrap();
+        assert_eq!(value["id"], "resp_1");
+        assert_eq!(value["usage"]["input_tokens"], 7);
+        assert_eq!(value["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn extract_bool_field_reads_stream_from_compressed_body() {
+        let plain = br#"{"stream":false}"#;
+        let compressed = zstd::encode_all(plain.as_slice(), 3).unwrap();
+        assert_eq!(
+            extract_bool_field(&compressed, Some("zstd"), "stream"),
+            Some(false)
+        );
     }
 }

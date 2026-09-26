@@ -277,6 +277,10 @@ pub struct NetworkLogDetails {
     pub first_token_ms: Option<u128>,
     pub output_tokens: Option<u64>,
     pub tokens_per_second: Option<f64>,
+    /// The downstream requested a regular JSON Responses envelope instead of SSE.
+    /// The upstream Codex endpoint only accepts streaming, so proxy_http converts
+    /// the terminal SSE event back to JSON before returning it.
+    pub responses_non_stream: bool,
     pub in_progress: bool,
     pub stream_lifecycle: Option<Arc<StreamLifecycle>>,
     pub diag: Option<crate::diag::Request>,

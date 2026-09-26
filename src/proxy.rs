@@ -1396,6 +1396,7 @@ fn is_websocket(req: &Request<Body>) -> bool {
 }
 
 async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
+    const MAX_NON_STREAM_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
     let started = Instant::now();
     let method = req.method().clone();
     let path = logs::safe_text(req.uri().path(), 256);
@@ -1502,6 +1503,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                     }),
                 );
             }
+            let responses_non_stream = details.responses_non_stream;
             let entry = LogEntry::new(
                 method.as_str(),
                 &path,
@@ -1663,6 +1665,41 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                     next.map(|item| (item, (stream, tracker)))
                 },
             );
+            if responses_non_stream {
+                let body = Body::from_stream(stream);
+                let bytes = match axum::body::to_bytes(body, MAX_NON_STREAM_RESPONSE_BYTES).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            format!("上游 Responses 响应读取失败: {error}"),
+                        )
+                            .into_response();
+                    }
+                };
+                let encoding = parts
+                    .headers
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok());
+                let converted = match crate::body_model::responses_sse_to_json(&bytes, encoding) {
+                    Ok(converted) => converted,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            format!("上游 Responses 响应缺少终止事件: {error}"),
+                        )
+                            .into_response();
+                    }
+                };
+                let mut parts = parts;
+                parts.headers.remove(header::CONTENT_ENCODING);
+                parts.headers.remove(header::CONTENT_LENGTH);
+                parts.headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                return Response::from_parts(parts, Body::from(converted));
+            }
             Response::from_parts(parts, Body::from_stream(stream))
         }
         Err(err) => {
@@ -2409,6 +2446,19 @@ async fn forward_http_tracked(
         .and_then(|v| v.to_str().ok())
         .map(|value| value.to_string());
     details.content_encoding = logs::safe_content_encoding(content_encoding.as_deref());
+    if parts.method == http::Method::POST
+        && path.contains("/responses")
+        && is_backend_upstream(&upstream)
+    {
+        let accepts_sse = parts
+            .headers
+            .get(header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+        let stream =
+            crate::body_model::extract_bool_field(&bytes, content_encoding.as_deref(), "stream");
+        details.responses_non_stream = !stream.unwrap_or(accepts_sse);
+    }
     if realtime_call && is_backend_upstream(&upstream) {
         bytes = realtime_backend_body(
             &bytes,
@@ -4474,7 +4524,14 @@ mod tests {
                 let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap();
                 sent.send((parts.uri, parts.headers, bytes.to_vec()))
                     .unwrap();
-                "ok"
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(
+                        "data: {\"type\":\"response.created\"}\n\n"
+                            .to_string()
+                            + "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\",\"usage\":{\"input_tokens\":7,\"output_tokens\":5}}}\n\n",
+                    ))
+                    .unwrap()
             }
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4506,7 +4563,8 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        axum::body::to_bytes(response.into_body(), 1024)
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let response_body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
 
@@ -4515,8 +4573,13 @@ mod tests {
         assert_eq!(headers[header::ACCEPT_ENCODING], "gzip, deflate");
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], true);
         assert!(value.get("max_output_tokens").is_none());
         assert!(value.get("previous_response_id").is_none());
+        let response_value: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(response_value["id"], "resp_1");
+        assert_eq!(response_value["usage"]["input_tokens"], 7);
+        assert_eq!(response_value["usage"]["output_tokens"], 5);
         server.abort();
     }
 
