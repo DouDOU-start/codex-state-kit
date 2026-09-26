@@ -6,7 +6,6 @@ import CircleArrowDown from "lucide-react/dist/esm/icons/circle-arrow-down.js";
 import CircleArrowUp from "lucide-react/dist/esm/icons/circle-arrow-up.js";
 import PencilLine from "lucide-react/dist/esm/icons/pencil-line.js";
 import Route from "lucide-react/dist/esm/icons/route.js";
-import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
 import X from "lucide-react/dist/esm/icons/x.js";
 import { getBillingRecords, getBillingRevision, getBillingSummary, isTauri } from "@/lib/api";
@@ -15,7 +14,6 @@ import { PAGE_SIZES, Pager } from "@/components/Pager";
 import { RefreshControl } from "@/components/RefreshControl";
 import { usePolling } from "@/hooks/usePolling";
 import { useNotify } from "@/components/Notifier";
-import { SHOW_SUSPECTED_DOWNGRADE_UI } from "@/lib/uiFlags";
 import type { BillingRecord, DowngradeReport, LogEntry, SavedAccount, Status } from "@/types";
 
 interface UsageRecordsPanelProps {
@@ -91,6 +89,12 @@ function formatDuration(ms?: number | null): string {
   return `${formatNumber(Math.floor(seconds / 60))}m ${formatNumber(seconds % 60)}s`;
 }
 
+function formatTokensPerSecond(value?: number | null): string {
+  if (value == null || !Number.isFinite(value) || value < 0) return "—";
+  if (value >= 1000) return `${formatNumber(value, { maximumFractionDigits: 0 })}`;
+  return formatNumber(value, { maximumFractionDigits: 1, useGrouping: false });
+}
+
 type Speed = "fast" | "mid" | "slow" | "none";
 
 /** 首字 5 秒 / 15 秒、总耗时 60 秒 / 180 秒为快慢分界。 */
@@ -107,6 +111,20 @@ function durationMs(record: BillingRecord): number | null {
   if (!record.finishedAt) return null;
   const ms = Date.parse(record.finishedAt) - Date.parse(record.startedAt);
   return Number.isFinite(ms) && ms >= 0 ? ms : null;
+}
+
+/**
+ * Compute generation throughput from the durable request timestamps. The
+ * network log is only a bounded best-effort fallback and may belong to a
+ * nearby request, so it must not override the persisted billing duration.
+ */
+function tokensPerSecond(record: BillingRecord, log?: LogEntry): number | null {
+  const duration = durationMs(record) ?? log?.ms ?? null;
+  const output = record.outputTokens;
+  if (output == null || duration == null || duration <= 0) return null;
+  const firstToken = record.firstTokenMs ?? log?.firstTokenMs ?? 0;
+  const generationMs = duration > firstToken ? duration - firstToken : duration;
+  return generationMs > 0 ? output * 1000 / generationMs : null;
 }
 
 function recordClock(record: BillingRecord): { time: string; date: string } {
@@ -188,7 +206,6 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
   const [accounts, setAccounts] = useState<[string, string][]>([]);
   /** 空字符串表示全部账号。 */
   const [accountId, setAccountId] = useState("");
-  const [onlyDowngraded, setOnlyDowngraded] = useState(false);
   const [detailRecord, setDetailRecord] = useState<BillingRecord | null>(null);
   const { notify } = useNotify();
   const reportError = useCallback((cause: unknown) => {
@@ -211,7 +228,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
   }, [detailRecord]);
 
   /** `silent`: an auto-refresh, so no spinner and no jump back to the top. */
-  const loadPage = useCallback(async (account: string, pageIndex: number, downgraded: boolean, size: number, silent = false) => {
+  const loadPage = useCallback(async (account: string, pageIndex: number, size: number, silent = false) => {
     const seq = ++requestSeq.current;
     if (!silent) setLoading(true);
     try {
@@ -219,7 +236,6 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
       const revision = await getBillingRevision();
       const result = await getBillingRecords({
         accountId: account || null,
-        downgraded: downgraded || null,
         limit: size,
         offset: pageIndex * size,
       });
@@ -262,15 +278,15 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
   }, [active, loadAccounts]);
 
   useEffect(() => {
-    if (active) void loadPage(accountId, page, onlyDowngraded, pageSize);
-  }, [active, accountId, page, onlyDowngraded, pageSize, loadPage]);
+    if (active) void loadPage(accountId, page, pageSize);
+  }, [active, accountId, page, pageSize, loadPage]);
 
   // Auto-refresh: a cheap revision check each tick, a reload only on change.
   usePolling(async () => {
     const revision = await getBillingRevision();
     if (revision === shownRevision.current) return;
     const knownTotal = total;
-    await loadPage(accountId, page, onlyDowngraded, pageSize, true);
+    await loadPage(accountId, page, pageSize, true);
     // New records may come from an account not in the filter yet.
     if (knownTotal === 0 || accounts.length === 0) void loadAccounts();
   }, refreshMs, active);
@@ -285,22 +301,9 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
     }
   };
 
-  const explainDowngrade = (record: BillingRecord, report: DowngradeReport) => {
-    notify({
-      id: `downgrade-${record.requestId}`,
-      kind: report.verdict === "confirmed" ? "error" : "warn",
-      title: `${downgradeLabel(report)}（${recordClock(record).time}）`,
-      message: (
-        <ul className="downgrade-signals">
-          {report.signals.map((signal) => <li key={signal}>{signal}</li>)}
-        </ul>
-      ),
-    });
-  };
-
   const refresh = () => {
     void loadAccounts();
-    void loadPage(accountId, page, onlyDowngraded, pageSize);
+    void loadPage(accountId, page, pageSize);
   };
 
   const visible = records;
@@ -338,16 +341,6 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
             }}
           />
         </div>
-        <label className="pricing-toggle">
-          <input
-            type="checkbox"
-            checked={onlyDowngraded}
-            onChange={(event) => {
-              setOnlyDowngraded(event.target.checked);
-              setPage(0);
-            }}
-          />
-          {t("只看降智请求")} </label>
         <span>{t("按请求开始时间排列")}</span>
       </div>
       <div className="usage-records__table" ref={tableRef}>
@@ -367,7 +360,11 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                 const clock = recordClock(record);
                 const log = matchLog(record, status.logs);
                 const first = record.firstTokenMs ?? log?.firstTokenMs ?? null;
-                const total = log?.ms ?? durationMs(record);
+                // Billing timestamps are the source of truth for request
+                // latency. A matched in-memory log is only a fallback for
+                // records from older runs that predate persisted finish time.
+                const total = durationMs(record) ?? log?.ms ?? null;
+                const throughput = tokensPerSecond(record, log);
                 const model = record.sentModel || record.requestedModel || t("未知模型");
                 const requested = record.requestedModel || model;
                 const response = record.responseModel;
@@ -381,7 +378,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                   ? null
                   : (record.inputTokens ?? 0) + (record.outputTokens ?? 0);
                 return (
-                  <tr key={record.requestId} className={record.downgrade && (SHOW_SUSPECTED_DOWNGRADE_UI || record.downgrade.verdict !== "suspected") ? `usage-row--${record.downgrade.verdict}` : undefined}>
+                  <tr key={record.requestId}>
                     <td className="usage-table__time">
                       <strong>{clock.time}</strong>
                       <small>{clock.date}</small>
@@ -407,17 +404,6 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                           </span>
                         )}
                       </div>
-                      {record.downgrade && (SHOW_SUSPECTED_DOWNGRADE_UI || record.downgrade.verdict !== "suspected") ? (
-                        <button
-                          type="button"
-                          className={`usage-downgrade usage-downgrade--${record.downgrade.verdict}`}
-                          title={t("查看判定依据")}
-                          onClick={() => explainDowngrade(record, record.downgrade!)}
-                        >
-                          <TriangleAlert size={11} />
-                          {downgradeLabel(record.downgrade)}
-                        </button>
-                      ) : null}
                       {record.pricingModel && record.pricingModel !== model ? <small>{t("按 {0} 计价", [record.pricingModel])}</small> : null}
                       {tier || record.longContext ? (
                         <span className="usage-table__badges">
@@ -432,6 +418,8 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                         <span className={`usage-speed--${speed(first, FIRST_TOKEN_LIMITS)}`}>{formatDuration(first)}</span>
                         <span className="usage-latency__label">{t("总耗时")}</span>
                         <span className={`usage-speed--${speed(total, TOTAL_LIMITS)}`}>{formatDuration(total)}</span>
+                        <span className="usage-latency__label">tok/s</span>
+                        <span>{formatTokensPerSecond(throughput)}</span>
                       </div>
                     </td>
                     <td className="usage-table__meter">
@@ -461,8 +449,8 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
         ) : (
           <div className="usage-records__empty">
             <Route size={24} strokeWidth={1.5} />
-            <strong>{onlyDowngraded ? t("没有降智请求") : t("还没有使用记录")}</strong>
-            <p>{onlyDowngraded ? t("没有检测到被改路由或安全缓冲的请求。") : t("完成一次上游请求后，时间和用量会列在这里。")}</p>
+            <strong>{t("还没有使用记录")}</strong>
+            <p>{t("完成一次上游请求后，时间和用量会列在这里。")}</p>
           </div>
         )}
       </div>
@@ -511,6 +499,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                 <div><dt>{t("用量来源")}</dt><dd>{detailRecord.usageSource || "—"}</dd></div>
                 <div><dt>{t("输入 tokens")}</dt><dd>{detailRecord.inputTokens ?? "—"}</dd></div>
                 <div><dt>{t("输出 tokens")}</dt><dd>{detailRecord.outputTokens ?? "—"}</dd></div>
+                <div><dt>tok/s</dt><dd>{formatTokensPerSecond(tokensPerSecond(detailRecord, detailLog))}</dd></div>
               </dl>
               <p className="record-detail__hint">{unpricedLabel(detailRecord).title}</p>
               <code className="record-detail__id">{t("请求 ID：")}{detailRecord.requestId}</code>

@@ -70,6 +70,37 @@ pub struct WsDial {
     pub preserve_client_identity: bool,
 }
 
+/// A long-lived WebSocket used by realtime voice sessions.
+///
+/// Responses turns use [`WsUpstreamPool`] because each turn is a JSON request
+/// with a terminal event. Realtime voice sessions are different: audio and
+/// control frames flow in both directions for the lifetime of the call, so
+/// they must bypass the Responses pool and retain their original framing.
+pub struct RawWebSocket {
+    ws: WebSocketStream<BoxIo>,
+    headers: http::HeaderMap,
+}
+
+impl RawWebSocket {
+    pub fn headers(&self) -> &http::HeaderMap {
+        &self.headers
+    }
+
+    pub async fn send(&mut self, message: Message) -> Result<()> {
+        self.ws
+            .send(message)
+            .await
+            .context("发送上游 WebSocket 帧失败")
+    }
+
+    pub async fn next(&mut self) -> Option<Result<Message>> {
+        self.ws
+            .next()
+            .await
+            .map(|result| result.context("读取上游 WebSocket 帧"))
+    }
+}
+
 impl WsDial {
     fn key(&self) -> String {
         // Turn metadata is deliberately excluded: it describes one request,
@@ -202,6 +233,13 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl WsUpstreamPool {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Opens a raw realtime WebSocket. Unlike `open_turn`, this does not send
+    /// an initial JSON frame or stop at a Responses terminal event.
+    pub async fn connect_raw(&self, dial: WsDial) -> Result<RawWebSocket> {
+        let (ws, headers) = connect_upstream_with_config(&dial, false).await?;
+        Ok(RawWebSocket { ws, headers })
     }
 
     /// Drops every connection (in-flight turns finish first) and re-warms:
@@ -667,6 +705,13 @@ async fn read_one(conn: &mut Option<Live>, saw_event: bool) -> Read {
 }
 
 async fn connect_upstream(dial: &WsDial) -> Result<(WebSocketStream<BoxIo>, http::HeaderMap)> {
+    connect_upstream_with_config(dial, true).await
+}
+
+async fn connect_upstream_with_config(
+    dial: &WsDial,
+    responses_transport: bool,
+) -> Result<(WebSocketStream<BoxIo>, http::HeaderMap)> {
     let url = Url::parse(&dial.url).context("上游 WebSocket 地址无效")?;
     let mut request = dial
         .url
@@ -674,7 +719,9 @@ async fn connect_upstream(dial: &WsDial) -> Result<(WebSocketStream<BoxIo>, http
         .into_client_request()
         .context("无法构造 WebSocket 握手")?;
     let headers = request.headers_mut();
-    insert_header(headers, "OpenAI-Beta", OPENAI_BETA);
+    if responses_transport {
+        insert_header(headers, "OpenAI-Beta", OPENAI_BETA);
+    }
     if !dial.authorization.is_empty() {
         insert_header(headers, "Authorization", &dial.authorization);
     }
@@ -685,10 +732,12 @@ async fn connect_upstream(dial: &WsDial) -> Result<(WebSocketStream<BoxIo>, http
         insert_header(headers, name, value);
     }
     let io = dial_io(&url, &dial.proxy).await?;
-    let (stream, response) =
-        tokio_tungstenite::client_async_with_config(request, io, Some(websocket_config()))
-            .await
-            .context("上游 WebSocket 握手失败")?;
+    let config = responses_transport
+        .then(websocket_config)
+        .or_else(|| Some(WebSocketConfig::default()));
+    let (stream, response) = tokio_tungstenite::client_async_with_config(request, io, config)
+        .await
+        .context("上游 WebSocket 握手失败")?;
     Ok((stream, response.headers().clone()))
 }
 

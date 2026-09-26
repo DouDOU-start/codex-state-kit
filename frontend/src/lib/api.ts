@@ -37,7 +37,7 @@ const defaultStatus = (): Status => ({
   forcedModel: "",
   currentAccountId: "mock-account-b",
   currentAccountEmail: "mock@example.com",
-  accountTraffic: { concurrentRequests: 2, rpm: 18 },
+  accountTraffic: { concurrentRequests: 2, rpm: 18, tpm: 12480 },
   proxyListen: "127.0.0.1:8787",
   upstream: "https://chatgpt.com/backend-api/codex",
   codexHome: "~/.codex",
@@ -663,7 +663,6 @@ export async function getBillingRecords(query: BillingQuery = {}): Promise<Billi
       to: query.to ?? null,
       source: query.source ?? null,
       model: query.model ?? null,
-      downgraded: query.downgraded ?? null,
       limit: query.limit ?? 50,
       offset: query.offset ?? 0,
     });
@@ -672,8 +671,6 @@ export async function getBillingRecords(query: BillingQuery = {}): Promise<Billi
     if (query.accountId && record.accountId !== query.accountId) return false;
     if (query.source && record.source !== query.source) return false;
     if (query.model && record.sentModel !== query.model && record.requestedModel !== query.model) return false;
-    if (query.downgraded === true && !record.downgrade) return false;
-    if (query.downgraded === false && record.downgrade) return false;
     return true;
   });
   const limit = query.limit ?? 50;

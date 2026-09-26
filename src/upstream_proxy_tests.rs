@@ -234,7 +234,8 @@ async fn upstream_proxy_hot_update_and_failures() {
             app.traffic.view(Some("failed-account"), Instant::now()),
             AccountTraffic {
                 concurrent_requests: 0,
-                rpm: 1
+                rpm: 1,
+                tpm: 0,
             }
         );
         let failed_log = app.logs.lock().await.back().cloned().unwrap();
@@ -378,7 +379,8 @@ async fn verify_response_metrics() {
             app.traffic.view(Some("metrics-account"), Instant::now()),
             AccountTraffic {
                 concurrent_requests: 1,
-                rpm: 1
+                rpm: 1,
+                tpm: 0,
             }
         );
         if outcome == "cancel_headers" {
@@ -388,7 +390,8 @@ async fn verify_response_metrics() {
                 app.traffic.view(Some("metrics-account"), Instant::now()),
                 AccountTraffic {
                     concurrent_requests: 0,
-                    rpm: 1
+                    rpm: 1,
+                    tpm: 0,
                 }
             );
             drop(release_tx);
@@ -518,7 +521,8 @@ async fn verify_response_metrics() {
             app.traffic.view(Some("metrics-account"), Instant::now()),
             AccountTraffic {
                 concurrent_requests: 0,
-                rpm: 1
+                rpm: 1,
+                tpm: 0,
             }
         );
     }
@@ -690,6 +694,82 @@ async fn forced_model_rewrites_downstream_request() {
         assert!(body.contains("\"model\":\"gpt-6-astra\""), "{body}");
         assert!(!body.contains("gpt-5.4"), "{body}");
         assert_eq!(details.model.as_deref(), Some("gpt-6-astra"));
+        server.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn backend_realtime_call_forwards_sdp_and_location() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let home = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let headers = read_headers(&mut socket).await;
+            assert!(headers.starts_with(
+                "POST /backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas HTTP/1.1"
+            ));
+            assert!(headers.to_ascii_lowercase().contains("content-type: application/json"));
+            let length = headers
+                .to_ascii_lowercase()
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["sdp"], "v=offer\r\n");
+            assert_eq!(body["session"]["voice"], "alloy");
+            assert!(body["session"].get("id").is_none());
+            socket
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Type: application/sdp\r\nLocation: /v1/live/rtc_test\r\nContent-Length: 10\r\nConnection: close\r\n\r\nv=answer\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let app = App::new(Settings {
+            upstream: format!("http://{addr}/backend-api/codex"),
+            codex_home: home.path().display().to_string(),
+            ..Settings::default()
+        })
+        .unwrap();
+        let boundary = "codex-realtime-call-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"sdp\"\r\nContent-Type: application/sdp\r\n\r\nv=offer\r\n\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"session\"\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"thread-1\",\"voice\":\"alloy\"}}\r\n--{boundary}--\r\n"
+        );
+        let mut details = NetworkLogDetails::default();
+        let response = forward_http_with_log(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/live")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+            &mut details,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/v1/live/rtc_test"
+        );
+        assert_eq!(
+            &axum::body::to_bytes(response.into_body(), 64)
+                .await
+                .unwrap()[..],
+            b"v=answer\r\n"
+        );
         server.await.unwrap();
     })
     .await

@@ -95,6 +95,23 @@ function tokenSum(records: BillingRecord[]): number {
   return records.reduce((sum, record) => sum + (record.inputTokens ?? 0) + (record.outputTokens ?? 0), 0);
 }
 
+/**
+ * Dashboard rollups (today, trend, latency and model distribution) must use
+ * every record in the selected window. The records endpoint caps one page at
+ * 500 rows, so loading only its first page silently under-counted busy users.
+ */
+async function getAllBillingRecords(from: string, to: string): Promise<BillingRecord[]> {
+  const pageSize = 500;
+  const first = await getBillingRecords({ from, to, limit: pageSize, offset: 0 });
+  if (first.total <= first.records.length) return first.records;
+  const offsets = [];
+  for (let offset = pageSize; offset < first.total; offset += pageSize) offsets.push(offset);
+  const pages = await Promise.all(
+    offsets.map((offset) => getBillingRecords({ from, to, limit: pageSize, offset })),
+  );
+  return [first.records, ...pages.map((page) => page.records)].flat();
+}
+
 export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccounts, active, refreshMs, onRefreshMsChange }: BillingPanelProps) {
   useLocale();
   const [summary, setSummary] = useState<BillingSummary | null>(null);
@@ -119,11 +136,11 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
       const [nextSummary, nextLifetime, nextRecords] = await Promise.all([
         getBillingSummary({ from, to }),
         getBillingSummary(),
-        getBillingRecords({ from, to, limit: 500, offset: 0 }),
+        getAllBillingRecords(from, to),
       ]);
       setSummary(nextSummary);
       setLifetime(nextLifetime);
-      setRecords(nextRecords.records);
+      setRecords(nextRecords);
       setError(null);
       shownRevision.current = revision;
       // Accounts with only older usage stay selectable.

@@ -296,6 +296,10 @@ export default function App() {
               <dt>RPM <span>{t("最近 60 秒")}</span></dt>
               <dd>{loggedIn ? fwd.status.accountTraffic?.rpm ?? "—" : "—"}<span>{t("次 / 分钟")}</span></dd>
             </div>
+            <div title={t("滚动最近 60 秒内已收到用量统计的输入和输出 token 数；上游尚未返回用量的请求不会计入。")}>
+              <dt>TPM <span>{t("最近 60 秒")}</span></dt>
+              <dd>{loggedIn ? fwd.status.accountTraffic?.tpm ?? "—" : "—"}<span>{t("tokens / 分钟")}</span></dd>
+            </div>
           </dl>
         </section>
 

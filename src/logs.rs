@@ -495,6 +495,11 @@ pub struct ResponseMetrics {
     cache_write_tokens: Option<u64>,
     reasoning_tokens: Option<u64>,
     usage_seen: bool,
+    /// Once a terminal event reports usage, ignore later non-terminal usage
+    /// fragments. Some upstreams emit an informational usage object before
+    /// `response.completed`; a late fragment must not overwrite the final
+    /// counters and make billing nondeterministic.
+    usage_terminal: bool,
     upstream_response_model: Option<String>,
     service_tier: Option<String>,
     downgrade: crate::downgrade::DowngradeSignals,
@@ -729,12 +734,16 @@ impl ResponseMetrics {
     }
 
     /// Start retaining only bounded metadata for an event that exceeded the
-    /// normal inspection limit. The head is used only to identify a protocol
-    /// event; complete usage/error objects are decoded on the native WS path.
+    /// normal inspection limit. The head identifies protocol metadata while a
+    /// small tail is enough to recover terminal usage without retaining output
+    /// or tool payloads.
     fn begin_large_event(&mut self, extra: &[u8]) {
         // `skip_event` is set as soon as a line crosses the bound, before the
-        // line reaches the delimiter where its head/tail are assembled.
-        if !self.skip_event || self.large_tail.is_empty() {
+        // line reaches the delimiter where its head/tail are assembled. At
+        // that point `data` is still empty, so retain the head from `extra`
+        // while preserving the tail collected from `line_tail`.
+        let was_skipped = self.skip_event;
+        if !was_skipped {
             let existing = std::mem::take(&mut self.data);
             self.data
                 .extend_from_slice(&existing[..existing.len().min(MAX_EVENT_HEAD_BYTES)]);
@@ -744,7 +753,16 @@ impl ResponseMetrics {
             }
             self.large_tail.clear();
             self.append_large_tail(&existing);
-            self.skip_event = true;
+        } else if self.data.is_empty() {
+            self.data
+                .extend_from_slice(&extra[..extra.len().min(MAX_EVENT_HEAD_BYTES)]);
+        }
+        self.skip_event = true;
+        if was_skipped {
+            // `extra` is usually the line prefix at the delimiter; its tail
+            // would replace the true event tail already retained in
+            // `line_tail`, so leave that tail untouched.
+            return;
         }
         self.append_large_tail(extra);
     }
@@ -760,8 +778,9 @@ impl ResponseMetrics {
         }
     }
 
-    /// Decode only small metadata fragments from an oversized JSON event.
-    /// Output/tool payloads are intentionally never retained or parsed.
+    /// Decode only bounded metadata fragments from an oversized event.
+    /// Output/tool payloads are intentionally never retained or parsed; a
+    /// complete usage object in the retained tail is safe to inspect.
     fn observe_large_event(&mut self, elapsed_ms: u128) {
         let head = self.data.clone();
         let event_type = find_event_type(&head);
@@ -788,6 +807,19 @@ impl ResponseMetrics {
             };
             if self.first_token_ms.is_none() && large_event_has_visible_output(event_type) {
                 self.first_token_ms = Some(elapsed_ms);
+            }
+        }
+        // The normal JSON parser deliberately skips oversized events to keep
+        // response inspection bounded. The usage object is small and normally
+        // lives near the end of a terminal event, so inspect only the retained
+        // head/tail fragments. This also works for large non-streaming JSON
+        // responses, which have no event `type` field.
+        let terminal = event_type.as_deref().is_some_and(is_terminal_event);
+        let tail = self.large_tail.clone();
+        for fragment in [head.as_slice(), tail.as_slice()] {
+            if let Some(usage) = find_usage_object(fragment) {
+                self.observe_usage(&usage, terminal);
+                break;
             }
         }
     }
@@ -920,16 +952,10 @@ impl ResponseMetrics {
         if let Some(event_type) = json.get("type").and_then(serde_json::Value::as_str) {
             self.record_sse_event_type(event_type);
         }
-        let terminal = matches!(
-            json.get("type").and_then(serde_json::Value::as_str),
-            Some(
-                "response.completed"
-                    | "response.done"
-                    | "response.failed"
-                    | "response.incomplete"
-                    | "response.cancelled"
-                    | "response.canceled"
-            )
+        let terminal = is_terminal_event(
+            json.get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
         );
         if terminal {
             self.terminal_event_seen = true;
@@ -990,18 +1016,22 @@ impl ResponseMetrics {
         // `response.usage` (Responses SSE terminal events). Parse both when
         // present so a provider can split counters across the two envelopes.
         if let Some(usage) = json.get("usage").filter(|usage| usage.is_object()) {
-            self.observe_usage(usage);
+            self.observe_usage(usage, terminal);
         }
         if let Some(usage) = json
             .pointer("/response/usage")
             .filter(|usage| usage.is_object())
         {
-            self.observe_usage(usage);
+            self.observe_usage(usage, terminal);
         }
     }
 
-    fn observe_usage(&mut self, usage: &serde_json::Value) {
+    fn observe_usage(&mut self, usage: &serde_json::Value, terminal: bool) {
+        if self.usage_terminal && !terminal {
+            return;
+        }
         self.usage_seen = true;
+        self.usage_terminal |= terminal;
         if let Some(tokens) = find_usage_tokens(usage, &["input_tokens", "prompt_tokens"]) {
             self.input_tokens = Some(tokens);
         }
@@ -1118,6 +1148,126 @@ fn large_event_has_visible_output(event_type: &str) -> bool {
             | "response.reasoning_summary_part.added"
             | "response.reasoning_summary_part.done"
     )
+}
+
+fn is_terminal_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.completed"
+            | "response.done"
+            | "response.failed"
+            | "response.incomplete"
+            | "response.cancelled"
+            | "response.canceled"
+    )
+}
+
+/// Finds a small provider `usage` object in a bounded event fragment.
+///
+/// Oversized SSE/JSON events are represented by a head and a tail only. A
+/// complete usage object is normally in the tail, but it can also be in the
+/// head for non-streaming responses. We scan JSON strings carefully so a
+/// generated output string containing the word `usage` cannot be mistaken for
+/// provider metadata, then parse only the balanced object following the key.
+fn find_usage_object(fragment: &[u8]) -> Option<serde_json::Value> {
+    let needle = b"\"usage\"";
+    let mut offset = 0;
+    while let Some(relative) = fragment[offset..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        let start = offset + relative;
+        // An escaped quote belongs to a JSON string value, not an object key.
+        let mut backslashes = 0;
+        let mut cursor = start;
+        while cursor > 0 && fragment[cursor - 1] == b'\\' {
+            backslashes += 1;
+            cursor -= 1;
+        }
+        if backslashes % 2 != 0 {
+            offset = start + needle.len();
+            continue;
+        }
+        cursor = start + needle.len();
+        while fragment.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if fragment.get(cursor) != Some(&b':') {
+            offset = start + needle.len();
+            continue;
+        }
+        cursor += 1;
+        while fragment.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if fragment.get(cursor) != Some(&b'{') {
+            offset = start + needle.len();
+            continue;
+        }
+        if let Some(end) = balanced_object_end(fragment, cursor) {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&fragment[cursor..=end])
+            {
+                // Require at least one usage-shaped field. This filters a
+                // generated structured-output object named `usage` while
+                // still accepting all supported provider aliases and details
+                // objects.
+                let usage_field = [
+                    "input_tokens",
+                    "prompt_tokens",
+                    "output_tokens",
+                    "completion_tokens",
+                    "input_tokens_details",
+                    "prompt_tokens_details",
+                    "cached_input_tokens",
+                    "cached_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "cache_creation_tokens",
+                    "cache_creation_input_tokens",
+                    "output_tokens_details",
+                    "completion_tokens_details",
+                ];
+                if value
+                    .as_object()
+                    .is_some_and(|object| usage_field.iter().any(|key| object.contains_key(*key)))
+                {
+                    return Some(value);
+                }
+            }
+        }
+        offset = start + needle.len();
+    }
+    None
+}
+
+fn balanced_object_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, &byte) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth = depth.saturating_add(1),
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The SSE fallback may have only the beginning of an oversized event.  Read
@@ -1544,6 +1694,64 @@ data: {"type":"response.completed","response":{"service_tier":"priority","usage"
         assert_eq!(metrics.output_tokens(), Some(80));
         assert_eq!(metrics.cached_input_tokens(), Some(500));
         assert_eq!(metrics.upstream_response_model(), Some("gpt-6-astra"));
+    }
+
+    #[test]
+    fn metrics_extract_usage_from_oversized_http_sse_event() {
+        let large_output = "x".repeat(MAX_LINE_BYTES + 32 * 1024);
+        let event = [
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":\"",
+            large_output.as_str(),
+            "\",\"usage\":{\"input_tokens\":900,\"output_tokens\":80,\"input_tokens_details\":{\"cached_tokens\":500}}}}\n\n",
+        ]
+        .concat();
+        let mut metrics = ResponseBodyMetrics::new("identity");
+        metrics.observe(event.as_bytes(), 42, true);
+        metrics.finish(50);
+
+        assert!(metrics.terminal_event_seen());
+        assert!(metrics.completed());
+        assert_eq!(metrics.input_tokens(), Some(900));
+        assert_eq!(metrics.output_tokens(), Some(80));
+        assert_eq!(metrics.cached_input_tokens(), Some(500));
+    }
+
+    #[test]
+    fn metrics_extract_usage_from_oversized_json_event() {
+        let large_output = "x".repeat(MAX_EVENT_BYTES + 32 * 1024);
+        let event = serde_json::json!({
+            "output": large_output,
+            "usage": {
+                "prompt_tokens": 900,
+                "completion_tokens": 80,
+                "prompt_tokens_details": {"cached_tokens": 500}
+            }
+        })
+        .to_string();
+        let mut metrics = ResponseBodyMetrics::new("identity");
+        metrics.observe(event.as_bytes(), 42, false);
+        metrics.finish(50);
+
+        assert!(metrics.usage_seen());
+        assert_eq!(metrics.input_tokens(), Some(900));
+        assert_eq!(metrics.output_tokens(), Some(80));
+        assert_eq!(metrics.cached_input_tokens(), Some(500));
+    }
+
+    #[test]
+    fn terminal_usage_is_not_overwritten_by_late_partial_usage() {
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(
+            br#"data: {"type":"response.completed","response":{"usage":{"input_tokens":900,"output_tokens":80}}}
+
+data: {"type":"response.output_text.delta","delta":"late","usage":{"input_tokens":1,"output_tokens":2}}
+
+"#,
+            10,
+            true,
+        );
+        assert_eq!(metrics.input_tokens(), Some(900));
+        assert_eq!(metrics.output_tokens(), Some(80));
     }
 
     #[test]

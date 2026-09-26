@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use url::Url;
 
 use crate::accounts::{self, AccountEnvironment, NetworkProfile};
@@ -1559,12 +1560,16 @@ impl ResponseLogTracker {
         } else {
             UsageState::MissingUsage
         };
+        let usage = self.metrics.token_usage();
+        if let Some(activity) = self.activity.as_mut() {
+            activity.observe_tokens(usage.input_tokens, usage.output_tokens);
+        }
         request.settle(UsageOutcome {
             state,
             finished_at: Some(chrono::Utc::now().to_rfc3339()),
             http_status: Some(self.entry.status),
             response_model: self.metrics.upstream_response_model().map(str::to_owned),
-            usage: self.metrics.token_usage(),
+            usage,
             usage_source: self
                 .metrics
                 .usage_seen()
@@ -1667,11 +1672,15 @@ impl Drop for ResponseLogTracker {
             // A dropped body means the client disconnected before a reliable
             // terminal usage event. Preserve the row as interrupted.
             if let Some(request) = self.billing.as_ref() {
+                let usage = self.metrics.token_usage();
+                if let Some(activity) = self.activity.as_mut() {
+                    activity.observe_tokens(usage.input_tokens, usage.output_tokens);
+                }
                 request.settle(UsageOutcome {
                     state: UsageState::Interrupted,
                     finished_at: Some(chrono::Utc::now().to_rfc3339()),
                     http_status: Some(self.entry.status),
-                    usage: self.metrics.token_usage(),
+                    usage,
                     service_tier: self.metrics.service_tier().map(str::to_owned),
                     first_token_ms: self.metrics.first_token_ms().map(|ms| ms as u64),
                     transport: Some(self.entry.transport.clone()),
@@ -1817,6 +1826,228 @@ fn business_http_client(template: &str, session: Option<&str>) -> Result<reqwest
     Ok(pooled_upstream(business_proxy_key(template, session)?)?.client)
 }
 
+fn normalized_path(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+/// Realtime voice uses the same local base URL as Responses, but its v3
+/// frameless transport is rooted at `/live` (or `/v1/live`).
+fn is_realtime_path(path: &str) -> bool {
+    let path = normalized_path(path);
+    path == "/live"
+        || path == "/v1/live"
+        || path.starts_with("/live/")
+        || path.starts_with("/v1/live/")
+        || path == "/realtime"
+        || path == "/v1/realtime"
+}
+
+fn is_realtime_call_path(method: &http::Method, path: &str) -> bool {
+    method == http::Method::POST
+        && matches!(
+            normalized_path(path),
+            "/live" | "/v1/live" | "/realtime/calls" | "/v1/realtime/calls"
+        )
+}
+
+fn is_realtime_ws_path(path: &str) -> bool {
+    is_realtime_path(path)
+}
+
+fn is_backend_upstream(upstream: &str) -> bool {
+    Url::parse(upstream).ok().is_some_and(|url| {
+        url.path()
+            .split('/')
+            .any(|segment| segment == "backend-api")
+    })
+}
+
+fn append_upstream_path(url: &mut Url, suffix: &str) {
+    let base = url.path().trim_end_matches('/');
+    let suffix = suffix.trim_start_matches('/');
+    let path = if base.is_empty() {
+        format!("/{suffix}")
+    } else if suffix.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}/{suffix}")
+    };
+    url.set_path(&path);
+}
+
+fn uri_path_for_upstream(upstream: &Url, local_path: &str) -> String {
+    let mut path = local_path.trim_start_matches('/');
+    let base = upstream.path().trim_end_matches('/');
+    // Codex's public API base is commonly `/v1`, while the proxy receives
+    // `/v1/live`; avoid producing `/v1/v1/live` in that configuration.
+    if base.ends_with("/v1") {
+        path = path.strip_prefix("v1/").unwrap_or(path);
+    }
+    path.to_string()
+}
+
+fn realtime_call_target(upstream: &str, uri: &Uri) -> Result<String> {
+    if !is_backend_upstream(upstream) {
+        let base = Url::parse(upstream.trim()).context("upstream url")?;
+        let path = uri_path_for_upstream(&base, uri.path());
+        let mut url = base;
+        append_upstream_path(&mut url, &path);
+        url.set_query(uri.query());
+        return Ok(url.to_string());
+    }
+    let mut url = Url::parse(upstream.trim()).context("upstream url")?;
+    if !url
+        .path()
+        .trim_end_matches('/')
+        .ends_with("/realtime/calls")
+    {
+        append_upstream_path(&mut url, "realtime/calls");
+    }
+    let has_intent = url.query_pairs().any(|(key, _)| key == "intent");
+    let has_architecture = url.query_pairs().any(|(key, _)| key == "architecture");
+    let mut pairs = url.query_pairs_mut();
+    if !has_intent {
+        pairs.append_pair("intent", "quicksilver");
+    }
+    if !has_architecture {
+        pairs.append_pair("architecture", "avas");
+    }
+    if let Some(query) = uri.query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if key != "intent" && key != "architecture" {
+                pairs.append_pair(&key, &value);
+            }
+        }
+    }
+    drop(pairs);
+    Ok(url.to_string())
+}
+
+fn realtime_backend_body(bytes: &[u8], content_type: Option<&str>) -> Result<Vec<u8>, String> {
+    let content_type = content_type.unwrap_or_default();
+    if content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|_| "语音请求体不是 JSON".to_string())?;
+        if let Some(session) = value
+            .get_mut("session")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            session.remove("id");
+        }
+        return serde_json::to_vec(&value).map_err(|err| format!("编码语音请求体失败: {err}"));
+    }
+
+    if content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/sdp"))
+    {
+        return serde_json::to_vec(&serde_json::json!({
+            "sdp": String::from_utf8(bytes.to_vec()).map_err(|_| "SDP 不是 UTF-8".to_string())?,
+            "session": {},
+        }))
+        .map_err(|err| format!("编码语音请求体失败: {err}"));
+    }
+
+    let boundary = content_type
+        .split(';')
+        .skip(1)
+        .find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            name.eq_ignore_ascii_case("boundary")
+                .then(|| value.trim().trim_matches('"').to_string())
+        })
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "语音 multipart 请求缺少 boundary".to_string())?;
+    let raw = std::str::from_utf8(bytes).map_err(|_| "语音 multipart 不是 UTF-8".to_string())?;
+    let marker = format!("--{boundary}");
+    let mut sdp = None;
+    let mut session = None;
+    for part in raw.split(&marker).skip(1) {
+        let part = part.trim_start_matches("--").trim_start_matches("\r\n");
+        if part.is_empty() {
+            continue;
+        }
+        let Some((headers, value)) = part.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let value = value.strip_suffix("\r\n").unwrap_or(value);
+        let name = headers.lines().find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            let marker = "name=\"";
+            let start = lower.find(marker)? + marker.len();
+            let rest = &line[start..];
+            Some(rest.split('"').next()?.to_string())
+        });
+        match name.as_deref() {
+            Some("sdp") => sdp = Some(value.to_string()),
+            Some("session") => {
+                session = Some(
+                    serde_json::from_str::<serde_json::Value>(value)
+                        .map_err(|_| "语音 session 不是 JSON".to_string())?,
+                )
+            }
+            _ => {}
+        }
+    }
+    let sdp = sdp.ok_or_else(|| "语音 multipart 缺少 sdp".to_string())?;
+    let mut session = session.ok_or_else(|| "语音 multipart 缺少 session".to_string())?;
+    if let Some(object) = session.as_object_mut() {
+        object.remove("id");
+    }
+    serde_json::to_vec(&serde_json::json!({"sdp": sdp, "session": session}))
+        .map_err(|err| format!("编码语音请求体失败: {err}"))
+}
+
+fn realtime_sideband_target(upstream: &str, uri: &Uri) -> Result<String> {
+    let path = normalized_path(uri.path());
+    let is_live = path == "/live"
+        || path == "/v1/live"
+        || path.starts_with("/live/")
+        || path.starts_with("/v1/live/");
+    let suffix = path
+        .strip_prefix("/v1/live")
+        .or_else(|| path.strip_prefix("/live"))
+        .unwrap_or_default();
+    if is_live && !suffix.is_empty() {
+        let call_id = suffix.trim_start_matches('/');
+        anyhow::ensure!(
+            !call_id.is_empty() && call_id != "." && call_id != ".." && !call_id.contains('/'),
+            "无效的实时语音 call id"
+        );
+    }
+    if is_backend_upstream(upstream) {
+        // Codex's WebRTC sideband deliberately uses the public realtime API
+        // even when the call was created through the ChatGPT backend.
+        let mut url = Url::parse(if is_live {
+            "https://api.openai.com/v1/live"
+        } else {
+            "https://api.openai.com/v1/realtime"
+        })
+        .context("realtime sideband url")?;
+        if is_live {
+            append_upstream_path(&mut url, suffix);
+        }
+        url.set_query(uri.query());
+        return Ok(url.to_string());
+    }
+    let base = Url::parse(upstream.trim()).context("upstream url")?;
+    let path = uri_path_for_upstream(&base, path);
+    let mut url = base;
+    append_upstream_path(&mut url, &path);
+    url.set_query(uri.query());
+    Ok(url.to_string())
+}
+
 fn upstream_http_client(
     proxy: &str,
     platform: identity::DevicePlatform,
@@ -1897,7 +2128,12 @@ async fn forward_http_tracked(
         );
     }
     let (mut parts, body) = req.into_parts();
-    let target = join_upstream(&upstream, &parts.uri)?;
+    let realtime_call = is_realtime_call_path(&parts.method, parts.uri.path());
+    let target = if realtime_call && is_backend_upstream(&upstream) {
+        realtime_call_target(&upstream, &parts.uri)?
+    } else {
+        join_upstream(&upstream, &parts.uri)?
+    };
     let path = parts.uri.path();
 
     // 先读取 body，以便从中提取或改写 model 字段
@@ -1912,6 +2148,22 @@ async fn forward_http_tracked(
         .and_then(|v| v.to_str().ok())
         .map(|value| value.to_string());
     details.content_encoding = logs::safe_content_encoding(content_encoding.as_deref());
+    if realtime_call && is_backend_upstream(&upstream) {
+        bytes = realtime_backend_body(
+            &bytes,
+            parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+        )
+        .map_err(|err| anyhow::anyhow!(err))?
+        .into();
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        details.body_bytes = bytes.len();
+    }
     // The model the client asked for, before a forced model replaces it.
     let client_model = crate::body_model::extract_model_from_body(&bytes);
     if path.contains("/responses") {
@@ -2391,6 +2643,61 @@ fn ws_dial(
     request_context: &identity::RequestContext,
 ) -> Result<WsDial> {
     let url = ws_bridge::upstream_to_ws_url(target).map_err(|err| anyhow::anyhow!(err))?;
+    ws_dial_with_url(
+        url,
+        proxy,
+        headers,
+        identity,
+        model,
+        service_tier,
+        turn_state,
+        request_context,
+    )
+}
+
+fn realtime_ws_dial(
+    target: &str,
+    proxy: &str,
+    headers: &HeaderMap,
+    identity: &VmIdentity,
+    model: &str,
+    service_tier: Option<&str>,
+    turn_state: Option<&str>,
+    request_context: &identity::RequestContext,
+) -> Result<WsDial> {
+    let mut url = Url::parse(target).map_err(|err| anyhow::anyhow!(err))?;
+    match url.scheme() {
+        "http" => url
+            .set_scheme("ws")
+            .map_err(|_| anyhow::anyhow!("无法把 http 换成 ws"))?,
+        "https" => url
+            .set_scheme("wss")
+            .map_err(|_| anyhow::anyhow!("无法把 https 换成 wss"))?,
+        "ws" | "wss" => {}
+        scheme => anyhow::bail!("不支持的实时语音 WebSocket 协议: {scheme}"),
+    }
+    ws_dial_with_url(
+        url.to_string(),
+        proxy,
+        headers,
+        identity,
+        model,
+        service_tier,
+        turn_state,
+        request_context,
+    )
+}
+
+fn ws_dial_with_url(
+    url: String,
+    proxy: &str,
+    headers: &HeaderMap,
+    identity: &VmIdentity,
+    model: &str,
+    service_tier: Option<&str>,
+    turn_state: Option<&str>,
+    request_context: &identity::RequestContext,
+) -> Result<WsDial> {
     let mut extra_headers = if identity.enabled {
         let thread_id = identity.thread_id.as_str();
         vec![
@@ -2561,8 +2868,9 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 
 fn merge_request_context_from_headers(context: &mut identity::RequestContext, headers: &HeaderMap) {
     if context.session_id.is_none() {
-        context.session_id =
-            header_value(headers, "session-id").or_else(|| header_value(headers, "session_id"));
+        context.session_id = header_value(headers, "session-id")
+            .or_else(|| header_value(headers, "session_id"))
+            .or_else(|| header_value(headers, "x-session-id"));
     }
     if context.window_id.is_none() {
         context.window_id = header_value(headers, "x-codex-window-id")
@@ -2633,9 +2941,10 @@ fn merge_request_context_from_headers(context: &mut identity::RequestContext, he
 async fn proxy_ws(app: Arc<App>, req: Request<Body>) -> Response {
     let headers = req.headers().clone();
     let (mut parts, _body) = req.into_parts();
+    let uri = parts.uri.clone();
     match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
         Ok(upgrade) => upgrade.on_upgrade(move |socket| async move {
-            if let Err(err) = client_ws_session(app, headers, socket).await {
+            if let Err(err) = client_ws_session(app, uri, headers, socket).await {
                 eprintln!("[ws] 客户端会话结束: {err:#}");
             }
         }),
@@ -2643,11 +2952,105 @@ async fn proxy_ws(app: Arc<App>, req: Request<Body>) -> Response {
     }
 }
 
-async fn client_ws_session(
+async fn realtime_ws_session(
     app: Arc<App>,
+    uri: Uri,
     client_headers: HeaderMap,
     mut socket: WebSocket,
 ) -> Result<()> {
+    let mut request_context = identity::RequestContext::default();
+    merge_request_context_from_headers(&mut request_context, &client_headers);
+    let root_identity = app.vm_identity.lock().await.clone();
+    let scoped_identity = root_identity.scoped_for_request(
+        &request_context,
+        &format!("realtime-ws:{}", uuid::Uuid::new_v4()),
+    );
+    let settings = app.settings.lock().await.clone();
+    let mut headers = client_headers.clone();
+    if let Some((credentials, override_headers)) = app
+        .sync_request_identity(Path::new(&settings.codex_home))
+        .await
+    {
+        if override_headers && !login::apply_chatgpt_credentials_headers(&mut headers, &credentials)
+        {
+            anyhow::bail!("无法应用 ChatGPT 鉴权请求头");
+        }
+    }
+    let template = resolved_proxy(&settings, &app.mihomo);
+    if settings.outbound_mode == OutboundMode::Mihomo && template.trim().is_empty() {
+        anyhow::bail!(
+            "{}",
+            app.mihomo
+                .proxy_url()
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "订阅节点正在连接，请稍候。".into())
+        );
+    }
+    let proxy = app.ws_upstream.resolve_proxy(&template, None).await?;
+    let target = realtime_sideband_target(&settings.upstream, &uri)?;
+    let model = settings.forced_model.trim();
+    let dial = realtime_ws_dial(
+        &target,
+        &proxy,
+        &headers,
+        &scoped_identity,
+        model,
+        None,
+        None,
+        &request_context,
+    )?;
+    let mut upstream = app.ws_upstream.connect_raw(dial).await?;
+
+    loop {
+        tokio::select! {
+            client = socket.recv() => {
+                let Some(message) = client else { return Ok(()); };
+                let message = message.context("读取客户端实时语音 WebSocket")?;
+                match message {
+                    WsMessage::Text(text) => upstream.send(TungsteniteMessage::Text(text.to_string().into())).await?,
+                    WsMessage::Binary(bytes) => upstream.send(TungsteniteMessage::Binary(bytes)).await?,
+                    WsMessage::Ping(bytes) => upstream.send(TungsteniteMessage::Ping(bytes)).await?,
+                    WsMessage::Pong(bytes) => upstream.send(TungsteniteMessage::Pong(bytes)).await?,
+                    WsMessage::Close(frame) => {
+                        let close = frame.map(|frame| {
+                            TungsteniteMessage::Close(Some(tungstenite::protocol::CloseFrame {
+                                code: tungstenite::protocol::frame::coding::CloseCode::from(frame.code),
+                                reason: frame.reason.to_string().into(),
+                            }))
+                        }).unwrap_or(TungsteniteMessage::Close(None));
+                        let _ = upstream.send(close).await;
+                        return Ok(());
+                    }
+                }
+            }
+            message = upstream.next() => {
+                let Some(message) = message else { return Ok(()); };
+                match message.context("读取上游实时语音 WebSocket")? {
+                    TungsteniteMessage::Text(text) => socket.send(WsMessage::Text(text.to_string().into())).await.context("转发上游实时语音帧")?,
+                    TungsteniteMessage::Binary(bytes) => socket.send(WsMessage::Binary(bytes)).await.context("转发上游实时语音帧")?,
+                    TungsteniteMessage::Ping(bytes) => socket.send(WsMessage::Ping(bytes)).await.context("转发上游实时语音 Ping")?,
+                    TungsteniteMessage::Pong(bytes) => socket.send(WsMessage::Pong(bytes)).await.context("转发上游实时语音 Pong")?,
+                    TungsteniteMessage::Close(_) => {
+                        let _ = socket.send(WsMessage::Close(None)).await;
+                        return Ok(());
+                    }
+                    TungsteniteMessage::Frame(_) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn client_ws_session(
+    app: Arc<App>,
+    uri: Uri,
+    client_headers: HeaderMap,
+    mut socket: WebSocket,
+) -> Result<()> {
+    if is_realtime_ws_path(uri.path()) {
+        return realtime_ws_session(app, uri, client_headers, socket).await;
+    }
     // Frames without session/window metadata still belong to this client
     // WebSocket. Keep one fallback scope for the socket instead of sharing the
     // process-wide runtime IDs with other windows.
@@ -3101,6 +3504,11 @@ async fn finish_client_ws_turn(
         .map(str::to_owned)
         .or_else(|| failure_message.map(str::to_owned));
     let status = if failed { 502 } else { 200 };
+    if let Some(account) = account {
+        let usage = metrics.token_usage();
+        app.traffic
+            .observe_tokens(&account.id, usage.input_tokens, usage.output_tokens);
+    }
     diag::emit(
         "ws_finish",
         diag_req,
@@ -3241,6 +3649,70 @@ mod tests {
         let uri: Uri = "http://127.0.0.1:8787/v1/responses".parse().unwrap();
         let out = join_upstream("https://chatgpt.com/backend-api/codex/", &uri).unwrap();
         assert_eq!(out, "https://chatgpt.com/backend-api/codex/v1/responses");
+    }
+
+    #[test]
+    fn backend_realtime_call_rewrites_path_and_query() {
+        let uri: Uri = "http://127.0.0.1:8787/live?trace=1".parse().unwrap();
+        assert_eq!(
+            realtime_call_target("https://chatgpt.com/backend-api/codex", &uri).unwrap(),
+            "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas&trace=1"
+        );
+    }
+
+    #[test]
+    fn public_realtime_call_keeps_v1_base_without_duplicate_prefix() {
+        let uri: Uri = "http://127.0.0.1:8787/v1/live".parse().unwrap();
+        assert_eq!(
+            realtime_call_target("https://api.openai.com/v1", &uri).unwrap(),
+            "https://api.openai.com/v1/live"
+        );
+    }
+
+    #[test]
+    fn backend_realtime_body_converts_codex_multipart() {
+        let body = concat!(
+            "--codex-realtime-call-boundary\r\n",
+            "Content-Disposition: form-data; name=\"sdp\"\r\n",
+            "Content-Type: application/sdp\r\n\r\n",
+            "v=offer\r\n",
+            "--codex-realtime-call-boundary\r\n",
+            "Content-Disposition: form-data; name=\"session\"\r\n",
+            "Content-Type: application/json\r\n\r\n",
+            "{\"id\":\"thread-1\",\"voice\":\"alloy\"}\r\n",
+            "--codex-realtime-call-boundary--\r\n"
+        );
+        let converted = realtime_backend_body(
+            body.as_bytes(),
+            Some("multipart/form-data; boundary=codex-realtime-call-boundary"),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&converted).unwrap();
+        assert_eq!(value["sdp"], "v=offer");
+        assert_eq!(value["session"]["voice"], "alloy");
+        assert!(value["session"].get("id").is_none());
+    }
+
+    #[test]
+    fn realtime_sideband_uses_public_api_for_backend_calls() {
+        let uri: Uri = "http://127.0.0.1:8787/v1/live/rtc_1?trace=1"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            realtime_sideband_target("https://chatgpt.com/backend-api/codex", &uri).unwrap(),
+            "https://api.openai.com/v1/live/rtc_1?trace=1"
+        );
+    }
+
+    #[test]
+    fn realtime_v1_sideband_preserves_call_query() {
+        let uri: Uri = "http://127.0.0.1:8787/v1/realtime?intent=quicksilver&call_id=rtc_1"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            realtime_sideband_target("https://chatgpt.com/backend-api/codex", &uri).unwrap(),
+            "https://api.openai.com/v1/realtime?intent=quicksilver&call_id=rtc_1"
+        );
     }
 
     #[test]
@@ -3716,6 +4188,7 @@ mod tests {
             AccountTraffic {
                 concurrent_requests: 1,
                 rpm: 1,
+                tpm: 0,
             }
         );
         drop(activity);
@@ -3724,6 +4197,7 @@ mod tests {
             AccountTraffic {
                 concurrent_requests: 0,
                 rpm: 1,
+                tpm: 0,
             }
         );
     }

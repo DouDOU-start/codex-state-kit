@@ -80,7 +80,7 @@ export interface Status {
   forcedModel: string;
   currentAccountId?: string | null;
   currentAccountEmail?: string | null;
-  accountTraffic: { concurrentRequests: number; rpm: number };
+  accountTraffic: { concurrentRequests: number; rpm: number; tpm: number };
   proxyListen: string;
   upstream: string;
   codexHome: string;
@@ -330,8 +330,6 @@ export interface BillingQuery {
   to?: string | null;
   source?: BillingRecordSource | null;
   model?: string | null;
-  /** true keeps only downgraded (confirmed or suspected) requests. */
-  downgraded?: boolean | null;
   limit?: number;
   offset?: number;
 }
