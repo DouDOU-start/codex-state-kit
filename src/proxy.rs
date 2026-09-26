@@ -1420,6 +1420,26 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                     .get(header::CONTENT_ENCODING)
                     .and_then(|value| value.to_str().ok()),
             ));
+            if let Some(req) = &details.diag {
+                diag::emit(
+                    "headers",
+                    Some(req),
+                    json!({
+                        "status": resp.status().as_u16(),
+                        "headerMs": details.response_header_ms,
+                        "peer": details.peer_addr,
+                        "http": details.http_version,
+                        "transport": details.transport,
+                        "contentType": resp.headers().get(header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok()),
+                        "contentLength": resp.headers().get(header::CONTENT_LENGTH)
+                            .and_then(|value| value.to_str().ok()),
+                        "contentEncoding": resp.headers().get(header::CONTENT_ENCODING)
+                            .and_then(|value| value.to_str().ok()),
+                        "responsesNonStream": details.responses_non_stream,
+                    }),
+                );
+            }
             if method == http::Method::HEAD
                 || matches!(resp.status().as_u16(), 204 | 304)
                 || resp
@@ -1490,19 +1510,6 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 .and_then(|value| value.parse::<u64>().ok());
             let lifecycle = details.stream_lifecycle.clone();
             let diag_req = details.diag.clone();
-            if let Some(req) = &diag_req {
-                diag::emit(
-                    "headers",
-                    Some(req),
-                    json!({
-                        "status": resp.status().as_u16(),
-                        "headerMs": details.response_header_ms,
-                        "peer": details.peer_addr,
-                        "http": details.http_version,
-                                "transport": details.transport,
-                    }),
-                );
-            }
             let responses_non_stream = details.responses_non_stream;
             let entry = LogEntry::new(
                 method.as_str(),
@@ -2439,6 +2446,12 @@ async fn forward_http_tracked(
         .await
         .context("read body")?;
     details.body_bytes = bytes.len();
+    // The body is buffered and may be rewritten below (Responses adaptation,
+    // model binding, virtual-device metadata, or realtime normalization).
+    // Never forward the downstream length after such a rewrite: a stale
+    // Content-Length makes the upstream parse a truncated request and can
+    // produce an empty 200 response, which is impossible to bill reliably.
+    parts.headers.remove(header::CONTENT_LENGTH);
 
     let content_encoding = parts
         .headers
@@ -2552,6 +2565,11 @@ async fn forward_http_tracked(
         route_kind: details.route_kind.clone(),
         proxy_session: None,
     });
+    let request_stream = if parts.method == http::Method::POST && path.contains("/responses") {
+        crate::body_model::extract_bool_field(&bytes, content_encoding.as_deref(), "stream")
+    } else {
+        None
+    };
     if let Some(req) = &details.diag {
         diag::emit(
             "request",
@@ -2560,6 +2578,8 @@ async fn forward_http_tracked(
                 "method": parts.method.as_str(),
                 "path": path,
                 "bodyBytes": details.body_bytes,
+                "responsesNonStream": details.responses_non_stream,
+                "requestStream": request_stream,
             }),
         );
     }
@@ -4556,6 +4576,9 @@ mod tests {
                 .uri("/v1/responses")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT_ENCODING, "gzip, deflate, br")
+                // Simulate a client length that becomes stale after the
+                // standard request is adapted for the Codex backend.
+                .header(header::CONTENT_LENGTH, "999999")
                 .body(Body::from(
                     r#"{"model":"gpt-test","input":[],"store":true,"max_output_tokens":64,"previous_response_id":"resp_1"}"#,
                 ))
@@ -4571,6 +4594,14 @@ mod tests {
         let (uri, headers, body) = received.recv().await.unwrap();
         assert_eq!(uri.path(), "/backend-api/codex/responses");
         assert_eq!(headers[header::ACCEPT_ENCODING], "gzip, deflate");
+        assert_eq!(
+            headers[header::CONTENT_LENGTH]
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            body.len()
+        );
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], true);
