@@ -2632,6 +2632,15 @@ async fn forward_http_tracked(
         )
         .body(bytes);
     for (name, value) in &parts.headers {
+        // Keep the response compression within the formats the bounded
+        // metrics decoder can inspect. Node clients commonly advertise Brotli
+        // (`br`), but Kit deliberately disables reqwest auto-decompression so
+        // it can return the original bytes to the client; forwarding `br`
+        // here would therefore make usage and latency parsing unavailable.
+        if name == header::ACCEPT_ENCODING {
+            builder = builder.header(header::ACCEPT_ENCODING, "gzip, deflate");
+            continue;
+        }
         if is_hop(name)
             || name.as_str().starts_with("sec-websocket-")
             || (vm.enabled && identity::is_vm_identity_header(name.as_str()))
@@ -4456,13 +4465,15 @@ mod tests {
 
     #[tokio::test]
     async fn business_forward_adapts_standard_responses_for_backend_upstream() {
-        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<(Uri, Vec<u8>)>();
+        let (sent, mut received) =
+            tokio::sync::mpsc::unbounded_channel::<(Uri, HeaderMap, Vec<u8>)>();
         let upstream = axum::Router::new().fallback(move |req: Request<Body>| {
             let sent = sent.clone();
             async move {
                 let (parts, body) = req.into_parts();
                 let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap();
-                sent.send((parts.uri, bytes.to_vec())).unwrap();
+                sent.send((parts.uri, parts.headers, bytes.to_vec()))
+                    .unwrap();
                 "ok"
             }
         });
@@ -4487,6 +4498,7 @@ mod tests {
                 .method("POST")
                 .uri("/v1/responses")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT_ENCODING, "gzip, deflate, br")
                 .body(Body::from(
                     r#"{"model":"gpt-test","input":[],"store":true,"max_output_tokens":64,"previous_response_id":"resp_1"}"#,
                 ))
@@ -4498,8 +4510,9 @@ mod tests {
             .await
             .unwrap();
 
-        let (uri, body) = received.recv().await.unwrap();
+        let (uri, headers, body) = received.recv().await.unwrap();
         assert_eq!(uri.path(), "/backend-api/codex/responses");
+        assert_eq!(headers[header::ACCEPT_ENCODING], "gzip, deflate");
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["store"], false);
         assert!(value.get("max_output_tokens").is_none());
