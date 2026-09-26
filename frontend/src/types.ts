@@ -82,6 +82,12 @@ export interface Status {
   currentAccountEmail?: string | null;
   accountTraffic: { concurrentRequests: number; rpm: number; tpm: number };
   proxyListen: string;
+  /** Whether the proxy listens on all interfaces for LAN clients. */
+  lanAccessEnabled: boolean;
+  /** Whether a Kit gateway API key has been configured. */
+  lanApiKeyConfigured: boolean;
+  /** Masked gateway key for display; the plaintext key is never returned by status. */
+  lanApiKeyMasked?: string | null;
   upstream: string;
   codexHome: string;
   proxyOk: boolean;
@@ -140,6 +146,7 @@ export interface SystemProxyView {
 export interface SettingsPatch {
   forcedModel: string;
   proxyListen: string;
+  lanAccessEnabled: boolean;
   upstream: string;
   codexHome: string;
   outboundProxy: string;

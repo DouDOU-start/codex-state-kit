@@ -8,6 +8,7 @@ import {
   importChatgptRefreshToken,
   pollChatgptLogin,
   setConfig,
+  setLanAccess as setLanAccessApi,
   openUrl,
   startChatgptLogin,
   probeOutboundLatency,
@@ -15,6 +16,7 @@ import {
   mihomoGroupDelay,
   updateVmIdentity,
   regenerateVmInstallationId,
+  regenerateLanApiKey,
   detectVmCliVersion,
   listAccounts,
   onAccountsChanged,
@@ -26,6 +28,7 @@ import type { SavedAccount, Banner, LoginMethod, LoginStart, LoginStatus, Status
 function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): SettingsPatch {
   return {
     proxyListen: status.proxyListen,
+    lanAccessEnabled: status.lanAccessEnabled,
     upstream: status.upstream,
     codexHome: status.codexHome,
     outboundProxy: status.outboundProxy,
@@ -418,6 +421,37 @@ export function useCodexStateKit() {
     }
   }, []);
 
+  const setLanAccess = useCallback(async (enabled: boolean) => {
+    setBusy("save");
+    try {
+      const next = await setLanAccessApi(enabled);
+      setStatus(next);
+      setBanner({ kind: "ok", text: enabled ? t("已允许局域网访问") : t("已关闭局域网访问") });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const rotateLanApiKey = useCallback(async () => {
+    setBusy("save");
+    try {
+      const result = await regenerateLanApiKey();
+      // The plaintext key is deliberately held only by the caller. Returning it
+      // lets the UI copy/show it once while status polling retains only a mask.
+      const next = await getStatus();
+      setStatus(next);
+      setBanner({ kind: "ok", text: t("API Key 已生成，请立即复制保存") });
+      return result;
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+      return null;
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
   const saveVmIdentity = useCallback(async (profile: VmProfile) => {
     setBusy("save");
     try {
@@ -490,6 +524,8 @@ export function useCodexStateKit() {
     probeMihomoGroup,
     probeAllMihomo,
     setChainSystemProxy,
+    setLanAccess,
+    rotateLanApiKey,
     saveVmIdentity,
     regenerateVmInstallation,
     detectVmVersion,

@@ -451,6 +451,20 @@ input[type="checkbox"]:disabled { opacity: .5; cursor: not-allowed; }
 .binding-note { display: flex; align-items: center; gap: 6px; margin: -4px 0 12px; padding: 7px 10px; border: 1px solid #d4e2f2; border-radius: 8px; color: var(--text-soft); background: var(--accent-soft); font-size: 10px; }
 .binding-note svg { color: var(--accent); }
 .binding-note strong { color: var(--accent-strong); font-weight: 650; }
+.lan-access { margin-top: 18px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #f8fafc; }
+.lan-access__heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.lan-access__heading h3 { margin: 0; color: var(--text); font-size: 12px; font-weight: 650; }
+.lan-access__heading p { margin: 4px 0 0; color: var(--muted); font-size: 9px; }
+.lan-access__toggle { display: inline-flex; align-items: center; gap: 7px; color: var(--accent-strong); font-size: 10px; cursor: pointer; white-space: nowrap; }
+.lan-access__toggle input { width: 15px; height: 15px; }
+.lan-access > .panel__hint { margin: 10px 0; }
+.lan-access__endpoint, .lan-access__key { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid #e8edf1; color: var(--muted); font-size: 10px; }
+.lan-access__endpoint code, .lan-access__key-value code { min-width: 0; color: var(--text-soft); font: 10px/1.5 var(--font-mono); overflow-wrap: anywhere; }
+.lan-access__key-value { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.lan-access__actions { display: inline-flex; flex-shrink: 0; align-items: center; gap: 6px; }
+.lan-access__actions .button { min-height: 28px; font-size: 10px; }
+.lan-access__note, .lan-access__error { margin: 8px 0 0; color: var(--muted); font-size: 9px; line-height: 1.6; }
+.lan-access__error { color: var(--red); }
 .system-proxy { display: grid; gap: 6px; margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #f8fafc; }
 .system-proxy__toggle { display: inline-flex; align-items: center; gap: 8px; color: var(--text); font-size: 11px; font-weight: 600; cursor: pointer; }
 .system-proxy__state { color: var(--muted); font-size: 10px; }

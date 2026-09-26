@@ -7,6 +7,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -102,6 +103,9 @@ const HOP_BY_HOP: &[&str] = &[
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub proxy_listen: String,
+    pub lan_access_enabled: bool,
+    pub lan_api_key_configured: bool,
+    pub lan_api_key_masked: Option<String>,
     pub upstream: String,
     pub codex_home: String,
     pub proxy_ok: bool,
@@ -152,6 +156,13 @@ pub struct App {
     /// live login changes.
     turn_state: Mutex<TurnStateStore>,
     ws_upstream: WsUpstreamPool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LanApiKeyResult {
+    pub api_key: String,
+    pub masked: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -358,6 +369,10 @@ impl App {
         );
         Status {
             proxy_listen: settings.proxy_listen,
+            lan_access_enabled: settings.lan_access_enabled,
+            lan_api_key_configured: !settings.lan_api_key_hash.trim().is_empty(),
+            lan_api_key_masked: (!settings.lan_api_key_hash.trim().is_empty())
+                .then(|| "••••••••".to_string()),
             upstream: settings.upstream,
             codex_home: settings.codex_home,
             proxy_ok: self.proxy_ok.load(Ordering::Relaxed),
@@ -590,6 +605,33 @@ impl ProxyHandle {
         Ok(self.managed_status().await)
     }
 
+    /// Enables or disables LAN access on the existing local proxy port. The
+    /// local Codex route remains advertised as 127.0.0.1; enabling LAN only
+    /// changes the bind address to the wildcard IPv4 address.
+    pub async fn set_lan_access(&self, enabled: bool) -> Result<Status> {
+        let current = self.app.settings.lock().await.clone();
+        let mut next = current;
+        next.lan_access_enabled = enabled;
+        self.apply_settings_to(next).await?;
+        Ok(self.managed_status().await)
+    }
+
+    /// Generates and persists a gateway key. Only the result of this call
+    /// contains the plaintext key; status responses expose configuration only.
+    pub async fn regenerate_lan_api_key(&self) -> Result<LanApiKeyResult> {
+        let api_key = format!("csk_{}", uuid::Uuid::new_v4().simple());
+        let hash = lan_api_key_hash(&api_key);
+        let _change = self.settings_change.lock().await;
+        let mut settings = self.app.settings.lock().await.clone();
+        settings.lan_api_key_hash = hash;
+        crate::settings::save_settings(&settings)?;
+        *self.app.settings.lock().await = settings;
+        Ok(LanApiKeyResult {
+            masked: mask_lan_api_key(&api_key),
+            api_key,
+        })
+    }
+
     pub async fn managed_status(&self) -> Status {
         let mut status = self.app.status().await;
         status.attach_error = self.attach_error.lock().expect("attach error").clone();
@@ -618,8 +660,22 @@ impl ProxyHandle {
 
     pub async fn start(&self) -> Result<()> {
         self.stop().await;
-        let listen = self.app.settings.lock().await.proxy_listen.clone();
-        let addr: SocketAddr = listen.parse().context("proxy_listen")?;
+        let settings = self.app.settings.lock().await.clone();
+        if settings.lan_access_enabled && settings.lan_api_key_hash.trim().is_empty() {
+            let error = anyhow::anyhow!("局域网访问已开启，但尚未生成 API Key");
+            *self.app.proxy_error.lock().await = Some(error.to_string());
+            self.app.proxy_ok.store(false, Ordering::Relaxed);
+            return Err(error);
+        }
+        let listen = settings.proxy_listen.clone();
+        let configured_addr: SocketAddr = listen.parse().context("proxy_listen")?;
+        if !settings.lan_access_enabled && !configured_addr.ip().is_loopback() {
+            let error = anyhow::anyhow!("非本机监听地址需要先开启局域网访问并配置 API Key");
+            *self.app.proxy_error.lock().await = Some(error.to_string());
+            self.app.proxy_ok.store(false, Ordering::Relaxed);
+            return Err(error);
+        }
+        let addr = proxy_bind_addr(configured_addr, settings.lan_access_enabled);
         let listener = match bind_listen(addr).await {
             Ok(listener) => listener,
             Err(err) => {
@@ -644,7 +700,9 @@ impl ProxyHandle {
         *self.stop.lock().await = Some(tx);
         let app = self.app.clone();
         app.proxy_ok.store(true, Ordering::Relaxed);
-        println!("proxy  http://{addr}  (point Codex openai_base_url here)");
+        println!(
+            "proxy  http://{configured_addr}  (bound {addr}; point Codex openai_base_url here)"
+        );
         let task_app = app.clone();
         let handle = tokio::spawn(async move {
             let router = axum::Router::new()
@@ -661,7 +719,6 @@ impl ProxyHandle {
             }
         });
         *self.task.lock().await = Some(handle);
-        let settings = self.app.settings.lock().await.clone();
         let _ = self.sync_routes_to(&settings);
         Ok(())
     }
@@ -928,6 +985,15 @@ impl ProxyHandle {
     async fn apply_settings_to(&self, next: Settings) -> Result<Status> {
         let _change = self.settings_change.lock().await;
         let old = self.app.settings.lock().await.clone();
+        let mut next = next;
+        // The gateway hash is managed by the dedicated key command. Ordinary
+        // settings updates intentionally omit it and must preserve it.
+        if next.lan_api_key_hash.trim().is_empty() {
+            next.lan_api_key_hash = old.lan_api_key_hash.clone();
+        }
+        if next.lan_access_enabled && next.lan_api_key_hash.trim().is_empty() {
+            anyhow::bail!("请先生成局域网 API Key");
+        }
         let next_business = resolved_proxy(&next, &self.app.mihomo);
         let vm_platform = {
             let vm = self.app.vm_identity.lock().await;
@@ -976,11 +1042,15 @@ impl ProxyHandle {
             }
         }
         drop(transition);
-        if old.proxy_listen != next.proxy_listen {
+        if old.proxy_listen != next.proxy_listen
+            || old.lan_access_enabled != next.lan_access_enabled
+        {
             if let Err(err) = self.start().await {
                 {
                     let mut settings = self.app.settings.lock().await;
                     settings.proxy_listen = old.proxy_listen.clone();
+                    settings.lan_access_enabled = old.lan_access_enabled;
+                    settings.lan_api_key_hash = old.lan_api_key_hash.clone();
                     let _ = save_settings(&settings);
                 }
                 let _ = self.start().await;
@@ -1142,7 +1212,122 @@ async fn bind_listen(addr: SocketAddr) -> Result<TcpListener> {
     }
 }
 
+fn proxy_bind_addr(configured: SocketAddr, lan_access_enabled: bool) -> SocketAddr {
+    if !lan_access_enabled {
+        return configured;
+    }
+    SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, configured.port()))
+}
+
+fn lan_api_key_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!("sha256:{digest:x}")
+}
+
+fn mask_lan_api_key(value: &str) -> String {
+    let prefix_len = value.len().min(8);
+    let suffix_len = value.len().min(4);
+    format!(
+        "{}…{}",
+        &value[..prefix_len],
+        &value[value.len() - suffix_len..]
+    )
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn api_key_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-api-key")
+        .or_else(|| headers.get("api-key"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn unauthorized(message: &'static str) -> Response {
+    (StatusCode::UNAUTHORIZED, message).into_response()
+}
+
+async fn authorize_lan_request(app: &App, req: &mut Request<Body>) -> Result<(), Response> {
+    let settings = app.settings.lock().await.clone();
+    let Some(expected_hash) = settings
+        .lan_api_key_hash
+        .strip_prefix("sha256:")
+        .filter(|value| !value.is_empty())
+    else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "局域网 API Key 未配置").into_response());
+    };
+    let home = Path::new(&settings.codex_home);
+    if !login::has_kit_session(home) {
+        return Err(unauthorized("Kit 尚未登录 ChatGPT"));
+    }
+
+    let gateway_valid = [bearer_token(req.headers()), api_key_header(req.headers())]
+        .into_iter()
+        .flatten()
+        .any(|token| {
+            let actual = lan_api_key_hash(&token);
+            let actual = actual.strip_prefix("sha256:").unwrap_or(&actual);
+            constant_time_equal(actual.as_bytes(), expected_hash.as_bytes())
+        });
+
+    if gateway_valid {
+        if app.sync_request_identity(home).await.is_none() {
+            return Err(unauthorized("Kit 尚未登录 ChatGPT"));
+        }
+        req.headers_mut().remove(header::AUTHORIZATION);
+        req.headers_mut().remove("x-api-key");
+        req.headers_mut().remove("api-key");
+        req.headers_mut().remove("chatgpt-account-id");
+        return Ok(());
+    }
+
+    // Preserve the current local Codex auth flow. The Kit account is the
+    // source of truth after the normal proxy forwarding logic runs, but the
+    // incoming bearer must still match a currently valid local credential.
+    let local_token = bearer_token(req.headers());
+    let identity = app.sync_request_identity(home).await;
+    let local_valid = local_token.as_deref().is_some_and(|token| {
+        identity
+            .as_ref()
+            .is_some_and(|(credentials, _)| credentials.access_token == token)
+    });
+    if local_valid {
+        // Do not leak OpenAI-compatible API key headers supplied by a local
+        // client to the ChatGPT upstream.
+        req.headers_mut().remove("x-api-key");
+        req.headers_mut().remove("api-key");
+        return Ok(());
+    }
+    Err(unauthorized("无效的局域网 API Key 或 ChatGPT 凭据"))
+}
+
 async fn proxy(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
+    let mut req = req;
+    if app.settings.lock().await.lan_access_enabled {
+        if let Err(response) = authorize_lan_request(&app, &mut req).await {
+            return response;
+        }
+    }
     if is_websocket(&req) {
         return proxy_ws(app, req).await;
     }
@@ -3635,6 +3820,123 @@ mod tests {
         let mut manual = settings;
         manual.outbound_mode = OutboundMode::Manual;
         assert_eq!(resolved_proxy(&manual, &mihomo), "http://127.0.0.1:7890");
+    }
+
+    #[test]
+    fn lan_binding_keeps_configured_port_and_local_address_when_disabled() {
+        let configured: SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        assert_eq!(proxy_bind_addr(configured, false), configured);
+        assert_eq!(
+            proxy_bind_addr(configured, true),
+            "0.0.0.0:8787".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            proxy_bind_addr("[::1]:8787".parse().unwrap(), true),
+            "0.0.0.0:8787".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn lan_api_key_hash_and_mask_are_stable() {
+        let key = "csk_example_key";
+        assert_eq!(lan_api_key_hash(key), lan_api_key_hash(key));
+        assert_ne!(lan_api_key_hash(key), lan_api_key_hash("csk_other_key"));
+        assert_eq!(mask_lan_api_key(key), "csk_exam…_key");
+    }
+
+    #[tokio::test]
+    async fn lan_gateway_key_is_accepted_and_removed_before_forwarding() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            login::kit_auth_path(root.path()),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"local-token","refresh_token":"local-refresh","account_id":"local-account"}}"#,
+        )
+        .unwrap();
+        let key = "csk_gateway_key";
+        let app = App::new(Settings {
+            codex_home: root.path().display().to_string(),
+            lan_access_enabled: true,
+            lan_api_key_hash: lan_api_key_hash(key),
+            ..Settings::default()
+        })
+        .unwrap();
+        let mut request = Request::builder()
+            .header("authorization", "Bearer not-the-gateway-key")
+            .header("x-api-key", key)
+            .header("chatgpt-account-id", "remote-account")
+            .body(Body::empty())
+            .unwrap();
+        authorize_lan_request(&app, &mut request).await.unwrap();
+        assert!(request.headers().get("authorization").is_none());
+        assert!(request.headers().get("x-api-key").is_none());
+        assert!(request.headers().get("chatgpt-account-id").is_none());
+    }
+
+    #[tokio::test]
+    async fn lan_accepts_the_current_local_chatgpt_token() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            login::kit_auth_path(root.path()),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"local-token","refresh_token":"local-refresh","account_id":"local-account"}}"#,
+        )
+        .unwrap();
+        let key = "csk_gateway_key";
+        let app = App::new(Settings {
+            codex_home: root.path().display().to_string(),
+            lan_access_enabled: true,
+            lan_api_key_hash: lan_api_key_hash(key),
+            ..Settings::default()
+        })
+        .unwrap();
+        let mut request = Request::builder()
+            .header("authorization", "Bearer local-token")
+            .header("chatgpt-account-id", "local-account")
+            .body(Body::empty())
+            .unwrap();
+        authorize_lan_request(&app, &mut request).await.unwrap();
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer local-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn lan_rejects_missing_or_invalid_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            login::kit_auth_path(root.path()),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"local-token","refresh_token":"local-refresh","account_id":"local-account"}}"#,
+        )
+        .unwrap();
+        let app = App::new(Settings {
+            codex_home: root.path().display().to_string(),
+            lan_access_enabled: true,
+            lan_api_key_hash: lan_api_key_hash("csk_gateway_key"),
+            ..Settings::default()
+        })
+        .unwrap();
+        let mut request = Request::new(Body::empty());
+        let response = authorize_lan_request(&app, &mut request).await.unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn lan_gateway_key_requires_a_kit_chatgpt_session() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "csk_gateway_key";
+        let app = App::new(Settings {
+            codex_home: root.path().display().to_string(),
+            lan_access_enabled: true,
+            lan_api_key_hash: lan_api_key_hash(key),
+            ..Settings::default()
+        })
+        .unwrap();
+        let mut request = Request::builder()
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = authorize_lan_request(&app, &mut request).await.unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

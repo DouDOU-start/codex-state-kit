@@ -34,5 +34,5 @@ pub use login::{
     PendingLogin, PollResult, PollStatus,
 };
 pub use logs::LogEntry;
-pub use proxy::{join_upstream, App, ProxyHandle, Status};
+pub use proxy::{join_upstream, App, LanApiKeyResult, ProxyHandle, Status};
 pub use settings::{home_dir, load_settings, save_settings, Settings, SettingsPatch};

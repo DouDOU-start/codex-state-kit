@@ -4,8 +4,8 @@ use codex_state_kit::pricing::{CatalogInfo, ModelPriceRow};
 use codex_state_kit::{
     exchange_refresh_token, import_access_token as persist_access_token, inspect_codex_config,
     login_http_client_via, login_status, persist_refresh_token_import, poll_device_login,
-    start_device_login, token_import_http_client_via, CodexConfigView, LoginEndpoints, LoginStart,
-    LoginStatus, SettingsPatch, Status,
+    start_device_login, token_import_http_client_via, CodexConfigView, LanApiKeyResult,
+    LoginEndpoints, LoginStart, LoginStatus, SettingsPatch, Status,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -156,6 +156,16 @@ pub async fn restart_after_update(
 #[tauri::command(async)]
 pub async fn get_status(state: State<'_, AppState>) -> CommandResult<Status> {
     Ok(state.proxy.managed_status().await)
+}
+
+#[tauri::command(async)]
+pub async fn set_lan_access(state: State<'_, AppState>, enabled: bool) -> CommandResult<Status> {
+    command(state.proxy.set_lan_access(enabled).await)
+}
+
+#[tauri::command(async)]
+pub async fn regenerate_lan_api_key(state: State<'_, AppState>) -> CommandResult<LanApiKeyResult> {
+    command(state.proxy.regenerate_lan_api_key().await)
 }
 
 /// Read durable per-account usage totals.  The billing store is independent

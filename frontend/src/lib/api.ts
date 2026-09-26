@@ -39,6 +39,9 @@ const defaultStatus = (): Status => ({
   currentAccountEmail: "mock@example.com",
   accountTraffic: { concurrentRequests: 2, rpm: 18, tpm: 12480 },
   proxyListen: "127.0.0.1:8787",
+  lanAccessEnabled: false,
+  lanApiKeyConfigured: false,
+  lanApiKeyMasked: null,
   upstream: "https://chatgpt.com/backend-api/codex",
   codexHome: "~/.codex",
   proxyOk: true,
@@ -182,6 +185,7 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
   mockStatus = {
     ...mockStatus,
     proxyListen: settings.proxyListen,
+    lanAccessEnabled: settings.lanAccessEnabled,
     upstream: settings.upstream,
     codexHome: settings.codexHome,
     outboundProxy: settings.outboundProxy,
@@ -212,6 +216,29 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
   mockConfig.codexHome = settings.codexHome;
   mockConfig.suggestedBaseUrl = `http://${settings.proxyListen}`;
   return cloneStatus();
+}
+
+/** Toggle the single-port listener's LAN binding without touching other settings. */
+export async function setLanAccess(enabled: boolean): Promise<Status> {
+  if (isTauri) return invoke<Status>("set_lan_access", { enabled });
+  mockStatus = { ...mockStatus, lanAccessEnabled: enabled };
+  return cloneStatus();
+}
+
+export interface LanApiKeyResult {
+  /** Plaintext key. The backend returns it only when a key is generated/rotated. */
+  apiKey: string;
+  /** Masked form suitable for display after generation. */
+  masked?: string | null;
+}
+
+/** Generate or rotate the gateway key used by LAN clients. */
+export async function regenerateLanApiKey(): Promise<LanApiKeyResult> {
+  if (isTauri) return invoke<LanApiKeyResult>("regenerate_lan_api_key");
+  const apiKey = `kit_mock_${crypto.randomUUID().replaceAll("-", "")}`;
+  const masked = `${apiKey.slice(0, 8)}…${apiKey.slice(-4)}`;
+  mockStatus = { ...mockStatus, lanApiKeyConfigured: true, lanApiKeyMasked: masked };
+  return { apiKey, masked };
 }
 
 export async function getCodexConfig(home?: string): Promise<CodexConfigView> {

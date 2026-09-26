@@ -88,6 +88,8 @@ export default function App() {
   const [mihomoSubscription, setMihomoSubscription] = useState("");
   const [mihomoNode, setMihomoNode] = useState("");
   const [forcedModel, setForcedModel] = useState("");
+  const [lanApiKey, setLanApiKey] = useState<string | null>(null);
+  const [lanApiKeyCopyState, setLanApiKeyCopyState] = useState<"idle" | "copied" | "error">("idle");
   const [addAccountOpen, setAddAccountOpen] = useState(false);
   /** The saved account the login dialog re-authorizes; null adds a new one. */
   const [reauthTarget, setReauthTarget] = useState<SavedAccount | null>(null);
@@ -226,6 +228,26 @@ export default function App() {
   const shownMihomoGroups = kitGroups.length > 0
     ? kitGroups
     : mihomoGroups.filter((group) => group.groupType === "select");
+  const proxyPort = fwd.status.proxyListen.split(":").pop() ?? fwd.status.proxyListen;
+  const lanBaseUrl = `http://<Kit主机IP>:${proxyPort}`;
+
+  async function copyLanApiKey() {
+    if (!lanApiKey) return;
+    try {
+      await navigator.clipboard.writeText(lanApiKey);
+      setLanApiKeyCopyState("copied");
+      window.setTimeout(() => setLanApiKeyCopyState("idle"), 1800);
+    } catch {
+      setLanApiKeyCopyState("error");
+    }
+  }
+
+  async function rotateLanApiKey() {
+    const result = await fwd.rotateLanApiKey();
+    if (!result) return;
+    setLanApiKey(result.apiKey);
+    setLanApiKeyCopyState("idle");
+  }
 
   return (
     <AppShell>
@@ -492,6 +514,46 @@ export default function App() {
             />
           </label>
           <p className="panel__hint">{t("填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游。")}</p>
+          <section className="lan-access" aria-label={t("局域网访问")}>
+            <div className="lan-access__heading">
+              <div>
+                <h3>{t("局域网访问")}</h3>
+                <p>{t("让其他机器通过同一个端口调用 Kit")}</p>
+              </div>
+              <label className="lan-access__toggle">
+                <input
+                  type="checkbox"
+                  checked={fwd.status.lanAccessEnabled === true}
+                  disabled={fwd.busy !== null}
+                  onChange={(event) => void fwd.setLanAccess(event.target.checked)}
+                />
+                <span>{fwd.status.lanAccessEnabled === true ? t("已开启") : t("已关闭")}</span>
+              </label>
+            </div>
+            <p className="panel__hint">{t("开启后 Kit 会监听局域网地址；本机 Codex 仍使用当前端口和自动注入配置，远端客户端使用这里生成的 API Key。")}</p>
+            <div className="lan-access__endpoint">
+              <span>{t("远端 Base URL")}</span>
+              <code>{lanBaseUrl}</code>
+            </div>
+            <div className="lan-access__key">
+              <div className="lan-access__key-value">
+                <span>{t("API Key")}</span>
+                <code>{lanApiKey ?? fwd.status.lanApiKeyMasked ?? (fwd.status.lanApiKeyConfigured ? t("已配置（仅显示掩码）") : t("尚未生成"))}</code>
+              </div>
+              <div className="lan-access__actions">
+                {lanApiKey ? (
+                  <button type="button" className="button button--secondary" onClick={() => void copyLanApiKey()}>
+                    {lanApiKeyCopyState === "copied" ? t("已复制") : t("复制 Key")}
+                  </button>
+                ) : null}
+                <button type="button" className="button button--ghost" disabled={fwd.busy !== null} onClick={() => void rotateLanApiKey()}>
+                  {fwd.status.lanApiKeyConfigured ? t("重新生成") : t("生成 API Key")}
+                </button>
+              </div>
+            </div>
+            {lanApiKeyCopyState === "error" ? <p className="lan-access__error">{t("复制失败，请手动复制上面的 Key")}</p> : null}
+            <p className="lan-access__note">{t("Key 只在生成后显示一次，请保存到远端客户端的 API Key 配置中。重新生成会立即使旧 Key 失效。")}</p>
+          </section>
         </section>
         </div>
 

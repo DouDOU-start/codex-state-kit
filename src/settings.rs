@@ -33,6 +33,14 @@ pub struct Settings {
     pub proxy_listen: String,
     pub upstream: String,
     pub codex_home: String,
+    /// Bind the proxy on all interfaces so trusted LAN clients can reach it.
+    /// The default keeps the historical loopback-only listener.
+    #[serde(default)]
+    pub lan_access_enabled: bool,
+    /// SHA-256 digest of the LAN gateway API key. The plaintext key is never
+    /// persisted in settings.
+    #[serde(default)]
+    pub lan_api_key_hash: String,
     pub outbound_proxy: String,
     #[serde(default, deserialize_with = "deserialize_outbound_mode")]
     pub outbound_mode: OutboundMode,
@@ -55,6 +63,8 @@ impl Default for Settings {
             proxy_listen: default_listen().into(),
             upstream: "https://chatgpt.com/backend-api/codex".into(),
             codex_home: home_dir().join(".codex").display().to_string(),
+            lan_access_enabled: false,
+            lan_api_key_hash: String::new(),
             outbound_proxy: String::new(),
             outbound_mode: OutboundMode::Manual,
             forced_model: String::new(),
@@ -105,6 +115,8 @@ pub struct SettingsPatch {
     pub upstream: String,
     pub codex_home: String,
     #[serde(default)]
+    pub lan_access_enabled: bool,
+    #[serde(default)]
     pub outbound_proxy: String,
     #[serde(default, deserialize_with = "deserialize_outbound_mode")]
     pub outbound_mode: OutboundMode,
@@ -126,6 +138,10 @@ impl SettingsPatch {
             proxy_listen: self.proxy_listen.trim().to_string(),
             upstream: self.upstream.trim().to_string(),
             codex_home: self.codex_home.trim().to_string(),
+            lan_access_enabled: self.lan_access_enabled,
+            // The gateway hash is durable state managed by the LAN key
+            // commands. A regular settings patch must not be able to clear it.
+            lan_api_key_hash: String::new(),
             outbound_proxy: normalize_outbound_proxy(&self.outbound_proxy)?,
             outbound_mode: self.outbound_mode,
             forced_model: normalize_forced_model(&self.forced_model)?,
@@ -287,6 +303,45 @@ mod tests {
     }
 
     #[test]
+    fn lan_access_defaults_closed_and_legacy_settings_still_load() {
+        let settings = settings_from_json("{}").unwrap();
+        assert!(!settings.lan_access_enabled);
+        assert!(settings.lan_api_key_hash.is_empty());
+
+        let legacy: Settings = serde_json::from_str(
+            r#"{"proxy_listen":"127.0.0.1:8787","upstream":"https://example.com","codex_home":"test"}"#,
+        )
+        .unwrap();
+        assert!(!legacy.lan_access_enabled);
+        assert!(legacy.lan_api_key_hash.is_empty());
+    }
+
+    #[test]
+    fn lan_access_patch_uses_camel_case_without_touching_gateway_hash() {
+        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen": "127.0.0.1:8787",
+            "upstream": "https://example.com",
+            "codexHome": "test",
+            "lanAccessEnabled": true
+        }))
+        .unwrap();
+        let settings = patch.into_settings().unwrap();
+        assert!(settings.lan_access_enabled);
+        assert!(settings.lan_api_key_hash.is_empty());
+
+        let settings_with_hash = Settings {
+            lan_access_enabled: true,
+            lan_api_key_hash: "sha256:abc123".into(),
+            ..settings
+        };
+
+        let serialized = serde_json::to_value(&settings_with_hash).unwrap();
+        assert_eq!(serialized["lan_access_enabled"], true);
+        assert_eq!(serialized["lan_api_key_hash"], "sha256:abc123");
+        assert!(!serialized.to_string().contains("lanApiKey"));
+    }
+
+    #[test]
     fn empty_outbound_proxy_is_ok() {
         assert_eq!(normalize_outbound_proxy("  ").unwrap(), "");
     }
@@ -322,6 +377,7 @@ mod tests {
             proxy_listen: "127.0.0.1:8787".into(),
             upstream: "https://chatgpt.com/backend-api/codex".into(),
             codex_home: "/tmp/codex".into(),
+            lan_access_enabled: false,
             outbound_proxy: "socks5://127.0.0.1:1080".into(),
             outbound_mode: OutboundMode::Manual,
             forced_model: String::new(),

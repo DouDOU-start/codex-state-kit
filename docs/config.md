@@ -59,6 +59,8 @@ openai_base_url = "http://127.0.0.1:8787"
 | 字段 | 用途 |
 | --- | --- |
 | `proxy_listen` | 本机监听地址，默认 `127.0.0.1:8787`；开发版为 `8788` |
+| `lan_access_enabled` | 是否把同一端口扩展到局域网接口，默认 `false`；开启前需要先生成 API Key |
+| `lan_api_key_hash` | 局域网 API Key 的 SHA-256 哈希；只保存哈希，不要手动填写明文 Key |
 | `upstream` | 上游地址，默认 `https://chatgpt.com/backend-api/codex` |
 | `codex_home` | Codex 配置目录的完整路径 |
 | `outbound_mode` | `manual`（默认）或 `mihomo`；旧值 `warp` 按 `manual` 读取 |
@@ -67,6 +69,21 @@ openai_base_url = "http://127.0.0.1:8787"
 | `mihomo_node` | 固定使用的节点名；留空使用订阅中的第一个 |
 | `chain_system_proxy` | 是否经系统代理连接手动代理，默认 `true` |
 | `forced_model` | 强制绑定的上游模型 ID，例如 `gpt-6-astra`；填写后下游无论请求什么模型都会改成该值再转发。留空保持下游原模型 |
+
+## 局域网访问
+
+在“转发设置”中开启“允许局域网访问”并生成 API Key 后，Kit 会继续使用当前端口，但把监听地址扩展到局域网接口。自动注入到本机 Codex 的地址仍然是 `http://127.0.0.1:<端口>`，本机 Codex 的账号注入流程不变。
+
+远端客户端使用 Kit 主机的局域网地址和生成的 Key：
+
+```text
+Base URL: http://<Kit主机IP>:8787
+Authorization: Bearer <Kit API Key>
+```
+
+也兼容 `x-api-key: <Kit API Key>` 和 `api-key: <Kit API Key>`。
+
+开发版端口默认为 `8788`。Key 只在生成或重新生成时显示一次；重新生成会立即使旧 Key 失效。启用后同一端口上的请求需要有效的 Kit API Key 或当前本机 Codex 的 ChatGPT 凭据，建议只在可信局域网使用，并通过系统防火墙限制端口来源。不要把端口直接暴露到公网。
 
 旧版的 `upstream_proxy` 会迁移到 `outbound_proxy`；Turn-State 相关的旧字段（`models`、`state_miss_policy`、`token_reuse_policy` 等）和 `ws_upstream_enabled`（上游现在固定走 WebSocket）读取时忽略，下次保存时移除。
 
