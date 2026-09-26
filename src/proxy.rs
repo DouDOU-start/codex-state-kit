@@ -2118,23 +2118,23 @@ fn append_upstream_path(url: &mut Url, suffix: &str) {
     url.set_path(&path);
 }
 
-fn uri_path_for_upstream(upstream: &Url, local_path: &str) -> String {
-    let mut path = local_path.trim_start_matches('/');
-    let base = upstream.path().trim_end_matches('/');
-    // Codex's public API base is commonly `/v1`, while the proxy receives
-    // `/v1/live`; avoid producing `/v1/v1/live` in that configuration.
-    if base.ends_with("/v1") {
-        path = path.strip_prefix("v1/").unwrap_or(path);
+/// `/v1` is an optional downstream prefix. The configured upstream base
+/// owns its API prefix (for example `/backend-api/codex` or `/v1`).
+fn upstream_relative_path(local_path: &str) -> &str {
+    let path = local_path.trim_start_matches('/');
+    if path == "v1" {
+        ""
+    } else {
+        path.strip_prefix("v1/").unwrap_or(path)
     }
-    path.to_string()
 }
 
 fn realtime_call_target(upstream: &str, uri: &Uri) -> Result<String> {
     if !is_backend_upstream(upstream) {
         let base = Url::parse(upstream.trim()).context("upstream url")?;
-        let path = uri_path_for_upstream(&base, uri.path());
+        let path = upstream_relative_path(uri.path());
         let mut url = base;
-        append_upstream_path(&mut url, &path);
+        append_upstream_path(&mut url, path);
         url.set_query(uri.query());
         return Ok(url.to_string());
     }
@@ -2279,9 +2279,9 @@ fn realtime_sideband_target(upstream: &str, uri: &Uri) -> Result<String> {
         return Ok(url.to_string());
     }
     let base = Url::parse(upstream.trim()).context("upstream url")?;
-    let path = uri_path_for_upstream(&base, path);
+    let path = upstream_relative_path(path);
     let mut url = base;
-    append_upstream_path(&mut url, &path);
+    append_upstream_path(&mut url, path);
     url.set_query(uri.query());
     Ok(url.to_string())
 }
@@ -3832,7 +3832,7 @@ pub fn join_upstream(upstream: &str, uri: &Uri) -> Result<String> {
         base.push('/');
     }
     let mut url = Url::parse(&base).context("upstream url")?;
-    let path = uri.path().trim_start_matches('/');
+    let path = upstream_relative_path(uri.path());
     url = url.join(path).context("join path")?;
     url.set_query(uri.query());
     Ok(url.to_string())
@@ -3845,6 +3845,10 @@ mod upstream_proxy_tests;
 #[cfg(test)]
 #[path = "account_switch_tests.rs"]
 mod account_switch_tests;
+
+#[cfg(test)]
+#[path = "path_alias_tests.rs"]
+mod path_alias_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4000,10 +4004,69 @@ mod tests {
     }
 
     #[test]
-    fn joins_nested_path() {
-        let uri: Uri = "http://127.0.0.1:8787/v1/responses".parse().unwrap();
-        let out = join_upstream("https://chatgpt.com/backend-api/codex/", &uri).unwrap();
-        assert_eq!(out, "https://chatgpt.com/backend-api/codex/v1/responses");
+    fn joins_optional_v1_aliases_without_changing_the_upstream_base() {
+        for base in [
+            "https://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex/",
+            "https://api.example.test/v1",
+            "https://api.example.test/v1/",
+            "http://127.0.0.1:9999",
+        ] {
+            for endpoint in [
+                "models",
+                "models/test-model",
+                "responses",
+                "responses/compact",
+                "chat/completions",
+            ] {
+                for prefix in ["", "/v1"] {
+                    let uri: Uri = format!("{prefix}/{endpoint}?a=1&a=2&value=%2Fv1%2F")
+                        .parse()
+                        .unwrap();
+                    assert_eq!(
+                        join_upstream(base, &uri).unwrap(),
+                        format!(
+                            "{}/{endpoint}?a=1&a=2&value=%2Fv1%2F",
+                            base.trim_end_matches('/')
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optional_v1_prefix_matches_only_the_first_complete_segment() {
+        for (path, relative) in [
+            ("/", ""),
+            ("/v1", ""),
+            ("/v1/", ""),
+            ("/v1/models/", "models/"),
+            ("/v10/models", "v10/models"),
+            ("/v1beta/models", "v1beta/models"),
+            ("/files/v1/models", "files/v1/models"),
+            ("/v1/v1/models", "v1/models"),
+        ] {
+            assert_eq!(upstream_relative_path(path), relative);
+        }
+    }
+
+    #[test]
+    fn realtime_optional_v1_aliases_keep_the_configured_base() {
+        for base in ["http://127.0.0.1:9999", "https://api.example.test/v1"] {
+            for prefix in ["", "/v1"] {
+                let call: Uri = format!("{prefix}/live?trace=1").parse().unwrap();
+                assert_eq!(
+                    realtime_call_target(base, &call).unwrap(),
+                    format!("{base}/live?trace=1")
+                );
+                let sideband: Uri = format!("{prefix}/realtime?call_id=rtc_1").parse().unwrap();
+                assert_eq!(
+                    realtime_sideband_target(base, &sideband).unwrap(),
+                    format!("{base}/realtime?call_id=rtc_1")
+                );
+            }
+        }
     }
 
     #[test]

@@ -83,6 +83,10 @@ Authorization: Bearer <Kit API Key>
 
 也兼容 `x-api-key: <Kit API Key>` 和 `api-key: <Kit API Key>`。
 
+下游 Base URL 可以使用 `http://<Kit主机IP>:8787` 或 `http://<Kit主机IP>:8787/v1`：`/models` 与 `/v1/models`、`/responses` 与 `/v1/responses` 会转发到相同的上游路径，查询参数保留。配置的上游前缀保持不变，例如默认上游使用 `/backend-api/codex/responses`，上游 Base URL 已含 `/v1` 时也不会重复拼接。
+
+使用默认 ChatGPT 上游时，下游仍需采用 Codex 兼容的 Responses 协议；路径别名不会把 Chat Completions 的请求和响应转换成 Responses。`/responses` 返回 `400` 时，需要根据上游返回的错误检查请求字段，不能仅靠增删 `/v1` 解决。
+
 开发版端口默认为 `8788`。Key 只在生成或重新生成时显示一次；重新生成会立即使旧 Key 失效。启用后同一端口上的请求需要有效的 Kit API Key 或当前本机 Codex 的 ChatGPT 凭据，建议只在可信局域网使用，并通过系统防火墙限制端口来源。不要把端口直接暴露到公网。
 
 旧版的 `upstream_proxy` 会迁移到 `outbound_proxy`；Turn-State 相关的旧字段（`models`、`state_miss_policy`、`token_reuse_policy` 等）和 `ws_upstream_enabled`（上游现在固定走 WebSocket）读取时忽略，下次保存时移除。
