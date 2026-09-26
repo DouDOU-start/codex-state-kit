@@ -40,6 +40,7 @@ const defaultStatus = (): Status => ({
   accountTraffic: { concurrentRequests: 2, rpm: 18, tpm: 12480 },
   proxyListen: "127.0.0.1:8787",
   lanAccessEnabled: false,
+  lanAccessUrl: null,
   lanApiKeyConfigured: false,
   lanApiKeyMasked: null,
   upstream: "https://chatgpt.com/backend-api/codex",

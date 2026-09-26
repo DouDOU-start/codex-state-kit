@@ -84,6 +84,8 @@ export interface Status {
   proxyListen: string;
   /** Whether the proxy listens on all interfaces for LAN clients. */
   lanAccessEnabled: boolean;
+  /** Best-effort LAN IPv4 endpoint for remote clients, including the proxy port. */
+  lanAccessUrl?: string | null;
   /** Whether a Kit gateway API key has been configured. */
   lanApiKeyConfigured: boolean;
   /** Masked gateway key for display; the plaintext key is never returned by status. */

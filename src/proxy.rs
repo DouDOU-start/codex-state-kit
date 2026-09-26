@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,6 +104,9 @@ const HOP_BY_HOP: &[&str] = &[
 pub struct Status {
     pub proxy_listen: String,
     pub lan_access_enabled: bool,
+    /// A best-effort URL for the host's primary LAN IPv4 address and proxy port.
+    /// This is presentation-only; clients still need to use a configured key.
+    pub lan_access_url: Option<String>,
     pub lan_api_key_configured: bool,
     pub lan_api_key_masked: Option<String>,
     pub upstream: String,
@@ -353,6 +356,13 @@ impl App {
     pub async fn status(&self) -> Status {
         self.sync_logged_in_account().await;
         let settings = self.settings.lock().await.clone();
+        let lan_access_url = settings
+            .proxy_listen
+            .parse::<SocketAddr>()
+            .ok()
+            .and_then(|listen| {
+                detect_lan_ipv4().map(|address| format!("http://{address}:{}", listen.port()))
+            });
         let logs = self
             .logs
             .lock()
@@ -370,6 +380,7 @@ impl App {
         Status {
             proxy_listen: settings.proxy_listen,
             lan_access_enabled: settings.lan_access_enabled,
+            lan_access_url,
             lan_api_key_configured: !settings.lan_api_key_hash.trim().is_empty(),
             lan_api_key_masked: (!settings.lan_api_key_hash.trim().is_empty())
                 .then(|| "••••••••".to_string()),
@@ -1217,6 +1228,48 @@ fn proxy_bind_addr(configured: SocketAddr, lan_access_enabled: bool) -> SocketAd
         return configured;
     }
     SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, configured.port()))
+}
+
+/// Return the IPv4 address selected by the host's primary route.
+///
+/// Rust's standard library does not expose a portable network-interface
+/// enumeration API. Connecting an unbound UDP socket does not send a packet,
+/// but asks the OS routing table which local address it would use. Trying a
+/// few independent destinations makes this work on hosts whose first route is
+/// a VPN or another non-LAN interface, while the private-address preference
+/// keeps the displayed address useful for a typical home/office network.
+fn detect_lan_ipv4() -> Option<Ipv4Addr> {
+    const TARGETS: &[&str] = &[
+        "192.168.0.1:80",
+        "10.0.0.1:80",
+        "172.16.0.1:80",
+        "1.1.1.1:80",
+        "8.8.8.8:53",
+    ];
+    let mut candidates = Vec::new();
+    for target in TARGETS {
+        let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+            continue;
+        };
+        if socket.connect(target).is_err() {
+            continue;
+        }
+        let Ok(SocketAddr::V4(local)) = socket.local_addr() else {
+            continue;
+        };
+        let address = *local.ip();
+        if address.is_unspecified() || address.is_loopback() || address.is_link_local() {
+            continue;
+        }
+        if !candidates.contains(&address) {
+            candidates.push(address);
+        }
+    }
+    candidates
+        .iter()
+        .copied()
+        .find(Ipv4Addr::is_private)
+        .or_else(|| candidates.into_iter().next())
 }
 
 fn lan_api_key_hash(value: &str) -> String {

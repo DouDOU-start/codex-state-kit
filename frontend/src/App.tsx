@@ -229,7 +229,7 @@ export default function App() {
     ? kitGroups
     : mihomoGroups.filter((group) => group.groupType === "select");
   const proxyPort = fwd.status.proxyListen.split(":").pop() ?? fwd.status.proxyListen;
-  const lanBaseUrl = `http://<Kit主机IP>:${proxyPort}`;
+  const lanBaseUrl = fwd.status.lanAccessUrl ?? `http://<Kit主机IP>:${proxyPort}`;
 
   async function copyLanApiKey() {
     if (!lanApiKey) return;
