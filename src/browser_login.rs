@@ -351,10 +351,17 @@ mod tests {
         }
 
         fn request(&self) -> reqwest::RequestBuilder {
-            reqwest::Client::new().get(self.url()).query(&[
+            Self::client().get(self.url()).query(&[
                 ("state", self.login.inner.state.as_str()),
                 ("code", "test-code"),
             ])
+        }
+
+        fn client() -> reqwest::Client {
+            // Callback tests must always reach the loopback listener directly.
+            // A configured system proxy can otherwise rewrite a deliberately
+            // invalid Host header into a proxy 502 before Axum validates it.
+            reqwest::Client::builder().no_proxy().build().unwrap()
         }
     }
 
@@ -362,7 +369,11 @@ mod tests {
     async fn callback_validates_state_and_pkce_and_writes_native_auth() {
         let f = Fixture::new(true, false, LIFETIME).await;
         for query in ["code=secret", "state=wrong&code=secret"] {
-            let response = reqwest::get(format!("{}?{query}", f.url())).await.unwrap();
+            let response = Fixture::client()
+                .get(format!("{}?{query}", f.url()))
+                .send()
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert!(!response.text().await.unwrap().contains("secret"));
         }
@@ -411,10 +422,11 @@ mod tests {
             "&code=a&error=denied",
             "&state=duplicate&code=a",
         ] {
-            let response =
-                reqwest::get(format!("{}?state={}{suffix}", f.url(), f.login.inner.state))
-                    .await
-                    .unwrap();
+            let response = Fixture::client()
+                .get(format!("{}?state={}{suffix}", f.url(), f.login.inner.state))
+                .send()
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
         let response = f
@@ -469,7 +481,7 @@ mod tests {
             let path = f.home.path().join("auth.json");
             std::fs::write(&path, "original-auth").unwrap();
             let response = if denied {
-                reqwest::Client::new()
+                Fixture::client()
                     .get(f.url())
                     .query(&[
                         ("state", f.login.inner.state.as_str()),
