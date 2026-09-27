@@ -400,6 +400,21 @@ impl LogEntry {
         }
     }
 
+    /// Start stream accounting after headers were already recorded. Used when
+    /// the body itself shows the response is SSE even though the headers did not.
+    pub fn track_stream(
+        &mut self,
+        started: Instant,
+        response_header_ms: u128,
+    ) -> Arc<StreamLifecycle> {
+        if let Some(existing) = &self.stream_lifecycle {
+            return existing.clone();
+        }
+        let lifecycle = Arc::new(StreamLifecycle::new(started, response_header_ms));
+        self.stream_lifecycle = Some(lifecycle.clone());
+        lifecycle
+    }
+
     pub fn snapshot(&self) -> Self {
         let mut entry = self.clone();
         let Some(lifecycle) = &self.stream_lifecycle else {
@@ -504,6 +519,13 @@ pub struct ResponseMetrics {
     /// `response.completed`; a late fragment must not overwrite the final
     /// counters and make billing nondeterministic.
     usage_terminal: bool,
+    /// Last provider `usage` object seen in an oversized event. Head/tail
+    /// windows miss it when a large tool payload sits on both sides.
+    usage_sniffer: UsageSniffer,
+    /// The current SSE line has crossed the inspection cap.
+    line_overflow: bool,
+    /// That overflowed line is a `data:` payload, so its bytes are sniffed.
+    sniff_overflow: bool,
     upstream_response_model: Option<String>,
     service_tier: Option<String>,
     downgrade: crate::downgrade::DowngradeSignals,
@@ -696,6 +718,9 @@ impl ResponseMetrics {
                     self.data.clear();
                     self.large_tail.clear();
                     self.skip_event = false;
+                    self.usage_sniffer.reset();
+                    self.line_overflow = false;
+                    self.sniff_overflow = false;
                 } else {
                     if let Some(value) = self.line.strip_prefix(b"data:") {
                         let value = value.strip_prefix(b" ").unwrap_or(value);
@@ -713,10 +738,23 @@ impl ResponseMetrics {
                     }
                     self.line.clear();
                     self.line_tail.clear();
+                    self.line_overflow = false;
                 }
             } else if self.line.len() < MAX_LINE_BYTES {
                 self.line.push(byte);
             } else {
+                if !self.line_overflow {
+                    self.line_overflow = true;
+                    self.sniff_overflow = self.line.starts_with(b"data:");
+                    if self.sniff_overflow {
+                        // The capped prefix is still here. Sniff it before the
+                        // rest of the line is reduced to a tail.
+                        self.usage_sniffer.feed(&self.line);
+                    }
+                }
+                if self.sniff_overflow {
+                    self.usage_sniffer.feed(&[byte]);
+                }
                 self.line_tail.push_back(byte);
                 if self.line_tail.len() > MAX_EVENT_TAIL_BYTES {
                     self.line_tail.pop_front();
@@ -827,6 +865,12 @@ impl ResponseMetrics {
                 self.observe_usage(&usage, terminal);
                 break;
             }
+        }
+        // A usage object between the retained head and tail is still the
+        // provider total when it is the last one in the event. Prefer it over
+        // an earlier fragment found in the head.
+        if let Some(usage) = self.usage_sniffer.take_found() {
+            self.observe_usage(&usage, terminal);
         }
     }
 
@@ -1156,6 +1200,201 @@ fn large_event_has_visible_output(event_type: &str) -> bool {
     )
 }
 
+/// Keeps the last small provider `usage` object while an oversized SSE event
+/// is scanned. The retained head and tail are not enough when a large tool
+/// payload sits on both sides of `usage`.
+#[derive(Clone, Debug)]
+struct UsageSniffer {
+    phase: SniffPhase,
+    key_at: usize,
+    depth: i32,
+    escaped: bool,
+    capture_string: bool,
+    discard: bool,
+    buf: Vec<u8>,
+    found: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SniffPhase {
+    Normal,
+    String,
+    Key,
+    AfterKey,
+    AfterColon,
+    Capture,
+}
+
+impl Default for UsageSniffer {
+    fn default() -> Self {
+        Self {
+            phase: SniffPhase::Normal,
+            key_at: 0,
+            depth: 0,
+            escaped: false,
+            capture_string: false,
+            discard: false,
+            buf: Vec::new(),
+            found: None,
+        }
+    }
+}
+
+impl UsageSniffer {
+    const KEY: &'static [u8] = b"usage";
+    const MAX_OBJECT: usize = 8192;
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.feed_byte(byte);
+        }
+    }
+
+    fn take_found(&mut self) -> Option<serde_json::Value> {
+        self.found.take()
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn feed_byte(&mut self, byte: u8) {
+        match self.phase {
+            SniffPhase::Capture => self.capture(byte),
+            SniffPhase::String => self.feed_string(byte),
+            SniffPhase::Key => self.feed_key(byte),
+            SniffPhase::AfterKey => self.feed_after_key(byte),
+            SniffPhase::AfterColon => self.feed_after_colon(byte),
+            SniffPhase::Normal => {
+                if byte == b'"' {
+                    self.phase = SniffPhase::Key;
+                    self.key_at = 0;
+                }
+            }
+        }
+    }
+
+    fn feed_string(&mut self, byte: u8) {
+        if self.escaped {
+            self.escaped = false;
+            return;
+        }
+        if byte == b'\\' {
+            self.escaped = true;
+            return;
+        }
+        if byte == b'"' {
+            self.phase = SniffPhase::Normal;
+        }
+    }
+
+    fn feed_key(&mut self, byte: u8) {
+        if self.escaped {
+            self.escaped = false;
+            self.phase = SniffPhase::String;
+            return;
+        }
+        if byte == b'\\' {
+            self.escaped = true;
+            self.phase = SniffPhase::String;
+            return;
+        }
+        if self.key_at < Self::KEY.len() && byte == Self::KEY[self.key_at] {
+            self.key_at += 1;
+            return;
+        }
+        if self.key_at == Self::KEY.len() && byte == b'"' {
+            self.phase = SniffPhase::AfterKey;
+            self.key_at = 0;
+            return;
+        }
+        self.key_at = 0;
+        if byte == b'"' {
+            self.phase = SniffPhase::Normal;
+        } else {
+            self.phase = SniffPhase::String;
+        }
+    }
+
+    fn feed_after_key(&mut self, byte: u8) {
+        if byte.is_ascii_whitespace() {
+            return;
+        }
+        if byte == b':' {
+            self.phase = SniffPhase::AfterColon;
+            return;
+        }
+        self.phase = SniffPhase::Normal;
+        self.feed_byte(byte);
+    }
+
+    fn feed_after_colon(&mut self, byte: u8) {
+        if byte.is_ascii_whitespace() {
+            return;
+        }
+        if byte == b'{' {
+            self.phase = SniffPhase::Capture;
+            self.depth = 1;
+            self.escaped = false;
+            self.capture_string = false;
+            self.discard = false;
+            self.buf.clear();
+            self.buf.push(b'{');
+            return;
+        }
+        self.phase = SniffPhase::Normal;
+        self.feed_byte(byte);
+    }
+
+    fn capture(&mut self, byte: u8) {
+        if !self.discard {
+            if self.buf.len() >= Self::MAX_OBJECT {
+                self.discard = true;
+                self.buf.clear();
+            } else {
+                self.buf.push(byte);
+            }
+        }
+        if self.capture_string {
+            if self.escaped {
+                self.escaped = false;
+                return;
+            }
+            if byte == b'\\' {
+                self.escaped = true;
+                return;
+            }
+            if byte == b'"' {
+                self.capture_string = false;
+            }
+            return;
+        }
+        match byte {
+            b'"' => self.capture_string = true,
+            b'{' => self.depth += 1,
+            b'}' => {
+                self.depth -= 1;
+                if self.depth == 0 {
+                    if !self.discard {
+                        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&self.buf) {
+                            if is_usage_shaped(&value) {
+                                self.found = Some(value);
+                            }
+                        }
+                    }
+                    self.buf.clear();
+                    self.discard = false;
+                    self.capture_string = false;
+                    self.escaped = false;
+                    self.depth = 0;
+                    self.phase = SniffPhase::Normal;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn is_terminal_event(event_type: &str) -> bool {
     matches!(
         event_type,
@@ -1166,6 +1405,28 @@ fn is_terminal_event(event_type: &str) -> bool {
             | "response.cancelled"
             | "response.canceled"
     )
+}
+
+fn is_usage_shaped(value: &serde_json::Value) -> bool {
+    const USAGE_FIELD: [&str; 14] = [
+        "input_tokens",
+        "prompt_tokens",
+        "output_tokens",
+        "completion_tokens",
+        "input_tokens_details",
+        "prompt_tokens_details",
+        "cached_input_tokens",
+        "cached_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_creation_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens_details",
+        "completion_tokens_details",
+    ];
+    value
+        .as_object()
+        .is_some_and(|object| USAGE_FIELD.iter().any(|key| object.contains_key(*key)))
 }
 
 /// Finds a small provider `usage` object in a bounded event fragment.
@@ -1217,26 +1478,7 @@ fn find_usage_object(fragment: &[u8]) -> Option<serde_json::Value> {
                 // generated structured-output object named `usage` while
                 // still accepting all supported provider aliases and details
                 // objects.
-                let usage_field = [
-                    "input_tokens",
-                    "prompt_tokens",
-                    "output_tokens",
-                    "completion_tokens",
-                    "input_tokens_details",
-                    "prompt_tokens_details",
-                    "cached_input_tokens",
-                    "cached_tokens",
-                    "cache_read_tokens",
-                    "cache_write_tokens",
-                    "cache_creation_tokens",
-                    "cache_creation_input_tokens",
-                    "output_tokens_details",
-                    "completion_tokens_details",
-                ];
-                if value
-                    .as_object()
-                    .is_some_and(|object| usage_field.iter().any(|key| object.contains_key(*key)))
-                {
+                if is_usage_shaped(&value) {
                     return Some(value);
                 }
             }
@@ -1700,6 +1942,25 @@ data: {"type":"response.completed","response":{"service_tier":"priority","usage"
         assert_eq!(metrics.output_tokens(), Some(80));
         assert_eq!(metrics.cached_input_tokens(), Some(500));
         assert_eq!(metrics.upstream_response_model(), Some("gpt-6-astra"));
+    }
+
+    #[test]
+    fn metrics_extract_usage_between_oversized_sse_payloads() {
+        let prefix = "x".repeat(MAX_LINE_BYTES);
+        let suffix = "y".repeat(MAX_EVENT_TAIL_BYTES + 32 * 1024);
+        let event = format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"note\":\"see \\\"usage\\\":{{\\\"input_tokens\\\":9}}\",\"decoy\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}},\"output\":\"{prefix}\",\"usage\":{{\"input_tokens\":11,\"output_tokens\":2,\"input_tokens_details\":{{\"cached_tokens\":4}}}},\"tail\":\"{suffix}\"}}}}\n\n"
+        );
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(event.as_bytes(), 40, true);
+        metrics.finish(50);
+
+        assert!(metrics.terminal_event_seen());
+        assert!(metrics.completed());
+        assert!(metrics.usage_seen());
+        assert_eq!(metrics.input_tokens(), Some(11));
+        assert_eq!(metrics.output_tokens(), Some(2));
+        assert_eq!(metrics.cached_input_tokens(), Some(4));
     }
 
     #[test]

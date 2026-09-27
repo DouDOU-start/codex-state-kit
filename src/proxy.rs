@@ -61,6 +61,60 @@ fn business_stream_idle_timeout(chunks: u64) -> Duration {
     }
 }
 
+fn media_type(content_type: &str) -> &str {
+    content_type.split(';').next().unwrap_or("").trim()
+}
+
+fn content_type_is_event_stream(content_type: &str) -> bool {
+    media_type(content_type).eq_ignore_ascii_case("text/event-stream")
+}
+
+fn content_type_is_json(content_type: &str) -> bool {
+    let mime = media_type(content_type);
+    mime.eq_ignore_ascii_case("application/json")
+        || mime.eq_ignore_ascii_case("application/problem+json")
+}
+
+fn identity_content_encoding(headers: &HeaderMap) -> bool {
+    match headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+    {
+        None => true,
+        Some(value) => {
+            let value = value.trim();
+            value.is_empty() || value.eq_ignore_ascii_case("identity")
+        }
+    }
+}
+
+/// What the first response bytes are, before any protocol event is parsed.
+enum BodyFraming {
+    Sse,
+    Json,
+    /// Too few bytes to tell `data:` from some other prefix.
+    Undecided,
+    Other,
+}
+
+fn sniff_body_framing(bytes: &[u8]) -> BodyFraming {
+    let Some(start) = bytes.iter().position(|byte| !byte.is_ascii_whitespace()) else {
+        return BodyFraming::Undecided;
+    };
+    let rest = &bytes[start..];
+    if rest.starts_with(b"{") || rest.starts_with(b"[") {
+        return BodyFraming::Json;
+    }
+    const MARKERS: [&[u8]; 5] = [b"data:", b"event:", b"id:", b"retry:", b":"];
+    if MARKERS.iter().any(|marker| rest.starts_with(marker)) {
+        return BodyFraming::Sse;
+    }
+    if MARKERS.iter().any(|marker| marker.starts_with(rest)) {
+        return BodyFraming::Undecided;
+    }
+    BodyFraming::Other
+}
+
 async fn debug_log(msg: String) {
     eprintln!("{}", msg);
     let path = crate::settings::home_dir().join(if cfg!(debug_assertions) {
@@ -1470,21 +1524,18 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 return resp;
             }
             details.in_progress = true;
-            // Some Codex upstream responses omit Content-Type despite sending
-            // SSE. Retain the request's explicit SSE negotiation in that case.
+            // Codex often omits Content-Type on an SSE body. Pi and other
+            // Responses clients set `stream: true` without
+            // `Accept: text/event-stream`, so the Accept header alone is not
+            // enough. `forward_http_tracked` already promotes that case to
+            // `http_sse`. A definite JSON type still stays non-SSE, and the
+            // first body bytes can correct either guess below.
             let is_sse = details.transport == "http_sse"
                 || resp
                     .headers()
                     .get(header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| {
-                        value
-                            .split(';')
-                            .next()
-                            .unwrap_or_default()
-                            .trim()
-                            .eq_ignore_ascii_case("text/event-stream")
-                    });
+                    .is_some_and(content_type_is_event_stream);
             if let Some(transport) = resp
                 .headers()
                 .get(UPSTREAM_TRANSPORT_HEADER)
@@ -1534,6 +1585,10 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 diag_first_token: false,
                 diag_finished: false,
                 last_diag_chunks: 0,
+                parse_sse: is_sse,
+                sniff_body: identity_content_encoding(resp.headers()),
+                body_classified: false,
+                sniff_buf: Vec::new(),
             };
             let (parts, body) = resp.into_parts();
             let stream: Pin<
@@ -1566,7 +1621,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                             }
                             tracker.entry.error_kind = Some("stream_idle".into());
                             tracker.finished = true;
-                            if is_sse {
+                            if tracker.parse_sse {
                                 let idle = Bytes::from_static(SSE_IDLE_TIMEOUT_EVENT);
                                 tracker.metrics.observe(
                                     idle.as_ref(),
@@ -1584,13 +1639,15 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                     };
                     match &next {
                         Some(Ok(bytes)) => {
+                            tracker.note_body_framing(bytes);
                             if let Some(lifecycle) = &tracker.lifecycle {
                                 lifecycle.observe_chunk(bytes.len());
                             }
+                            let parse_sse = tracker.parse_sse;
                             tracker.metrics.observe(
                                 bytes,
                                 tracker.started.elapsed().as_millis(),
-                                is_sse,
+                                parse_sse,
                             );
                             // Hyper may stop polling immediately after Content-Length
                             // bytes. That is completion, not client cancellation.
@@ -1625,7 +1682,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                             // 200 response even though the provider truncated
                             // the stream before `response.completed` (or an
                             // explicit failure/incomplete event).
-                            let truncated_sse = is_sse
+                            let truncated_sse = tracker.parse_sse
                                 && !tracker.metrics.terminal_event_seen()
                                 && tracker.metrics.error_kind.is_none();
                             if truncated_sse {
@@ -1794,9 +1851,48 @@ struct ResponseLogTracker {
     diag_first_token: bool,
     diag_finished: bool,
     last_diag_chunks: u64,
+    /// Whether usage and first-token timing should read this body as SSE.
+    parse_sse: bool,
+    /// Uncompressed bodies can be reclassified from their first bytes.
+    sniff_body: bool,
+    body_classified: bool,
+    sniff_buf: Vec<u8>,
 }
 
 impl ResponseLogTracker {
+    /// Headers are not a reliable SSE signal. Pi sets `stream: true` and Codex
+    /// often replies with no `Content-Type`, or with `text/plain`. Use the
+    /// first uncompressed bytes so usage and first-token timing still run.
+    fn note_body_framing(&mut self, bytes: &[u8]) {
+        if self.body_classified || !self.sniff_body || bytes.is_empty() {
+            return;
+        }
+        if self.sniff_buf.len() < 24 {
+            let room = 24 - self.sniff_buf.len();
+            self.sniff_buf.extend(bytes.iter().copied().take(room));
+        }
+        match sniff_body_framing(&self.sniff_buf) {
+            BodyFraming::Undecided if self.sniff_buf.len() < 24 => return,
+            BodyFraming::Sse => self.apply_body_framing(true),
+            BodyFraming::Json => self.apply_body_framing(false),
+            BodyFraming::Undecided | BodyFraming::Other => self.body_classified = true,
+        }
+    }
+
+    fn apply_body_framing(&mut self, sse: bool) {
+        self.body_classified = true;
+        self.parse_sse = sse;
+        self.entry.transport = if sse {
+            "http_sse".into()
+        } else {
+            "http".into()
+        };
+        if sse && self.lifecycle.is_none() {
+            let header_ms = self.entry.response_header_ms.unwrap_or(0);
+            self.lifecycle = Some(self.entry.track_stream(self.started, header_ms));
+        }
+    }
+
     fn refresh(&mut self) {
         self.entry.ms = self.started.elapsed().as_millis();
         self.entry.first_token_ms = self.metrics.first_token_ms();
@@ -2790,19 +2886,36 @@ async fn forward_http_tracked(
     }
     let response_header_ms = started.elapsed().as_millis();
     details.response_header_ms = Some(response_header_ms);
-    if let Some(content_type) = upstream_resp
+    // Pi and other Responses clients set `stream: true` without advertising
+    // `Accept: text/event-stream`. The Codex backend then often omits
+    // Content-Type while still sending SSE. Treat that body as SSE so first
+    // token and usage are recorded. A real JSON content type still wins, so a
+    // JSON error is not marked as a truncated event stream.
+    let expect_response_sse = parts.method == http::Method::POST
+        && path.contains("/responses")
+        && (details.responses_non_stream
+            || request_stream == Some(true)
+            || details.transport == "http_sse");
+    match upstream_resp
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
     {
-        details.transport = if content_type
-            .to_ascii_lowercase()
-            .contains("text/event-stream")
-        {
-            "http_sse".into()
-        } else {
-            "http".into()
-        };
+        Some(content_type) if content_type_is_event_stream(content_type) => {
+            details.transport = "http_sse".into();
+        }
+        Some(content_type) if content_type_is_json(content_type) => {
+            details.transport = "http".into();
+        }
+        // text/plain and other ambiguous types keep the Accept decision. The
+        // body sniff promotes an actual SSE payload once the first bytes arrive.
+        Some(_) => {}
+        None if expect_response_sse => {
+            details.transport = "http_sse".into();
+        }
+        None => {}
     }
     let resp_status_u16 = upstream_resp.status().as_u16();
     details.peer_addr = upstream_resp.remote_addr().map(|addr| addr.to_string());
@@ -3971,6 +4084,30 @@ mod tests {
 
         identity.enabled = true;
         assert_eq!(tls_platform(&identity), identity::DevicePlatform::Windows);
+    }
+
+    #[test]
+    fn body_framing_sniff_separates_sse_json_and_short_prefixes() {
+        assert!(matches!(sniff_body_framing(b"data: {}"), BodyFraming::Sse));
+        assert!(matches!(
+            sniff_body_framing(b"\nevent: response.completed\n"),
+            BodyFraming::Sse
+        ));
+        assert!(matches!(
+            sniff_body_framing(b"  {\"usage\":{\"output_tokens\":1}}"),
+            BodyFraming::Json
+        ));
+        assert!(matches!(sniff_body_framing(b"da"), BodyFraming::Undecided));
+        assert!(matches!(
+            sniff_body_framing(b"plain text"),
+            BodyFraming::Other
+        ));
+        assert!(content_type_is_event_stream(
+            "text/event-stream; charset=utf-8"
+        ));
+        assert!(content_type_is_json("application/json; charset=utf-8"));
+        assert!(!content_type_is_json("text/plain"));
+        assert!(!content_type_is_event_stream("text/plain; charset=utf-8"));
     }
 
     #[test]

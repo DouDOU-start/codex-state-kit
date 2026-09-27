@@ -776,3 +776,149 @@ async fn backend_realtime_call_forwards_sdp_and_location() {
     .await
     .unwrap();
 }
+
+const RESPONSES_SSE: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-6-astra\"}}\n\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6-astra\",\"usage\":{\"input_tokens\":11,\"output_tokens\":2}}}\n\n",
+);
+
+/// Serves one HTTP response, including the case where Content-Type is omitted.
+async fn serve_raw_response(content_type: Option<&str>, body: &[u8]) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let content_type = content_type.map(str::to_owned);
+    let body = body.to_vec();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let headers = read_headers(&mut socket).await;
+        let length = headers
+            .to_ascii_lowercase()
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if length > 0 {
+            let mut request_body = vec![0; length];
+            socket.read_exact(&mut request_body).await.unwrap();
+        }
+        let mut head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        if let Some(content_type) = content_type {
+            head.push_str(&format!("Content-Type: {content_type}\r\n"));
+        }
+        head.push_str("\r\n");
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+    });
+    addr
+}
+
+#[tokio::test]
+async fn third_party_responses_stream_records_usage_without_event_stream_headers() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let cases: [(&str, Option<&str>, &[u8], bool); 3] = [
+            ("missing_type", None, RESPONSES_SSE.as_bytes(), true),
+            (
+                "text_plain",
+                Some("text/plain; charset=utf-8"),
+                RESPONSES_SSE.as_bytes(),
+                true,
+            ),
+            (
+                "json_body",
+                None,
+                br#"{"id":"resp_json","usage":{"input_tokens":11,"output_tokens":2}}"#,
+                false,
+            ),
+        ];
+        for (label, content_type, body, expect_sse) in cases {
+            let home = tempfile::tempdir().unwrap();
+            let addr = serve_raw_response(content_type, body).await;
+            let app = Arc::new(
+                App::new(Settings {
+                    upstream: format!("http://{addr}"),
+                    codex_home: home.path().display().to_string(),
+                    ..Settings::default()
+                })
+                .unwrap(),
+            );
+            let response = proxy_http(
+                app.clone(),
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-6-astra","stream":true,"input":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{label}");
+            let forwarded = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(forwarded.as_ref(), body, "{label}");
+            let entry = app.logs.lock().await.back().unwrap().snapshot();
+            assert_eq!(entry.output_tokens, Some(2), "{label}");
+            assert!(entry.error_kind.is_none(), "{label} {:?}", entry.error_kind);
+            if expect_sse {
+                assert!(entry.first_token_ms.is_some(), "{label}");
+                assert_eq!(entry.transport, "http_sse", "{label}");
+            } else {
+                assert!(entry.first_token_ms.is_none(), "{label}");
+                assert!(entry.error_kind.is_none(), "{label}");
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn nonstream_responses_without_content_type_keep_usage_after_json_conversion() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let home = tempfile::tempdir().unwrap();
+        let addr = serve_raw_response(None, RESPONSES_SSE.as_bytes()).await;
+        let app = Arc::new(
+            App::new(Settings {
+                upstream: format!("http://{addr}/backend-api/codex"),
+                codex_home: home.path().display().to_string(),
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        app.vm_identity.lock().await.enabled = false;
+        let response = proxy_http(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"model":"gpt-6-astra","input":[]}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        let forwarded = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&forwarded).unwrap();
+        assert_eq!(value["usage"]["input_tokens"], 11);
+        assert_eq!(value["usage"]["output_tokens"], 2);
+        let entry = app.logs.lock().await.back().unwrap().snapshot();
+        assert_eq!(entry.output_tokens, Some(2));
+        assert!(entry.first_token_ms.is_some());
+        assert!(entry.error_kind.is_none());
+        assert_eq!(entry.transport, "http_sse");
+    })
+    .await
+    .unwrap();
+}
