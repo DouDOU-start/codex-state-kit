@@ -114,12 +114,12 @@ function durationMs(record: BillingRecord): number | null {
 }
 
 /**
- * Compute generation throughput from the durable request timestamps. The
- * network log is only a bounded best-effort fallback and may belong to a
- * nearby request, so it must not override the persisted billing duration.
+ * Compute generation throughput from the durable request timestamps. A live
+ * network log has only provisional timing, so it must not make throughput
+ * appear before billing settles.
  */
 function tokensPerSecond(record: BillingRecord, log?: LogEntry): number | null {
-  const duration = durationMs(record) ?? log?.ms ?? null;
+  const duration = durationMs(record);
   const output = record.outputTokens;
   if (output == null || duration == null || duration <= 0) return null;
   const firstToken = record.firstTokenMs ?? log?.firstTokenMs ?? 0;
@@ -360,10 +360,11 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                 const clock = recordClock(record);
                 const log = matchLog(record, status.logs);
                 const first = record.firstTokenMs ?? log?.firstTokenMs ?? null;
-                // Billing timestamps are the source of truth for request
-                // latency. A matched in-memory log is only a fallback for
-                // records from older runs that predate persisted finish time.
-                const total = durationMs(record) ?? log?.ms ?? null;
+                // A network log is updated while the response is still
+                // streaming. Do not use that provisional duration for the
+                // billing row: total latency becomes visible only after the
+                // durable usage record has its finishedAt timestamp.
+                const total = durationMs(record);
                 const throughput = tokensPerSecond(record, log);
                 const model = record.sentModel || record.requestedModel || t("未知模型");
                 const requested = record.requestedModel || model;

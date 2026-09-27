@@ -654,16 +654,18 @@ impl BillingStore {
                 .query_row("SELECT input_nanos_per_million, cached_input_nanos_per_million, output_nanos_per_million, currency, id FROM pricing_rules WHERE provider=?1 AND model=?2 AND effective_from <= ?3 ORDER BY effective_from DESC, id DESC LIMIT 1", params![provider, model, effective_at], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
                 .optional()?;
             if let Some((input_price, cached_price, output_price, currency, id)) = rule {
-                // Manual rules have no cache-write or tier prices: cache
-                // writes are billed as input and the tier is ignored.
                 let cached = usage.cache_read_tokens.min(usage.input_tokens);
-                let uncached = usage.input_tokens - cached;
+                let cache_write = usage.cache_write_tokens.min(usage.input_tokens - cached);
+                let uncached = usage.input_tokens - cached - cache_write;
                 let cost = |tokens: u64, price: i64| -> Result<i64> {
                     i64::try_from(i128::from(tokens) * i128::from(price) / 1_000_000)
                         .context("billing cost overflow")
                 };
                 let input = cost(uncached, input_price)?;
                 let cache_read = cost(cached, cached_price)?;
+                // Manual rules have no cache-write or tier prices, so cache
+                // writes fall back to the ordinary input price.
+                let cache_write_cost = cost(cache_write, input_price)?;
                 let output = cost(usage.output_tokens, output_price)?;
                 return Ok(Priced {
                     rule_id: Some(id),
@@ -672,9 +674,9 @@ impl BillingStore {
                     long_context: false,
                     input: Some(input),
                     cache_read: Some(cache_read),
-                    cache_write: Some(0),
+                    cache_write: Some(cache_write_cost),
                     output: Some(output),
-                    total: Some(input + cache_read + output),
+                    total: Some(input + cache_read + cache_write_cost + output),
                     currency: Some(currency),
                 });
             }
@@ -1202,6 +1204,49 @@ mod tests {
         assert_eq!(record.cost_nanos, Some(1_900));
         assert_eq!(record.pricing_model.as_deref(), Some("house-model"));
         assert_eq!(store.price_unpriced().unwrap(), 0);
+    }
+
+    #[test]
+    fn manual_pricing_does_not_charge_cache_writes_as_ordinary_input() {
+        let store = BillingStore::open_in_memory().unwrap();
+        store
+            .add_pricing_rule(PricingRuleSpec {
+                provider: PROVIDER_CHATGPT.into(),
+                model: "manual-cache-write".into(),
+                input_nanos_per_million: 1_000_000,
+                cached_input_nanos_per_million: 500_000,
+                output_nanos_per_million: 2_000_000,
+                currency: "USD".into(),
+                effective_from: None,
+            })
+            .unwrap();
+        store
+            .begin_request(RequestStart {
+                sent_model: Some("manual-cache-write".into()),
+                ..start("manual-cache-write-request", "a")
+            })
+            .unwrap();
+        let record = store
+            .settle_request(
+                "manual-cache-write-request",
+                UsageOutcome {
+                    state: UsageState::Measured,
+                    usage: TokenUsage {
+                        input_tokens: Some(1_000),
+                        cached_input_tokens: Some(200),
+                        cache_write_tokens: Some(300),
+                        output_tokens: Some(500),
+                        ..TokenUsage::default()
+                    },
+                    ..UsageOutcome::default()
+                },
+            )
+            .unwrap();
+        // Only 500 tokens are ordinary input: 1000 - 200 cached - 300 written.
+        assert_eq!(record.input_cost_nanos, Some(500));
+        assert_eq!(record.cache_read_cost_nanos, Some(100));
+        assert_eq!(record.cache_write_cost_nanos, Some(300));
+        assert_eq!(record.cost_nanos, Some(1_900));
     }
 
     #[test]
