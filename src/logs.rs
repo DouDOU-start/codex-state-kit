@@ -763,9 +763,11 @@ impl ResponseMetrics {
         }
         self.skip_event = true;
         if was_skipped {
-            // `extra` is usually the line prefix at the delimiter; its tail
-            // would replace the true event tail already retained in
-            // `line_tail`, so leave that tail untouched.
+            // The response may arrive in many chunks. Keep advancing the
+            // bounded tail so usage at the end of a large non-streaming JSON
+            // response remains observable instead of freezing at the first
+            // chunk that crossed the inspection limit.
+            self.append_large_tail(extra);
             return;
         }
         self.append_large_tail(extra);
@@ -1734,6 +1736,29 @@ data: {"type":"response.completed","response":{"service_tier":"priority","usage"
         .to_string();
         let mut metrics = ResponseBodyMetrics::new("identity");
         metrics.observe(event.as_bytes(), 42, false);
+        metrics.finish(50);
+
+        assert!(metrics.usage_seen());
+        assert_eq!(metrics.input_tokens(), Some(900));
+        assert_eq!(metrics.output_tokens(), Some(80));
+        assert_eq!(metrics.cached_input_tokens(), Some(500));
+    }
+
+    #[test]
+    fn metrics_extract_usage_from_chunked_oversized_json_event() {
+        let event = serde_json::json!({
+            "output": "x".repeat(MAX_EVENT_BYTES + 32 * 1024),
+            "usage": {
+                "input_tokens": 900,
+                "output_tokens": 80,
+                "input_tokens_details": {"cached_tokens": 500}
+            }
+        })
+        .to_string();
+        let mut metrics = ResponseBodyMetrics::new("identity");
+        for chunk in event.as_bytes().chunks(16 * 1024) {
+            metrics.observe(chunk, 42, false);
+        }
         metrics.finish(50);
 
         assert!(metrics.usage_seen());
