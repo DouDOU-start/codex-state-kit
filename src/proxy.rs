@@ -464,6 +464,11 @@ impl App {
         }
     }
 
+    /// The virtual device currently applied to forwarded traffic and login.
+    pub async fn virtual_device(&self) -> VmIdentity {
+        self.vm_identity.lock().await.clone()
+    }
+
     /// The outbound line for ChatGPT login and token import: the same exit
     /// (and `{session}`) business requests use, so a new account signs in
     /// from the line it is then bound to. Empty when no line is configured.

@@ -252,9 +252,10 @@ impl VmIdentity {
                 .unwrap_or_else(|_| Uuid::new_v4().to_string());
         identity.normalize();
         identity.fill_runtime();
-        if !identity.terminal_override {
-            identity.detect_runtime_terminal();
-        }
+        // An enabled virtual device keeps the platform's own terminal. Host
+        // detection is only for passthrough, where the real machine is the
+        // identity being reported.
+        identity.apply_runtime_terminal();
         #[cfg(not(test))]
         if let Some(version) = detect_local_cli_version() {
             identity.cli_version = version;
@@ -310,13 +311,19 @@ impl VmIdentity {
             .unwrap_or_else(|| self.originator.clone())
     }
 
-    /// Builds the request User-Agent without loading or persisting the
-    /// virtual-device profile.  Login and auxiliary clients use this helper
-    /// so they expose the same runtime terminal metadata as the proxy while
-    /// keeping authentication side-effect free.
+    /// User-Agent for login, token refresh, and other Kit-originated calls.
+    /// When the virtual device is enabled this is the saved platform, including
+    /// its own terminal, so a Mac profile never picks up a Windows terminal
+    /// from the machine running Kit.
     pub(crate) fn runtime_user_agent() -> String {
-        let mut identity = Self::ephemeral();
-        identity.detect_runtime_terminal();
+        let path = identity_path();
+        let mut identity = match std::fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str::<Self>(&raw).unwrap_or_else(|_| Self::fresh()),
+            Err(_) => Self::fresh(),
+        };
+        identity.normalize();
+        identity.fill_runtime();
+        identity.apply_runtime_terminal();
         #[cfg(not(test))]
         if let Some(version) = detect_local_cli_version() {
             identity.cli_version = version;
@@ -492,10 +499,16 @@ impl VmIdentity {
         }
     }
 
-    /// Detect the terminal environment once per identity load. The selected
-    /// virtual platform remains authoritative for OS/version/architecture;
-    /// terminal detection is safe to use independently because it is the
-    /// same environment metadata the official CLI includes in its UA.
+    /// Host terminal detection applies only while the virtual device is off.
+    /// An enabled profile reports the terminal that belongs to its platform.
+    fn apply_runtime_terminal(&mut self) {
+        if self.enabled || self.terminal_override {
+            return;
+        }
+        self.detect_runtime_terminal();
+    }
+
+    /// Detect the terminal environment once per identity load.
     fn detect_runtime_terminal(&mut self) {
         let Some(detected) = detect_terminal_info() else {
             return;
@@ -2392,6 +2405,35 @@ mod tests {
             sanitize_user_agent_suffix("  mcp\nclient\u{1f600}  "),
             "mcp_client_  ".trim()
         );
+    }
+
+    #[test]
+    fn enabled_profile_does_not_adopt_the_host_terminal() {
+        let mut identity = VmIdentity::ephemeral();
+        identity.enabled = true;
+        identity.apply_profile(VmProfile {
+            platform: DevicePlatform::Mac,
+            environment: None,
+            enabled: Some(true),
+            terminal: None,
+            terminal_version: None,
+            terminal_multiplexer: None,
+        });
+        identity.apply_runtime_terminal();
+        assert_eq!(identity.terminal, "xterm-256color");
+        assert!(!identity.user_agent().contains("Windows"));
+        identity.apply_profile(VmProfile {
+            platform: DevicePlatform::Windows,
+            environment: None,
+            enabled: Some(true),
+            terminal: None,
+            terminal_version: None,
+            terminal_multiplexer: None,
+        });
+        identity.apply_runtime_terminal();
+        assert!(identity.user_agent().contains("Windows 10.0.26100"));
+        assert!(identity.user_agent().contains("WindowsTerminal"));
+        assert!(!identity.user_agent().contains("Mac OS"));
     }
 
     #[test]

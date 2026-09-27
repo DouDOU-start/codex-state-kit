@@ -652,7 +652,7 @@ export default function App() {
                 }} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} />
             </label>)}
           </div>}
-          <p className="panel__hint">{vmIdentity?.enabled ? t("系统版本、架构和终端跟随所选系统，与官方 CLI 在该系统上上报的一致；CLI 版本和终端信息跟随本机环境。") : t("当前为纯透传模式，下面保存的虚拟设备参数不会改写请求。")}</p>
+          <p className="panel__hint">{vmIdentity?.enabled ? t("系统版本、架构和终端跟随所选系统。授权浏览器按这个系统显示为 Chrome，才能使用谷歌账号登录。") : t("当前为纯透传模式，下面保存的虚拟设备参数不会改写请求。")}</p>
           <div className="vm-identity__actions">
             <button type="button" className="button button--ghost" disabled={fwd.busy !== null || !vmIdentity?.enabled} onClick={() => void fwd.detectVmVersion()}>{t("检测本机 CLI")}</button>
             <button

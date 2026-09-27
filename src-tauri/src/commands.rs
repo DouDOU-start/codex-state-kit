@@ -502,10 +502,26 @@ pub async fn cancel_chatgpt_login(state: State<'_, AppState>) -> CommandResult<A
 }
 
 #[tauri::command(async)]
-pub async fn open_url(url: String) -> CommandResult<ActionResult> {
+pub async fn open_url(state: State<'_, AppState>, url: String) -> CommandResult<ActionResult> {
     let url = url.trim();
     if !url.starts_with("https://auth.openai.com/") {
         return Err("只能打开 ChatGPT 登录页".into());
+    }
+    let identity = state.core().virtual_device().await;
+    if identity.enabled {
+        let proxy = state
+            .pending_login
+            .lock()
+            .expect("pending login")
+            .proxy
+            .clone();
+        codex_state_kit::auth_browser::open(url, &proxy, &identity)
+            .await
+            .map_err(|err| err.to_string())?;
+        return Ok(ActionResult {
+            ok: true,
+            message: "已用虚拟设备浏览器打开登录页".into(),
+        });
     }
     open::that(url).map_err(|err| err.to_string())?;
     Ok(ActionResult {

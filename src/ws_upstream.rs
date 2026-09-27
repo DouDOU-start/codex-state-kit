@@ -750,6 +750,15 @@ fn insert_header(headers: &mut http::HeaderMap, name: &str, value: &str) {
     }
 }
 
+pub(crate) async fn dial_tcp(proxy: &str, host: &str, port: u16) -> Result<BoxIo> {
+    if proxy.trim().is_empty() {
+        let stream = TcpStream::connect((host, port)).await?;
+        stream.set_nodelay(true).ok();
+        return Ok(BoxIo::new(stream));
+    }
+    connect_via_proxy(proxy.trim(), host, port).await
+}
+
 async fn dial_io(url: &Url, proxy: &str) -> Result<BoxIo> {
     let host = url
         .host_str()
@@ -922,7 +931,7 @@ pub struct BoxIo {
 }
 
 impl BoxIo {
-    fn new<T>(stream: T) -> Self
+    pub(crate) fn new<T>(stream: T) -> Self
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {

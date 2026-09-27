@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod auth_browser;
 pub mod attach;
 pub mod billing;
 pub mod body_model;
