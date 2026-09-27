@@ -326,6 +326,8 @@ export interface BillingRecord {
   firstTokenMs?: number | null;
   /** http | http_sse | http_to_ws | ws_to_ws */
   transport?: string | null;
+  /** Downstream User-Agent before virtual-device rewriting. */
+  clientUserAgent?: string | null;
   downgrade?: DowngradeReport | null;
   costNanos?: number | null;
   currency?: string | null;

@@ -543,6 +543,7 @@ impl App {
         requested_model: Option<&str>,
         sent_model: Option<&str>,
         service_tier: Option<String>,
+        client_user_agent: Option<String>,
     ) -> Option<BillingRequest> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let started_at = chrono::Utc::now()
@@ -559,6 +560,7 @@ impl App {
             requested_model: requested_model.or(sent_model).map(str::to_owned),
             sent_model: sent_model.map(str::to_owned),
             service_tier,
+            client_user_agent,
         }) {
             Ok(_) => Some(BillingRequest::new(self.billing.clone(), request_id)),
             Err(error) => {
@@ -2706,6 +2708,7 @@ async fn forward_http_tracked(
                     content_encoding.as_deref(),
                     "service_tier",
                 ),
+                client_user_agent: client_user_agent(&parts.headers),
             })
             .context("begin durable billing record")?;
         *billing_request = Some(BillingRequest::new(app.billing.clone(), request_id));
@@ -3589,6 +3592,7 @@ async fn client_ws_session(
                     .get("service_tier")
                     .and_then(|value| value.as_str())
                     .map(str::to_string),
+                client_user_agent(&client_headers),
             )
         });
         let dial = match current_ws_dial(
@@ -4038,6 +4042,16 @@ fn is_hop(name: &HeaderName) -> bool {
         .any(|h| name.as_str().eq_ignore_ascii_case(h))
 }
 
+/// Downstream `User-Agent`, bounded and stripped of control characters.
+/// This is the client that called Kit, not the virtual-device value sent upstream.
+fn client_user_agent(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())?;
+    let text = logs::safe_text(raw, 240);
+    (!text.is_empty()).then_some(text)
+}
+
 fn request_account(headers: &HeaderMap) -> Option<String> {
     headers
         .get("chatgpt-account-id")
@@ -4084,6 +4098,29 @@ mod tests {
 
         identity.enabled = true;
         assert_eq!(tls_platform(&identity), identity::DevicePlatform::Windows);
+    }
+
+    #[test]
+    fn client_user_agent_keeps_a_bounded_downstream_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("pi/1.2 (darwin)"),
+        );
+        assert_eq!(
+            client_user_agent(&headers).as_deref(),
+            Some("pi/1.2 (darwin)")
+        );
+        let long = "a".repeat(300);
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_str(&long).unwrap(),
+        );
+        assert_eq!(client_user_agent(&headers).unwrap().chars().count(), 240);
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("   "));
+        assert_eq!(client_user_agent(&headers), None);
+        headers.remove(header::USER_AGENT);
+        assert_eq!(client_user_agent(&headers), None);
     }
 
     #[test]
@@ -4435,6 +4472,7 @@ mod tests {
                 requested_model: Some("gpt-test".into()),
                 sent_model: Some("gpt-test".into()),
                 service_tier: None,
+                client_user_agent: None,
             })
             .unwrap();
         {
@@ -4950,6 +4988,7 @@ mod tests {
                 Some("gpt-client"),
                 Some("gpt-forced"),
                 Some("priority".into()),
+                Some("codex-cli/0.0.0".into()),
             )
             .unwrap();
         let record = app.billing.get_by_id(&billing.request_id).unwrap().unwrap();
@@ -4957,6 +4996,10 @@ mod tests {
         assert_eq!(record.email.as_deref(), Some("a@example.com"));
         assert_eq!(record.requested_model.as_deref(), Some("gpt-client"));
         assert_eq!(record.sent_model.as_deref(), Some("gpt-forced"));
+        assert_eq!(
+            record.client_user_agent.as_deref(),
+            Some("codex-cli/0.0.0")
+        );
         drop(billing);
     }
 
@@ -5264,6 +5307,7 @@ mod tests {
                     Some("gpt-test"),
                     Some("gpt-test"),
                     None,
+                    None,
                 )
                 .unwrap();
             let request_id = billing.request_id.clone();
@@ -5349,6 +5393,7 @@ mod tests {
                 &account,
                 Some("gpt-test"),
                 Some("gpt-test"),
+                None,
                 None,
             )
             .unwrap();

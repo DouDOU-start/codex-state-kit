@@ -81,6 +81,9 @@ pub struct RequestStart {
     /// `service_tier` from the request body.
     #[serde(default)]
     pub service_tier: Option<String>,
+    /// Downstream `User-Agent` before virtual-device rewriting.
+    #[serde(default)]
+    pub client_user_agent: Option<String>,
 }
 
 fn default_provider() -> String {
@@ -168,6 +171,8 @@ pub struct UsageRecord {
     pub output_cost_nanos: Option<i64>,
     pub first_token_ms: Option<u64>,
     pub transport: Option<String>,
+    /// Downstream `User-Agent` captured before virtual-device rewriting.
+    pub client_user_agent: Option<String>,
     /// Set when the response looks downgraded (see [`crate::downgrade`]).
     pub downgrade: Option<DowngradeReport>,
     pub cost_nanos: Option<i64>,
@@ -177,7 +182,7 @@ pub struct UsageRecord {
 }
 
 /// Columns read by [`row_to_record`], in order.
-const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.error_message,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos,u.first_token_ms,u.transport,u.downgrade";
+const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.error_message,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos,u.first_token_ms,u.transport,u.downgrade,u.client_user_agent";
 
 /// (state, source, provider, sent_model, started_at, requested_service_tier)
 type PendingRow = (
@@ -477,6 +482,19 @@ impl BillingStore {
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)",
             [],
         )?;
+        // Version 4: the downstream client's User-Agent, kept so usage rows
+        // can be told apart when several clients share this proxy.
+        let existing: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('usage_records')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !existing.iter().any(|name| name == "client_user_agent") {
+            conn.execute_batch("ALTER TABLE usage_records ADD COLUMN client_user_agent TEXT")?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version) VALUES (4)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -530,8 +548,8 @@ impl BillingStore {
             )?
         };
         tx.execute(
-            "INSERT OR IGNORE INTO usage_records(request_id, account_id, source, started_at, state, requested_model, sent_model, requested_service_tier) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7)",
-            params![start.request_id, account_db_id, start.source, start.started_at, start.requested_model, start.sent_model, start.service_tier],
+            "INSERT OR IGNORE INTO usage_records(request_id, account_id, source, started_at, state, requested_model, sent_model, requested_service_tier, client_user_agent) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7,?8)",
+            params![start.request_id, account_db_id, start.source, start.started_at, start.requested_model, start.sent_model, start.service_tier, start.client_user_agent],
         )?;
         tx.commit()?;
         drop(conn);
@@ -811,7 +829,9 @@ impl BillingStore {
         let limit = filter.limit.unwrap_or(50).clamp(1, 500);
         let offset = filter.offset.unwrap_or(0);
         let conn = self.connection();
-        let mut clauses = vec!["1=1".to_string()];
+        // In-flight rows are bookkeeping until the response settles. The usage
+        // list only shows finished requests.
+        let mut clauses = vec!["u.state<>'pending'".to_string()];
         let mut values: Vec<Box<dyn ToSql>> = Vec::new();
         if let Some(value) = filter.account_id.as_deref() {
             clauses.push("a.upstream_account_id=?".into());
@@ -1084,6 +1104,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         downgrade: row
             .get::<_, Option<String>>(32)?
             .and_then(|json| serde_json::from_str(&json).ok()),
+        client_user_agent: row.get(33)?,
     })
 }
 
@@ -1102,7 +1123,32 @@ mod tests {
             requested_model: Some("gpt-test".into()),
             sent_model: Some("gpt-test".into()),
             service_tier: None,
+            client_user_agent: None,
         }
+    }
+
+    #[test]
+    fn stores_the_downstream_user_agent_through_settlement() {
+        let store = BillingStore::open_in_memory().unwrap();
+        let started = store
+            .begin_request(RequestStart {
+                client_user_agent: Some("pi/1.2 (test)".into()),
+                ..start("ua", "a")
+            })
+            .unwrap();
+        assert_eq!(started.client_user_agent.as_deref(), Some("pi/1.2 (test)"));
+        let settled = store
+            .settle_request(
+                "ua",
+                UsageOutcome {
+                    state: UsageState::MissingUsage,
+                    finished_at: Some("2026-01-01T00:00:01.000Z".into()),
+                    http_status: Some(200),
+                    ..UsageOutcome::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(settled.client_user_agent.as_deref(), Some("pi/1.2 (test)"));
     }
 
     #[test]
@@ -1302,6 +1348,33 @@ mod tests {
                 .missing_usage_count,
             1
         );
+    }
+
+    #[test]
+    fn usage_list_hides_requests_that_are_still_pending() {
+        let store = BillingStore::open_in_memory().unwrap();
+        store.begin_request(start("pending", "a")).unwrap();
+        store.begin_request(start("done", "a")).unwrap();
+        store
+            .settle_request(
+                "done",
+                UsageOutcome {
+                    state: UsageState::Measured,
+                    finished_at: Some("2026-01-01T00:00:01.000Z".into()),
+                    http_status: Some(200),
+                    usage: TokenUsage {
+                        input_tokens: Some(2),
+                        output_tokens: Some(3),
+                        ..TokenUsage::default()
+                    },
+                    ..UsageOutcome::default()
+                },
+            )
+            .unwrap();
+        let page = store.list_usage(UsageFilter::default()).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].request_id, "done");
     }
 
     #[test]
@@ -1529,6 +1602,7 @@ mod tests {
         let old = store.get_by_id("old").unwrap().unwrap();
         assert_eq!(old.input_tokens, Some(5));
         assert_eq!(old.cache_write_tokens, None);
+        assert_eq!(old.client_user_agent, None);
         assert!(!old.long_context);
         store.begin_request(start("new", "old")).unwrap();
     }

@@ -513,6 +513,7 @@ const mockBillingRecords: BillingRecord[] = [
     costNanos: 17_612_800,
     firstTokenMs: 1_840,
     transport: "http_sse",
+    clientUserAgent: "pi/0.0.0",
     currency: "USD",
   },
   {
@@ -527,6 +528,7 @@ const mockBillingRecords: BillingRecord[] = [
     httpStatus: 200,
     requestedModel: "gpt-6-astra",
     sentModel: "gpt-6-astra",
+    clientUserAgent: "pi/0.0.0 (darwin; arm64)",
     usageSource: null,
     pricingRuleId: null,
     costNanos: null,
@@ -546,6 +548,7 @@ const mockBillingRecords: BillingRecord[] = [
     sentModel: "gpt-6-astra",
     responseModel: "gpt-6-astra",
     transport: "http_to_ws",
+    clientUserAgent: "codex-cli/0.0.0",
     downgrade: {
       verdict: "confirmed",
       requestedModel: "gpt-6-astra",
@@ -604,6 +607,7 @@ for (let index = 0; index < 70; index += 1) {
     sentModel: "gpt-5.1-codex",
     responseModel: index % 5 === 3 ? "gpt-5.1-codex-mini" : "gpt-5.1-codex-2025-11-13",
     transport: index % 2 ? "ws_to_ws" : "http_sse",
+    clientUserAgent: index % 2 ? "codex-cli/0.0.0" : "pi/0.0.0",
     downgrade: index % 7 === 2
       ? {
           verdict: "suspected",

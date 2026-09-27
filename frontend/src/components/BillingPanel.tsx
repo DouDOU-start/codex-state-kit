@@ -182,11 +182,14 @@ export function BillingPanel({ currentAccountId, currentAccountEmail, savedAccou
       const key = dayKey(record.startedAt);
       buckets.set(key, [...(buckets.get(key) ?? []), record]);
     }
-    return [...buckets.entries()].map(([label, rows]) => ({
-      label,
-      requests: rows.length,
-      costNanos: sumNanos(rows),
-    }));
+    return [...buckets.entries()]
+      .map(([label, rows]) => ({
+        label,
+        at: Math.min(...rows.map((record) => Date.parse(record.startedAt) || Number.POSITIVE_INFINITY)),
+        requests: rows.length,
+        costNanos: sumNanos(rows),
+      }))
+      .sort((a, b) => a.at - b.at);
   }, [mine]);
   const peak = days.reduce<(typeof days)[number] | null>((best, day) => {
     if (day.costNanos == null) return best;

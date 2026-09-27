@@ -73,12 +73,34 @@ function stateLabel(state: BillingRecord["state"]): string {
   } as Record<string, string>)[state] ?? state;
 }
 
-/** 1 万以内显示千分位，更大时显示 K / M。 */
-function compactTokens(value: number | null | undefined): string {
-  if (value == null) return "—";
-  if (value < 10_000) return formatNumber(value);
-  if (value < 1_000_000) return `${formatNumber(value / 1000, { minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false })}K`;
-  return `${formatNumber(value / 1_000_000, { minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false })}M`;
+/** 按 1 000 换算：1.0K = 1,000，1.00M = 1,000,000。小数位固定，避免 1,024 被收成 1K。 */
+function tokenAmount(value: number | null | undefined): { amount: string; unit: string } | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  const sign = value < 0 ? "-" : "";
+  const absolute = Math.abs(value);
+  const scaled = (divisor: number, unit: string, digits: number) => ({
+    amount: `${sign}${formatNumber(absolute / divisor, {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+      useGrouping: false,
+    })}`,
+    unit,
+  });
+  if (absolute >= 1_000_000_000) return scaled(1_000_000_000, "B", 2);
+  if (absolute >= 1_000_000) return scaled(1_000_000, "M", 2);
+  if (absolute >= 1_000) return scaled(1_000, "K", 1);
+  return { amount: formatNumber(value), unit: "" };
+}
+
+function TokenFigure({ value }: { value: number | null | undefined }) {
+  const figure = tokenAmount(value);
+  if (!figure) return "—";
+  return <>{figure.amount}{figure.unit ? <i className="usage-meter__unit">{figure.unit}</i> : null}</>;
+}
+
+function tokenTitle(label: string, value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return label;
+  return `${label} · ${formatNumber(value)}`;
 }
 
 function formatDuration(ms?: number | null): string {
@@ -349,6 +371,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
             <thead>
               <tr>
                 <th>{t("时间")}</th>
+                <th>{t("客户端")}</th>
                 <th>{t("模型")}</th>
                 <th>{t("延迟")}</th>
                 <th>{t("计量")}</th>
@@ -383,6 +406,9 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                     <td className="usage-table__time">
                       <strong>{clock.time}</strong>
                       <small>{clock.date}</small>
+                    </td>
+                    <td className="usage-table__client" title={record.clientUserAgent || undefined}>
+                      {record.clientUserAgent || "—"}
                     </td>
                     <td className="usage-table__model">
                       <div className="usage-model__line">
@@ -426,12 +452,12 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                     <td className="usage-table__meter">
                       <div className="usage-meter">
                         <div className="usage-meter__io">
-                          <span className="usage-meter__in" title={t("非缓存输入")}><CircleArrowDown size={13} />{compactTokens(uncached)}</span>
-                          <span className="usage-meter__out" title={record.reasoningTokens ? t("输出（含推理 {0}）", [compactTokens(record.reasoningTokens)]) : t("输出")}><CircleArrowUp size={13} />{compactTokens(record.outputTokens)}</span>
-                          <span className="usage-meter__cache" title={t("缓存读")}><BookOpen size={12} />{compactTokens(record.inputTokens == null ? null : cached)}</span>
-                          {cacheWrite ? <span className="usage-meter__cache" title={t("缓存写")}><PencilLine size={12} />{compactTokens(cacheWrite)}</span> : null}
+                          <span className="usage-meter__in" title={tokenTitle(t("非缓存输入"), uncached)}><CircleArrowDown size={12} /><TokenFigure value={uncached} /></span>
+                          <span className="usage-meter__out" title={tokenTitle(record.reasoningTokens ? t("输出（含推理 {0}）", [formatNumber(record.reasoningTokens)]) : t("输出"), record.outputTokens)}><CircleArrowUp size={12} /><TokenFigure value={record.outputTokens} /></span>
+                          <span className="usage-meter__cache" title={tokenTitle(t("缓存读"), record.inputTokens == null ? null : cached)}><BookOpen size={11} /><TokenFigure value={record.inputTokens == null ? null : cached} /></span>
+                          {cacheWrite ? <span className="usage-meter__cache" title={tokenTitle(t("缓存写"), cacheWrite)}><PencilLine size={11} /><TokenFigure value={cacheWrite} /></span> : null}
                         </div>
-                        <strong className="usage-meter__total" title={t("总 tokens（输入 + 输出）")}>{compactTokens(totalTokens)}</strong>
+                        <strong className="usage-meter__total" title={tokenTitle(t("总 tokens（输入 + 输出）"), totalTokens)}><TokenFigure value={totalTokens} /></strong>
                       </div>
                     </td>
                     <td className="usage-table__cost" title={parts.length ? parts.join("\n") : undefined}>
@@ -497,6 +523,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                 <div><dt>{t("HTTP 状态")}</dt><dd>{detailStatus ?? "—"}</dd></div>
                 <div><dt>{t("错误类型 / 错误码")}</dt><dd className={detailError ? "record-detail__error" : undefined}>{detailError || "—"}</dd></div>
                 <div><dt>{t("传输方式")}</dt><dd>{detailTransport || "—"}</dd></div>
+                <div className="record-detail__ua"><dt>{t("客户端 User-Agent")}</dt><dd>{detailRecord.clientUserAgent || "—"}</dd></div>
                 <div><dt>{t("用量来源")}</dt><dd>{detailRecord.usageSource || "—"}</dd></div>
                 <div><dt>{t("输入 tokens")}</dt><dd>{detailRecord.inputTokens ?? "—"}</dd></div>
                 <div><dt>{t("输出 tokens")}</dt><dd>{detailRecord.outputTokens ?? "—"}</dd></div>
