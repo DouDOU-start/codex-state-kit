@@ -346,6 +346,7 @@ pub async fn import_chatgpt_refresh_token(
     refresh_token: String,
     account_id: Option<String>,
 ) -> CommandResult<LoginStatus> {
+    let _ = account_id;
     let settings = state.core().settings.lock().await.clone();
     let home = PathBuf::from(home.unwrap_or(settings.codex_home));
     let generation = {
@@ -356,9 +357,8 @@ pub async fn import_chatgpt_refresh_token(
         slot.cancel();
         slot.generation
     };
-    let client = command(token_import_http_client_via(
-        &state.core().login_proxy(account_id.as_deref()).await,
-    ))?;
+    // Refresh-token import uses this computer's network, not the outbound proxy.
+    let client = command(token_import_http_client_via(""))?;
     let tokens = command(exchange_refresh_token(&client, &refresh_token).await)?;
     let status = {
         let slot = state.pending_login.lock().expect("pending login");
@@ -406,10 +406,12 @@ pub async fn start_chatgpt_login(
     method: Option<LoginMethod>,
     account_id: Option<String>,
 ) -> CommandResult<LoginStart> {
+    let _ = account_id;
     let settings = state.core().settings.lock().await.clone();
     let home = PathBuf::from(home.unwrap_or(settings.codex_home));
-    // Sign in over the line this account is (or will be) bound to.
-    let proxy = state.core().login_proxy(account_id.as_deref()).await;
+    // Authorization stays on this computer's browser and network. The
+    // account's outbound proxy is only for later forwarded traffic.
+    let proxy = String::new();
     let generation = {
         let mut slot = state.pending_login.lock().expect("pending login");
         if slot.closed {
@@ -502,30 +504,14 @@ pub async fn cancel_chatgpt_login(state: State<'_, AppState>) -> CommandResult<A
 }
 
 #[tauri::command(async)]
-pub async fn open_url(state: State<'_, AppState>, url: String) -> CommandResult<ActionResult> {
+pub async fn open_url(_state: State<'_, AppState>, url: String) -> CommandResult<ActionResult> {
     let url = url.trim();
     if !url.starts_with("https://auth.openai.com/") {
         return Err("只能打开 ChatGPT 登录页".into());
     }
-    let identity = state.core().virtual_device().await;
-    if identity.enabled {
-        let proxy = state
-            .pending_login
-            .lock()
-            .expect("pending login")
-            .proxy
-            .clone();
-        codex_state_kit::auth_browser::open(url, &proxy, &identity)
-            .await
-            .map_err(|err| err.to_string())?;
-        return Ok(ActionResult {
-            ok: true,
-            message: "已用虚拟设备浏览器打开登录页".into(),
-        });
-    }
     open::that(url).map_err(|err| err.to_string())?;
     Ok(ActionResult {
         ok: true,
-        message: "已打开登录页".into(),
+        message: "已用系统浏览器打开登录页".into(),
     })
 }

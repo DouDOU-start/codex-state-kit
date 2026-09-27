@@ -145,7 +145,7 @@ export function AddAccountDialog({ open, target, onClose, fwd, codexHome }: AddA
           <div className="login-box">
             {pending ? (
               <div className="login-pending">
-                <p>{pending.method === "browser" ? t("请在 Kit 打开的授权浏览器里完成登录，结果会自动同步。") : t("请在 Kit 打开的授权浏览器里输入代码")}</p>
+                <p>{pending.method === "browser" ? t("请在系统浏览器完成授权，登录结果将自动同步。") : t("在系统浏览器打开验证页并输入代码")}</p>
                 {pending.method === "device" ? <div className="user-code">{pending.userCode}</div> : null}
                 <div className="panel__actions">
                   {pending.method === "device" ? (

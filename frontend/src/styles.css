@@ -54,16 +54,19 @@ button:disabled { cursor: not-allowed; opacity: .48; box-shadow: none; }
 h1, h2, p { margin-top: 0; }
 svg { flex-shrink: 0; }
 .app-shell { display: grid; width: 100%; height: 100%; grid-template-rows: 42px minmax(0, 1fr); background: radial-gradient(ellipse at 95% 5%, #eaf0f7 0, transparent 42%), var(--bg); }
-.titlebar { display: flex; align-items: center; justify-content: space-between; padding-left: 16px; border-bottom: 1px solid var(--line); background: #fcfbf8; user-select: none; }
+/* 圆角描边盖住整窗。标题栏压在它上面，关闭按钮才能收到点击。 */
+.titlebar { position: relative; z-index: 40; display: flex; align-items: center; justify-content: space-between; padding-left: 16px; border-bottom: 1px solid var(--line); background: #fcfbf8; user-select: none; }
 .titlebar__identity { display: flex; align-items: center; gap: 9px; }
+.titlebar__spacer { flex: 1; align-self: stretch; min-width: 12px; }
 .app-version { padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font: 10px/1.4 var(--font-mono); background: var(--surface-raised); }
 .titlebar__actions { display: flex; align-items: center; gap: 12px; height: 100%; }
 .language-select { min-width: 100px; }
 .update-check { border: 0; padding: 5px 7px; border-radius: 5px; background: transparent; color: var(--accent); font-size: 11px; cursor: pointer; }
 .update-check:hover { background: var(--accent-soft); }
-.window-controls { display: flex; height: 100%; }
-.window-controls button { display: grid; width: 40px; padding: 0; place-items: center; border: 0; color: var(--muted); background: transparent; cursor: pointer; transition: background .15s; }
-.window-controls button:hover { color: var(--text); background: #eaf0f5; }
+.window-controls { position: relative; z-index: 1; display: flex; height: 100%; -webkit-app-region: no-drag; app-region: no-drag; }
+.window-controls button { display: grid; width: 40px; padding: 0; place-items: center; border: 0; color: var(--text); background: #fcfbf8; cursor: pointer; opacity: 1; pointer-events: auto; -webkit-app-region: no-drag; app-region: no-drag; transition: background .15s, color .15s; }
+.window-controls button:disabled { opacity: 1; cursor: pointer; pointer-events: auto; }
+.window-controls button:hover { background: #eaf0f5; }
 .window-controls__close:hover { color: white !important; background: #c56564 !important; }
 .app-content { position: relative; min-height: 0; overflow: auto; scrollbar-gutter: stable; }
 .logo { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 650; pointer-events: none; }

@@ -6,7 +6,7 @@ import X from "lucide-react/dist/esm/icons/x.js";
 import Github from "lucide-react/dist/esm/icons/github.js";
 import ExternalLink from "lucide-react/dist/esm/icons/external-link.js";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect, type PropsWithChildren } from "react";
+import { useEffect, type MouseEvent, type PropsWithChildren } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { GITHUB_REPO_URL, isTauri, openGithubRepo } from "@/lib/api";
 import { version } from "../../../package.json";
@@ -20,9 +20,14 @@ async function windowAction(action: "minimize" | "maximize" | "close") {
   const window = getCurrentWindow();
   if (action === "minimize") await window.minimize();
   if (action === "maximize") await window.toggleMaximize();
-  // Keep the proxy and tray process alive when the title-bar X is clicked.
-  // The tray menu remains the explicit way to exit the application.
-  if (action === "close") await window.hide();
+  // close() is permitted; the native handler hides the window and keeps the process alive.
+  if (action === "close") await window.close();
+}
+
+function pressWindowControl(event: MouseEvent<HTMLButtonElement>, action: "minimize" | "maximize" | "close") {
+  event.preventDefault();
+  event.stopPropagation();
+  void windowAction(action);
 }
 
 export function AppShell({ children }: PropsWithChildren) {
@@ -68,11 +73,12 @@ export function AppShell({ children }: PropsWithChildren) {
   const versionLabel = import.meta.env.DEV || !isTauri ? "dev" : `v${version}`;
   return (
     <div className="app-shell">
-      <header className="titlebar" data-tauri-drag-region>
+      <header className="titlebar">
         <div className="titlebar__identity" data-tauri-drag-region>
           <Logo />
           <span className="app-version" data-tauri-drag-region>{versionLabel}</span>
         </div>
+        <div className="titlebar__spacer" data-tauri-drag-region />
         <div className="titlebar__actions">
           <Select
             className="language-select"
@@ -96,17 +102,17 @@ export function AppShell({ children }: PropsWithChildren) {
             }}>
             <Github size={15} aria-hidden="true" /><span>GitHub</span><ExternalLink size={11} aria-hidden="true" />
           </a>
-        <div className="window-controls">
-          <button type="button" aria-label={t("最小化")} onClick={() => void windowAction("minimize")}>
-            <Minus size={17} />
-          </button>
-          <button type="button" aria-label={t("最大化")} onClick={() => void windowAction("maximize")}>
-            <Square size={13} />
-          </button>
-          <button className="window-controls__close" type="button" aria-label={t("隐藏到后台")} title={t("隐藏到后台")} onClick={() => void windowAction("close")}>
-            <X size={17} />
-          </button>
-        </div>
+          <div className="window-controls">
+            <button type="button" data-window-action="minimize" aria-label={t("最小化")} onMouseDown={(event) => pressWindowControl(event, "minimize")}>
+              <Minus size={17} />
+            </button>
+            <button type="button" data-window-action="maximize" aria-label={t("最大化")} onMouseDown={(event) => pressWindowControl(event, "maximize")}>
+              <Square size={13} />
+            </button>
+            <button type="button" className="window-controls__close" data-window-action="close" aria-label={t("隐藏到后台")} title={t("隐藏到后台")} onMouseDown={(event) => pressWindowControl(event, "close")}>
+              <X size={17} />
+            </button>
+          </div>
         </div>
       </header>
       <main className="app-content">
