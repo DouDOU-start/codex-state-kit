@@ -70,6 +70,7 @@ fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
         outbound_proxy: proxy.into(),
         outbound_mode: settings.outbound_mode,
         forced_model: settings.forced_model.clone(),
+        forced_reasoning_effort: settings.forced_reasoning_effort.clone(),
         mihomo_subscription: String::new(),
         mihomo_node: String::new(),
         chain_system_proxy: settings.chain_system_proxy,

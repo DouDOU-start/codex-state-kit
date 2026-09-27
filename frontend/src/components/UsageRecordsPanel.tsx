@@ -414,6 +414,9 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
                       <div className="usage-model__line">
                         <span className="usage-model__key">{t("请求模型")}</span>
                         <strong>{requested}</strong>
+                        {record.reasoningEffort ? (
+                          <span className="usage-badge">{record.reasoningEffort}</span>
+                        ) : null}
                         <span className="usage-model__transport">· {transportLabel(record)}</span>
                       </div>
                       {model !== requested ? (
@@ -519,6 +522,7 @@ export function UsageRecordsPanel({ active, status, savedAccounts, refreshMs, on
               </div>
               <dl className="record-detail__grid">
                 <div><dt>{t("模型")}</dt><dd>{detailRecord.sentModel || detailRecord.requestedModel || "—"}</dd></div>
+                <div><dt>reasoning.effort</dt><dd>{detailRecord.reasoningEffort || "—"}</dd></div>
                 <div><dt>{t("上游响应模型")}</dt><dd>{detailRecord.responseModel || "—"}</dd></div>
                 <div><dt>{t("HTTP 状态")}</dt><dd>{detailStatus ?? "—"}</dd></div>
                 <div><dt>{t("错误类型 / 错误码")}</dt><dd className={detailError ? "record-detail__error" : undefined}>{detailError || "—"}</dd></div>

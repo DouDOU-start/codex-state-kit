@@ -36,6 +36,7 @@ function patchFrom(status: Status, overrides: Partial<SettingsPatch> = {}): Sett
     mihomoSubscription: status.mihomoSubscription ?? "",
     mihomoNode: status.mihomoNode ?? "",
     forcedModel: status.forcedModel ?? "",
+    forcedReasoningEffort: status.forcedReasoningEffort ?? "",
     chainSystemProxy: status.chainSystemProxy !== false,
     ...overrides,
   };
@@ -245,6 +246,22 @@ export function useCodexStateKit() {
       setBanner({ kind: "error", text: errorMessage(cause) });
     } finally {
       setProbing(null);
+    }
+  }, []);
+
+  const saveForcedReasoningEffort = useCallback(async (forcedReasoningEffort: string) => {
+    setBusy("save");
+    try {
+      const latest = await getStatus();
+      const next = await setConfig(patchFrom(latest, { forcedReasoningEffort: forcedReasoningEffort.trim() }));
+      setStatus(next);
+      setBanner({ kind: "ok", text: next.forcedReasoningEffort
+        ? t("已绑定思考等级 {0}，下游请求都会改成这个值再转发。", [next.forcedReasoningEffort])
+        : t("已取消绑定思考等级，按下游原来的 reasoning.effort 转发。") });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
     }
   }, []);
 
@@ -516,6 +533,7 @@ export function useCodexStateKit() {
     saveSettings,
     saveMihomo,
     saveForcedModel,
+    saveForcedReasoningEffort,
     probing,
     probingGroup,
     latency,

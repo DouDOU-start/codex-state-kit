@@ -179,6 +179,7 @@ pub struct Status {
     pub current_account_id: Option<String>,
     pub current_account_email: Option<String>,
     pub forced_model: String,
+    pub forced_reasoning_effort: String,
     pub diag_log_path: String,
     pub vm_identity: identity::VmIdentityView,
     pub chain_system_proxy: bool,
@@ -454,6 +455,7 @@ impl App {
             current_account_id: account,
             current_account_email: login_status.email,
             forced_model: settings.forced_model,
+            forced_reasoning_effort: settings.forced_reasoning_effort,
             diag_log_path: diag::path().display().to_string(),
             vm_identity: self.vm_identity.lock().await.view(),
             chain_system_proxy: settings.chain_system_proxy,
@@ -549,6 +551,7 @@ impl App {
         sent_model: Option<&str>,
         service_tier: Option<String>,
         client_user_agent: Option<String>,
+        reasoning_effort: Option<String>,
     ) -> Option<BillingRequest> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let started_at = chrono::Utc::now()
@@ -566,6 +569,7 @@ impl App {
             sent_model: sent_model.map(str::to_owned),
             service_tier,
             client_user_agent,
+            reasoning_effort,
         }) {
             Ok(_) => Some(BillingRequest::new(self.billing.clone(), request_id)),
             Err(error) => {
@@ -2604,6 +2608,16 @@ async fn forward_http_tracked(
             .into();
             details.body_bytes = bytes.len();
         }
+        if let Some(effort) = request_settings.forced_reasoning_effort() {
+            bytes = crate::body_model::rewrite_reasoning_effort_in_body(
+                &bytes,
+                content_encoding.as_deref(),
+                effort,
+            )
+            .map_err(|err| anyhow::anyhow!("{err}"))?
+            .into();
+            details.body_bytes = bytes.len();
+        }
     }
     details.transport = if parts
         .headers
@@ -2714,6 +2728,10 @@ async fn forward_http_tracked(
                     "service_tier",
                 ),
                 client_user_agent: client_user_agent(&parts.headers),
+                reasoning_effort: crate::body_model::extract_reasoning_effort(
+                    &bytes,
+                    content_encoding.as_deref(),
+                ),
             })
             .context("begin durable billing record")?;
         *billing_request = Some(BillingRequest::new(app.billing.clone(), request_id));
@@ -3598,6 +3616,7 @@ async fn client_ws_session(
                     .and_then(|value| value.as_str())
                     .map(str::to_string),
                 client_user_agent(&client_headers),
+                crate::body_model::reasoning_effort_of(&frame),
             )
         });
         let dial = match current_ws_dial(
@@ -3739,6 +3758,9 @@ async fn prepare_client_ws_frame(
     let settings = app.settings.lock().await.clone();
     if let Some(model) = settings.forced_model() {
         ws_bridge::rewrite_model_in_ws_frame(&mut frame, model);
+    }
+    if let Some(effort) = settings.forced_reasoning_effort() {
+        ws_bridge::rewrite_reasoning_effort_in_ws_frame(&mut frame, effort);
     }
     if frame.get("type").is_none() {
         frame["type"] = serde_json::json!("response.create");
@@ -4478,6 +4500,7 @@ mod tests {
                 sent_model: Some("gpt-test".into()),
                 service_tier: None,
                 client_user_agent: None,
+                reasoning_effort: None,
             })
             .unwrap();
         {
@@ -4994,6 +5017,7 @@ mod tests {
                 Some("gpt-forced"),
                 Some("priority".into()),
                 Some("codex-cli/0.0.0".into()),
+                Some("high".into()),
             )
             .unwrap();
         let record = app.billing.get_by_id(&billing.request_id).unwrap().unwrap();
@@ -5005,6 +5029,7 @@ mod tests {
             record.client_user_agent.as_deref(),
             Some("codex-cli/0.0.0")
         );
+        assert_eq!(record.reasoning_effort.as_deref(), Some("high"));
         drop(billing);
     }
 
@@ -5313,6 +5338,7 @@ mod tests {
                     Some("gpt-test"),
                     None,
                     None,
+                    None,
                 )
                 .unwrap();
             let request_id = billing.request_id.clone();
@@ -5398,6 +5424,7 @@ mod tests {
                 &account,
                 Some("gpt-test"),
                 Some("gpt-test"),
+                None,
                 None,
                 None,
             )

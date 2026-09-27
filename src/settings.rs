@@ -45,6 +45,10 @@ pub struct Settings {
     #[serde(default, deserialize_with = "deserialize_outbound_mode")]
     pub outbound_mode: OutboundMode,
     pub forced_model: String,
+    /// Override `reasoning.effort` on forwarded requests. Empty keeps the
+    /// client's own thinking level.
+    #[serde(default)]
+    pub forced_reasoning_effort: String,
     /// Clash / Mihomo 订阅 URL、本地文件，或分享链接正文。
     #[serde(default)]
     pub mihomo_subscription: String,
@@ -68,6 +72,7 @@ impl Default for Settings {
             outbound_proxy: String::new(),
             outbound_mode: OutboundMode::Manual,
             forced_model: String::new(),
+            forced_reasoning_effort: String::new(),
             mihomo_subscription: String::new(),
             mihomo_node: String::new(),
             chain_system_proxy: default_chain_system_proxy(),
@@ -79,6 +84,11 @@ impl Settings {
     pub fn forced_model(&self) -> Option<&str> {
         let model = self.forced_model.trim();
         (!model.is_empty()).then_some(model)
+    }
+
+    pub fn forced_reasoning_effort(&self) -> Option<&str> {
+        let effort = self.forced_reasoning_effort.trim();
+        (!effort.is_empty()).then_some(effort)
     }
 }
 
@@ -123,6 +133,8 @@ pub struct SettingsPatch {
     #[serde(default)]
     pub forced_model: String,
     #[serde(default)]
+    pub forced_reasoning_effort: String,
+    #[serde(default)]
     pub mihomo_subscription: String,
     #[serde(default)]
     pub mihomo_node: String,
@@ -145,6 +157,7 @@ impl SettingsPatch {
             outbound_proxy: normalize_outbound_proxy(&self.outbound_proxy)?,
             outbound_mode: self.outbound_mode,
             forced_model: normalize_forced_model(&self.forced_model)?,
+            forced_reasoning_effort: normalize_reasoning_effort(&self.forced_reasoning_effort)?,
             mihomo_subscription: normalize_mihomo_text(
                 &self.mihomo_subscription,
                 8192,
@@ -209,6 +222,21 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
     let raw = serde_json::to_string_pretty(settings)?;
     std::fs::write(&path, raw).with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+pub fn normalize_reasoning_effort(raw: &str) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.len() > 32
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        bail!("思考等级无效");
+    }
+    Ok(value.to_string())
 }
 
 pub fn normalize_forced_model(raw: &str) -> Result<String> {
@@ -381,6 +409,7 @@ mod tests {
             outbound_proxy: "socks5://127.0.0.1:1080".into(),
             outbound_mode: OutboundMode::Manual,
             forced_model: String::new(),
+            forced_reasoning_effort: String::new(),
             mihomo_subscription: String::new(),
             mihomo_node: String::new(),
             chain_system_proxy: true,

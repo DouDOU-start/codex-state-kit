@@ -78,6 +78,8 @@ export interface VirtualEnvironment {
 export interface Status {
   diagLogPath?: string;
   forcedModel: string;
+  /** Empty keeps the client's reasoning.effort. */
+  forcedReasoningEffort: string;
   currentAccountId?: string | null;
   currentAccountEmail?: string | null;
   accountTraffic: { concurrentRequests: number; rpm: number; tpm: number };
@@ -147,6 +149,8 @@ export interface SystemProxyView {
 
 export interface SettingsPatch {
   forcedModel: string;
+  /** Empty keeps the client's reasoning.effort. */
+  forcedReasoningEffort: string;
   proxyListen: string;
   lanAccessEnabled: boolean;
   upstream: string;
@@ -328,6 +332,8 @@ export interface BillingRecord {
   transport?: string | null;
   /** Downstream User-Agent before virtual-device rewriting. */
   clientUserAgent?: string | null;
+  /** Requested thinking level: none, minimal, low, medium, high, or xhigh. */
+  reasoningEffort?: string | null;
   downgrade?: DowngradeReport | null;
   costNanos?: number | null;
   currency?: string | null;

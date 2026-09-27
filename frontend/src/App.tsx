@@ -88,6 +88,7 @@ export default function App() {
   const [mihomoSubscription, setMihomoSubscription] = useState("");
   const [mihomoNode, setMihomoNode] = useState("");
   const [forcedModel, setForcedModel] = useState("");
+  const [forcedReasoningEffort, setForcedReasoningEffort] = useState("");
   const [lanApiKey, setLanApiKey] = useState<string | null>(null);
   const [lanApiKeyCopyState, setLanApiKeyCopyState] = useState<"idle" | "copied" | "error">("idle");
   const [addAccountOpen, setAddAccountOpen] = useState(false);
@@ -148,6 +149,7 @@ export default function App() {
     setMihomoSubscription(fwd.status.mihomoSubscription ?? "");
     setMihomoNode(fwd.status.mihomoNode ?? "");
     setForcedModel(fwd.status.forcedModel ?? "");
+    setForcedReasoningEffort(fwd.status.forcedReasoningEffort ?? "");
   }, [fwd.status]);
 
   // Switching accounts swaps the bound outbound line and virtual device on
@@ -513,7 +515,30 @@ export default function App() {
               }}
             />
           </label>
-          <p className="panel__hint">{t("填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游。")}</p>
+          <label className="field">
+            <span>{t("思考等级")}</span>
+            <Select
+              variant="field"
+              ariaLabel={t("思考等级")}
+              disabled={fwd.busy !== null}
+              value={forcedReasoningEffort}
+              placeholder={t("跟随下游")}
+              options={[
+                { value: "", label: t("跟随下游") },
+                { value: "none", label: "none" },
+                { value: "minimal", label: "minimal" },
+                { value: "low", label: "low" },
+                { value: "medium", label: "medium" },
+                { value: "high", label: "high" },
+                { value: "xhigh", label: "xhigh" },
+              ]}
+              onChange={(value) => {
+                setForcedReasoningEffort(value);
+                void fwd.saveForcedReasoningEffort(value);
+              }}
+            />
+          </label>
+          <p className="panel__hint">{t("填写后，下游无论请求什么模型 ID，都会改成这个值再转发给上游。思考等级留空则保持下游原来的 reasoning.effort。")}</p>
           <section className="lan-access" aria-label={t("局域网访问")}>
             <div className="lan-access__heading">
               <div>

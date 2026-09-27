@@ -35,6 +35,7 @@ export async function openGithubRepo(): Promise<void> {
 const defaultStatus = (): Status => ({
   diagLogPath: "",
   forcedModel: "",
+  forcedReasoningEffort: "",
   currentAccountId: "mock-account-b",
   currentAccountEmail: "mock@example.com",
   accountTraffic: { concurrentRequests: 2, rpm: 18, tpm: 12480 },
@@ -210,6 +211,7 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
         }
       : { ...mockStatus.mihomo, phase: "stopped", proxyUrl: null, selected: null, groups: [], error: null },
     forcedModel: settings.forcedModel,
+    forcedReasoningEffort: settings.forcedReasoningEffort,
     chainSystemProxy: settings.chainSystemProxy !== false,
     systemProxy: { ...(mockStatus.systemProxy ?? { detected: null, lastError: null }), enabled: settings.chainSystemProxy !== false },
     proxyOk: true,
@@ -514,6 +516,7 @@ const mockBillingRecords: BillingRecord[] = [
     firstTokenMs: 1_840,
     transport: "http_sse",
     clientUserAgent: "pi/0.0.0",
+    reasoningEffort: "high",
     currency: "USD",
   },
   {

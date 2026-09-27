@@ -84,6 +84,9 @@ pub struct RequestStart {
     /// Downstream `User-Agent` before virtual-device rewriting.
     #[serde(default)]
     pub client_user_agent: Option<String>,
+    /// `reasoning.effort` from the request: none, minimal, low, medium, high, xhigh.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 fn default_provider() -> String {
@@ -173,6 +176,8 @@ pub struct UsageRecord {
     pub transport: Option<String>,
     /// Downstream `User-Agent` captured before virtual-device rewriting.
     pub client_user_agent: Option<String>,
+    /// Requested thinking level (`reasoning.effort`).
+    pub reasoning_effort: Option<String>,
     /// Set when the response looks downgraded (see [`crate::downgrade`]).
     pub downgrade: Option<DowngradeReport>,
     pub cost_nanos: Option<i64>,
@@ -182,7 +187,7 @@ pub struct UsageRecord {
 }
 
 /// Columns read by [`row_to_record`], in order.
-const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.error_message,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos,u.first_token_ms,u.transport,u.downgrade,u.client_user_agent";
+const RECORD_COLUMNS: &str = "u.request_id,a.provider,a.upstream_account_id,a.display_email,u.source,u.started_at,u.finished_at,u.state,u.http_status,u.requested_model,u.sent_model,u.response_model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.usage_source,u.pricing_rule_id,u.cost_nanos,u.currency,u.error_kind,u.error_message,u.cache_write_tokens,u.reasoning_tokens,u.pricing_model,u.service_tier,u.long_context,u.input_cost_nanos,u.cache_read_cost_nanos,u.cache_write_cost_nanos,u.output_cost_nanos,u.first_token_ms,u.transport,u.downgrade,u.client_user_agent,u.reasoning_effort";
 
 /// (state, source, provider, sent_model, started_at, requested_service_tier)
 type PendingRow = (
@@ -495,6 +500,18 @@ impl BillingStore {
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (4)",
             [],
         )?;
+        // Version 5: thinking level requested for the turn.
+        let existing: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('usage_records')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !existing.iter().any(|name| name == "reasoning_effort") {
+            conn.execute_batch("ALTER TABLE usage_records ADD COLUMN reasoning_effort TEXT")?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version) VALUES (5)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -548,8 +565,8 @@ impl BillingStore {
             )?
         };
         tx.execute(
-            "INSERT OR IGNORE INTO usage_records(request_id, account_id, source, started_at, state, requested_model, sent_model, requested_service_tier, client_user_agent) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7,?8)",
-            params![start.request_id, account_db_id, start.source, start.started_at, start.requested_model, start.sent_model, start.service_tier, start.client_user_agent],
+            "INSERT OR IGNORE INTO usage_records(request_id, account_id, source, started_at, state, requested_model, sent_model, requested_service_tier, client_user_agent, reasoning_effort) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7,?8,?9)",
+            params![start.request_id, account_db_id, start.source, start.started_at, start.requested_model, start.sent_model, start.service_tier, start.client_user_agent, start.reasoning_effort],
         )?;
         tx.commit()?;
         drop(conn);
@@ -1105,6 +1122,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
             .get::<_, Option<String>>(32)?
             .and_then(|json| serde_json::from_str(&json).ok()),
         client_user_agent: row.get(33)?,
+        reasoning_effort: row.get(34)?,
     })
 }
 
@@ -1124,7 +1142,20 @@ mod tests {
             sent_model: Some("gpt-test".into()),
             service_tier: None,
             client_user_agent: None,
+            reasoning_effort: None,
         }
+    }
+
+    #[test]
+    fn stores_the_requested_thinking_level() {
+        let store = BillingStore::open_in_memory().unwrap();
+        let started = store
+            .begin_request(RequestStart {
+                reasoning_effort: Some("high".into()),
+                ..start("think", "a")
+            })
+            .unwrap();
+        assert_eq!(started.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

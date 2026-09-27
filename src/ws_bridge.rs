@@ -73,6 +73,14 @@ pub fn adapt_responses_frame(frame: &mut Value) {
     }
 }
 
+pub fn rewrite_reasoning_effort_in_ws_frame(frame: &mut Value, effort: &str) {
+    let effort = effort.trim();
+    if effort.is_empty() {
+        return;
+    }
+    crate::body_model::set_reasoning_effort(frame, effort);
+}
+
 pub fn rewrite_model_in_ws_frame(frame: &mut Value, model: &str) {
     let model = model.trim();
     if model.is_empty() {

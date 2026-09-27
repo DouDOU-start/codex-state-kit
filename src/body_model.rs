@@ -74,6 +74,33 @@ pub fn rewrite_model_in_body(
     }
 }
 
+/// 读取请求里的思考等级。Codex 写在 `reasoning.effort`，也接受顶层 `reasoning_effort`。
+pub fn extract_reasoning_effort(bytes: &[u8], encoding: Option<&str>) -> Option<String> {
+    reasoning_effort_of(&plain_request_json(bytes, encoding)?)
+}
+
+pub fn reasoning_effort_of(value: &Value) -> Option<String> {
+    let raw = value
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("reasoning_effort").and_then(Value::as_str))?;
+    let effort = raw.trim();
+    (!effort.is_empty()).then_some(effort.to_string())
+}
+
+fn plain_request_json(bytes: &[u8], encoding: Option<&str>) -> Option<Value> {
+    let plain = match detect_body_compression(bytes, encoding) {
+        None => bytes.to_vec(),
+        Some("zstd") => zstd::decode_all(std::io::Cursor::new(bytes)).ok()?,
+        Some("gzip") => decompress_named(bytes, "gzip")?,
+        Some("deflate") => {
+            decompress_named(bytes, "deflate").or_else(|| decompress_named(bytes, "raw_deflate"))?
+        }
+        Some(_) => return None,
+    };
+    serde_json::from_slice(&plain).ok()
+}
+
 /// 读取请求体顶层的字符串字段（如 `service_tier`），支持 zstd / gzip / deflate。
 pub fn extract_str_field(bytes: &[u8], encoding: Option<&str>, key: &str) -> Option<String> {
     let plain = match detect_body_compression(bytes, encoding) {
@@ -283,6 +310,72 @@ fn detect_body_compression(bytes: &[u8], encoding: Option<&str>) -> Option<&'sta
     None
 }
 
+pub fn rewrite_reasoning_effort_in_body(
+    bytes: &[u8],
+    encoding: Option<&str>,
+    effort: &str,
+) -> Result<Vec<u8>, String> {
+    let effort = effort.trim();
+    if effort.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+    match detect_body_compression(bytes, encoding) {
+        None => rewrite_json_reasoning_effort(bytes, effort),
+        Some("zstd") => {
+            let plain = zstd::decode_all(std::io::Cursor::new(bytes))
+                .map_err(|_| "无法解压 zstd 请求体，不能改写思考等级".to_string())?;
+            let rewritten = rewrite_json_reasoning_effort(&plain, effort)?;
+            zstd::encode_all(rewritten.as_slice(), 0)
+                .map_err(|_| "无法重新压缩 zstd 请求体".to_string())
+        }
+        Some("gzip") => {
+            let plain = decompress_named(bytes, "gzip")
+                .ok_or_else(|| "无法解压 gzip 请求体，不能改写思考等级".to_string())?;
+            compress_gzip(&rewrite_json_reasoning_effort(&plain, effort)?)
+        }
+        Some("deflate") => {
+            let plain = decompress_named(bytes, "deflate")
+                .or_else(|| decompress_named(bytes, "raw_deflate"))
+                .ok_or_else(|| "无法解压 deflate 请求体，不能改写思考等级".to_string())?;
+            compress_deflate(&rewrite_json_reasoning_effort(&plain, effort)?)
+        }
+        Some(_) => Err("不支持的请求体压缩，不能改写思考等级".into()),
+    }
+}
+
+fn rewrite_json_reasoning_effort(bytes: &[u8], effort: &str) -> Result<Vec<u8>, String> {
+    let mut value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| "请求体不是 JSON，不能改写思考等级".to_string())?;
+    set_reasoning_effort(&mut value, effort);
+    serde_json::to_vec(&value).map_err(|_| "无法序列化改写后的请求体".to_string())
+}
+
+pub(crate) fn set_reasoning_effort(value: &mut Value, effort: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("reasoning_effort") {
+        object.insert("reasoning_effort".into(), Value::String(effort.to_string()));
+    }
+    match object.get_mut("reasoning") {
+        Some(Value::Object(reasoning)) => {
+            reasoning.insert("effort".into(), Value::String(effort.to_string()));
+        }
+        Some(_) => {
+            object.insert(
+                "reasoning".into(),
+                serde_json::json!({ "effort": effort }),
+            );
+        }
+        None => {
+            object.insert(
+                "reasoning".into(),
+                serde_json::json!({ "effort": effort }),
+            );
+        }
+    }
+}
+
 fn rewrite_json_model(bytes: &[u8], model: &str) -> Result<Vec<u8>, String> {
     let mut value: Value = serde_json::from_slice(bytes)
         .map_err(|_| "请求体不是 JSON，不能强制绑定模型".to_string())?;
@@ -374,6 +467,31 @@ mod tests {
             Some("priority")
         );
         assert_eq!(extract_str_field(plain, None, "missing"), None);
+    }
+
+    #[test]
+    fn extract_reasoning_effort_reads_nested_and_top_level() {
+        let nested = br#"{"model":"gpt-6-astra","reasoning":{"effort":"High"}}"#;
+        assert_eq!(
+            extract_reasoning_effort(nested, None).as_deref(),
+            Some("High")
+        );
+        let top = br#"{"reasoning_effort":"xhigh"}"#;
+        assert_eq!(extract_reasoning_effort(top, None).as_deref(), Some("xhigh"));
+        assert_eq!(
+            reasoning_effort_of(&serde_json::json!({"reasoning": {"effort": "  "}})),
+            None
+        );
+        let rewritten = rewrite_reasoning_effort_in_body(
+            br#"{"model":"gpt-6-astra","reasoning":{"effort":"low"}}"#,
+            None,
+            "xhigh",
+        )
+        .unwrap();
+        assert_eq!(
+            reasoning_effort_of(&serde_json::from_slice::<Value>(&rewritten).unwrap()).as_deref(),
+            Some("xhigh")
+        );
     }
 
     #[test]
