@@ -2283,28 +2283,14 @@ mod tests {
     #[test]
     fn platform_presets_set_every_system_field() {
         let mut identity = VmIdentity::ephemeral();
-        identity.apply_profile(VmProfile {
-            platform: DevicePlatform::Windows,
-            environment: None,
-            enabled: None,
-            terminal: None,
-            terminal_version: None,
-            terminal_multiplexer: None,
-        });
+        identity.set_platform(DevicePlatform::Windows);
         assert_eq!(identity.platform(), DevicePlatform::Windows);
         assert!(identity.user_agent().starts_with(&format!(
             "{}/0.155.0 (Windows 10.0.26100; x86_64) ",
             identity.originator_value()
         )));
         assert!(identity.user_agent().contains("WindowsTerminal"));
-        identity.apply_profile(VmProfile {
-            platform: DevicePlatform::Linux,
-            environment: None,
-            enabled: None,
-            terminal: None,
-            terminal_version: None,
-            terminal_multiplexer: None,
-        });
+        identity.set_platform(DevicePlatform::Linux);
         assert!(identity.user_agent().starts_with(&format!(
             "{}/0.155.0 (Ubuntu 24.4.0; x86_64) ",
             identity.originator_value()
@@ -2332,11 +2318,12 @@ mod tests {
         let installation = identity.installation_id.clone();
         let identity = identity.with_runtime_ids();
         assert_eq!(identity.installation_id, installation);
+        let (os_type, os_version, _, _) = DevicePlatform::host().preset();
         assert!(identity.user_agent().starts_with(&format!(
-            "{}/0.155.0 (Windows 10.0.26100; x86_64) ",
-            identity.originator_value()
+            "{}/0.155.0 ({} {}; ",
+            identity.originator_value(), os_type, os_version
         )));
-        assert!(identity.user_agent().contains("WindowsTerminal"));
+        assert_eq!(identity.platform(), DevicePlatform::host());
         // Old files carrying the retired version lock still load.
         let raw = r#"{"installationId":"00000000-0000-4000-8000-000000000000","cliVersion":"0.160.0",
             "originator":"codex_cli_rs","osType":"Linux","osVersion":"6.8.0","arch":"x86_64",
@@ -2344,8 +2331,8 @@ mod tests {
         let old: VmIdentity = serde_json::from_str(raw).unwrap();
         assert!(old.enabled);
         let old = old.with_runtime_ids();
-        assert_eq!(old.platform(), DevicePlatform::Linux);
-        assert_eq!(old.os_version, "24.4.0");
+        assert_eq!(old.platform(), DevicePlatform::host());
+        assert_eq!(old.os_version, DevicePlatform::host().preset().1);
         assert_eq!(old.cli_version, "0.160.0");
     }
 
@@ -2423,7 +2410,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_profile_does_not_adopt_the_host_terminal() {
+    fn enabled_profile_always_uses_the_host_platform_preset() {
         let mut identity = VmIdentity::ephemeral();
         identity.enabled = true;
         identity.apply_profile(VmProfile {
@@ -2435,8 +2422,8 @@ mod tests {
             terminal_multiplexer: None,
         });
         identity.apply_runtime_terminal();
-        assert_eq!(identity.terminal, "xterm-256color");
-        assert!(!identity.user_agent().contains("Windows"));
+        assert_eq!(identity.platform(), DevicePlatform::host());
+        assert_eq!(identity.terminal, DevicePlatform::host().preset().3);
         identity.apply_profile(VmProfile {
             platform: DevicePlatform::Windows,
             environment: None,
@@ -2446,9 +2433,8 @@ mod tests {
             terminal_multiplexer: None,
         });
         identity.apply_runtime_terminal();
-        assert!(identity.user_agent().contains("Windows 10.0.26100"));
-        assert!(identity.user_agent().contains("WindowsTerminal"));
-        assert!(!identity.user_agent().contains("Mac OS"));
+        assert_eq!(identity.platform(), DevicePlatform::host());
+        assert_eq!(identity.terminal, DevicePlatform::host().preset().3);
     }
 
     #[test]

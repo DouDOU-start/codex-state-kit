@@ -332,14 +332,11 @@ mod tests {
     #[test]
     fn windows_login_page_uses_the_virtual_device_user_agent() {
         let mut identity = VmIdentity::ephemeral();
-        identity.apply_profile(crate::identity::VmProfile {
-            platform: DevicePlatform::Windows,
-            environment: None,
-            enabled: Some(true),
-            terminal: None,
-            terminal_version: None,
-            terminal_multiplexer: None,
-        });
+        // The production profile is host-bound; set the public fixture fields
+        // directly here so this test continues to cover Windows UA formatting
+        // on every CI runner.
+        identity.os_type = "Windows".into();
+        identity.arch = "x86_64".into();
         let agent = login_browser_user_agent(&identity, "142.0.7444.60");
         assert!(agent.starts_with("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"));
         assert!(agent.contains("Chrome/142.0.7444.60"));
