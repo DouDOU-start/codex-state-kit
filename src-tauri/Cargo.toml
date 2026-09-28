@@ -1,6 +1,6 @@
 [package]
 name = "codex-state-kit-desktop"
-version = "0.0.13"
+version = "0.0.14"
 description = "Desktop manager for the Codex reverse proxy"
 license = "MIT"
 edition = "2021"
