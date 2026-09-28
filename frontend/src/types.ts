@@ -39,7 +39,7 @@ export interface LogEntry {
   currentIdleMs?: number | null;
 }
 
-/** The system a virtual device reports; version, arch and terminal follow it. */
+/** The host-bound system a virtual device reports; version, arch and terminal use its preset. */
 export type DevicePlatform = "mac" | "windows" | "linux";
 
 export interface VmIdentityView {
@@ -243,6 +243,22 @@ export interface LoginPoll {
 export interface ActionResult {
   ok: boolean;
   message: string;
+}
+
+export interface ModelTraceChallenge {
+  id: string;
+  expectedCount: number;
+  prompt: string;
+}
+
+export interface ModelTraceAttempt {
+  challengeId: string;
+  expectedCount: number;
+  status: "ok" | "error" | string;
+  text?: string | null;
+  httpStatus?: number | null;
+  error?: string | null;
+  sentModel: string;
 }
 
 export interface Banner {

@@ -163,6 +163,7 @@ pub fn responses_sse_to_json(bytes: &[u8], encoding: Option<&str>) -> Result<Vec
 
     let mut event_data = Vec::new();
     let mut terminal = None;
+    let mut output_text = String::new();
     let mut consume_event = |data: &[u8]| {
         let data = data.strip_suffix(b"\n").unwrap_or(data);
         if data.is_empty() || data == b"[DONE]" {
@@ -172,6 +173,17 @@ pub fn responses_sse_to_json(bytes: &[u8], encoding: Option<&str>) -> Result<Vec
             return;
         };
         let event_type = value.get("type").and_then(Value::as_str);
+        if event_type == Some("response.output_text.delta") {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                output_text.push_str(delta);
+            }
+        } else if event_type == Some("response.output_text.done")
+            && output_text.is_empty()
+        {
+            if let Some(text) = value.get("text").and_then(Value::as_str) {
+                output_text.push_str(text);
+            }
+        }
         if matches!(
             event_type,
             Some(
@@ -203,7 +215,14 @@ pub fn responses_sse_to_json(bytes: &[u8], encoding: Option<&str>) -> Result<Vec
     consume_event(&event_data);
 
     terminal
-        .map(|value| {
+        .map(|mut value| {
+            if !output_text.is_empty() {
+                if let Some(object) = value.as_object_mut() {
+                    object
+                        .entry("output_text")
+                        .or_insert_with(|| Value::String(output_text.clone()));
+                }
+            }
             serde_json::to_vec(&value).map_err(|_| "无法序列化 Responses 响应".to_string())
         })
         .transpose()?
@@ -590,6 +609,18 @@ mod tests {
         assert_eq!(value["id"], "resp_1");
         assert_eq!(value["usage"]["input_tokens"], 7);
         assert_eq!(value["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn responses_sse_to_json_preserves_output_text_deltas() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"1 2 \"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"3\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\"}}\n\n",
+        );
+        let value: Value =
+            serde_json::from_slice(&responses_sse_to_json(body.as_bytes(), None).unwrap()).unwrap();
+        assert_eq!(value["output_text"], "1 2 3");
     }
 
     #[test]

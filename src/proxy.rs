@@ -6,7 +6,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -28,6 +28,7 @@ use crate::diag;
 use crate::downgrade;
 use crate::identity::{self, VmIdentity};
 use crate::login;
+use crate::modeltrace::{self, ModelTraceAttempt, ModelTraceChallenge};
 #[cfg(test)]
 use crate::logs::ObservedStream;
 use crate::logs::{self, LogEntry, NetworkLogDetails, StreamLifecycle};
@@ -1271,6 +1272,145 @@ impl ProxyHandle {
         };
         Ok(crate::latency::LatencyReport { target, samples })
     }
+
+    /// Send one ModelTrace challenge through the same local proxy path used by
+    /// Codex. The probe marker keeps it out of billing, traffic counters and
+    /// the bounded business network log while retaining all normal upstream
+    /// authentication, routing and virtual-device rewriting.
+    pub async fn run_modeltrace_probe(
+        &self,
+        model: String,
+        reasoning_effort: Option<String>,
+        challenge: ModelTraceChallenge,
+    ) -> Result<ModelTraceAttempt> {
+        let settings = self.app.settings.lock().await.clone();
+        let requested_model = model.trim().to_string();
+        if requested_model.is_empty() || requested_model.chars().any(char::is_control) {
+            anyhow::bail!("归因模型不能为空或包含控制字符");
+        }
+        if challenge.prompt.trim().is_empty() {
+            anyhow::bail!("归因挑战不能为空");
+        }
+        // A probe must report and send the model selected in the ModelTrace
+        // panel. The proxy skips global forced-model rewriting for probes.
+        let sent_model = requested_model.clone();
+        let effort = settings
+            .forced_reasoning_effort()
+            .map(str::to_owned)
+            .or_else(|| reasoning_effort.filter(|value| !value.trim().is_empty()));
+        let home = Path::new(&settings.codex_home);
+        let (credentials, _) = self
+            .app
+            .sync_request_identity(home)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("尚未登录 ChatGPT。请先在本应用完成 ChatGPT 登录。"))?;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .context("创建归因探测客户端")?;
+        let endpoint = format!("http://{}/responses", settings.proxy_listen);
+        let error_attempt = |message: String, status: Option<u16>| ModelTraceAttempt {
+            challenge_id: challenge.id.clone(),
+            expected_count: challenge.expected_count,
+            status: "error".into(),
+            text: None,
+            http_status: status,
+            error: Some(message),
+            sent_model: sent_model.clone(),
+        };
+        let mut body = json!({
+            "model": requested_model,
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": challenge.prompt,
+                }],
+            }],
+            "stream": false,
+            "store": false,
+        });
+        if let Some(effort) = effort {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+        // The managed proxy can be briefly unavailable while it is restarting
+        // after an account or route change. Retry the local hop before
+        // reporting a probe failure; upstream HTTP errors are handled below
+        // and are deliberately not retried here.
+        let mut response = None;
+        let mut last_error = None;
+        for attempt in 0..3 {
+            match client
+                .post(&endpoint)
+                .header("authorization", format!("Bearer {}", credentials.access_token))
+                .header("chatgpt-account-id", credentials.account_id.clone())
+                .header("x-codex-state-kit-probe", "1")
+                // The ChatGPT Codex endpoint emits Responses as SSE after the
+                // proxy's compatibility rewrite; the proxy converts it back to
+                // JSON for this non-streaming probe.
+                .header("accept", "text/event-stream")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(value) => {
+                    response = Some(value);
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            }
+        }
+        let response = match response {
+            Some(response) => response,
+            None => return Ok(error_attempt(
+                format!("发送归因探测请求失败（本地代理连接失败）：{}", last_error.unwrap_or_else(|| "未知错误".into())),
+                None,
+            )),
+        };
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let detail = response
+                .bytes()
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|value| {
+                    value
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .or_else(|| value.get("message").and_then(Value::as_str))
+                        .map(|message| logs::safe_text(message, 256))
+                });
+            let message = detail
+                .map(|detail| format!("上游返回 HTTP {status}：{detail}"))
+                .unwrap_or_else(|| format!("上游返回 HTTP {status}"));
+            return Ok(error_attempt(message, Some(status)));
+        }
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(error_attempt(format!("读取归因探测响应失败：{error}"), Some(status))),
+        };
+        let text = match modeltrace::extract_output_text(&bytes) {
+            Ok(text) => text,
+            Err(error) => return Ok(error_attempt(format!("提取归因探测输出失败：{error}"), Some(status))),
+        };
+        Ok(ModelTraceAttempt {
+            challenge_id: challenge.id,
+            expected_count: challenge.expected_count,
+            status: "ok".into(),
+            text: Some(text),
+            http_status: Some(status),
+            error: None,
+            sent_model,
+        })
+    }
 }
 
 async fn bind_listen(addr: SocketAddr) -> Result<TcpListener> {
@@ -1524,14 +1664,16 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                         ..UsageOutcome::default()
                     });
                 }
-                app.record(
-                    method.as_str(),
-                    &path,
-                    resp.status().as_u16(),
-                    started,
-                    details,
-                )
-                .await;
+                if !details.probe {
+                    app.record(
+                        method.as_str(),
+                        &path,
+                        resp.status().as_u16(),
+                        started,
+                        details,
+                    )
+                    .await;
+                }
                 return resp;
             }
             details.in_progress = true;
@@ -1573,6 +1715,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
             let lifecycle = details.stream_lifecycle.clone();
             let diag_req = details.diag.clone();
             let responses_non_stream = details.responses_non_stream;
+            let suppress_logging = details.probe;
             let entry = LogEntry::new(
                 method.as_str(),
                 &path,
@@ -1580,7 +1723,9 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 started,
                 details,
             );
-            logs::push(&mut *app.logs.lock().await, entry.clone());
+            if !suppress_logging {
+                logs::push(&mut *app.logs.lock().await, entry.clone());
+            }
             let tracker = ResponseLogTracker {
                 app,
                 entry,
@@ -1600,6 +1745,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 sniff_body: identity_content_encoding(resp.headers()),
                 body_classified: false,
                 sniff_buf: Vec::new(),
+                suppress_logging,
             };
             let (parts, body) = resp.into_parts();
             let stream: Pin<
@@ -1792,8 +1938,10 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                 .response_status
                 .and_then(|status| StatusCode::from_u16(status).ok())
                 .unwrap_or(StatusCode::BAD_GATEWAY);
-            app.record(method.as_str(), &path, status.as_u16(), started, details)
-                .await;
+            if !details.probe {
+                app.record(method.as_str(), &path, status.as_u16(), started, details)
+                    .await;
+            }
             (status, err.to_string()).into_response()
         }
     }
@@ -1868,6 +2016,7 @@ struct ResponseLogTracker {
     sniff_body: bool,
     body_classified: bool,
     sniff_buf: Vec<u8>,
+    suppress_logging: bool,
 }
 
 impl ResponseLogTracker {
@@ -1928,7 +2077,9 @@ impl ResponseLogTracker {
     }
 
     async fn publish(&self) {
-        replace_network_log(&self.app, self.entry.clone()).await;
+        if !self.suppress_logging {
+            replace_network_log(&self.app, self.entry.clone()).await;
+        }
     }
 
     fn settle_billing(&mut self) {
@@ -2537,6 +2688,8 @@ async fn forward_http_tracked(
         );
     }
     let (mut parts, body) = req.into_parts();
+    let probe = parts.headers.remove("x-codex-state-kit-probe").is_some();
+    details.probe = probe;
     let realtime_call = is_realtime_call_path(&parts.method, parts.uri.path());
     let path = parts.uri.path();
     let mut target = if realtime_call && is_backend_upstream(&upstream) {
@@ -2598,25 +2751,29 @@ async fn forward_http_tracked(
     // The model the client asked for, before a forced model replaces it.
     let client_model = crate::body_model::extract_model_from_body(&bytes);
     if path.contains("/responses") {
-        if let Some(forced) = request_settings.forced_model() {
-            bytes = crate::body_model::rewrite_model_in_body(
-                &bytes,
-                content_encoding.as_deref(),
-                forced,
-            )
-            .map_err(|err| anyhow::anyhow!("{err}"))?
-            .into();
-            details.body_bytes = bytes.len();
-        }
-        if let Some(effort) = request_settings.forced_reasoning_effort() {
-            bytes = crate::body_model::rewrite_reasoning_effort_in_body(
-                &bytes,
-                content_encoding.as_deref(),
-                effort,
-            )
-            .map_err(|err| anyhow::anyhow!("{err}"))?
-            .into();
-            details.body_bytes = bytes.len();
+        // ModelTrace explicitly selects the model it is measuring. Do not
+        // apply global forced-model/reasoning overrides to probe requests.
+        if !probe {
+            if let Some(forced) = request_settings.forced_model() {
+                bytes = crate::body_model::rewrite_model_in_body(
+                    &bytes,
+                    content_encoding.as_deref(),
+                    forced,
+                )
+                .map_err(|err| anyhow::anyhow!("{err}"))?
+                .into();
+                details.body_bytes = bytes.len();
+            }
+            if let Some(effort) = request_settings.forced_reasoning_effort() {
+                bytes = crate::body_model::rewrite_reasoning_effort_in_body(
+                    &bytes,
+                    content_encoding.as_deref(),
+                    effort,
+                )
+                .map_err(|err| anyhow::anyhow!("{err}"))?
+                .into();
+                details.body_bytes = bytes.len();
+            }
         }
     }
     details.transport = if parts
@@ -2704,7 +2861,10 @@ async fn forward_http_tracked(
     // Persist the account/request association before sending upstream. The
     // account comes from the credentials actually applied to this request, so
     // a late login switch cannot reassign an in-flight response.
-    if parts.method == http::Method::POST && path.contains("/responses") && billing_identity_matches
+    if parts.method == http::Method::POST
+        && path.contains("/responses")
+        && billing_identity_matches
+        && !probe
     {
         let (account_id, email) = request_identity
             .as_ref()
@@ -2744,14 +2904,16 @@ async fn forward_http_tracked(
     } else {
         upstream_proxy.clone()
     };
-    if let Some(account) = parts
+    if !probe {
+        if let Some(account) = parts
         .headers
         .get("chatgpt-account-id")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        *activity = Some(app.traffic.begin(account, Instant::now()));
+        {
+            *activity = Some(app.traffic.begin(account, Instant::now()));
+        }
     }
     let root_vm = app.vm_identity.lock().await.clone();
     let account_scope = request_identity

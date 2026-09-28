@@ -163,7 +163,7 @@ export function useCodexStateKit() {
     try {
       const next = await switchAccount(accountId, codexHome);
       setLogin(next);
-      setBanner({ kind: "ok", text: t("已切换到 {0}，后续请求立即使用该账号", [next.email ?? accountId]) });
+      setBanner({ kind: "warn", text: t("已切换到 {0}，请重启 GPT/Codex 使新账号生效", [next.email ?? accountId]) });
       await loadAccounts();
       void loadStatus(true);
     } catch (cause) {

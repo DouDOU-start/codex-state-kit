@@ -15,7 +15,8 @@
     "build:renderer": "tsc --noEmit && vite build",
     "icons": "tauri icon frontend/public/icon.svg --output src-tauri/icons && node -e \"require('node:fs').copyFileSync('src-tauri/icons/icon.png', 'src-tauri/icons/source.png')\"",
     "typecheck": "tsc --noEmit",
-    "test:i18n": "node --test tools/i18n.test.mjs"
+    "test:i18n": "node --test tools/i18n.test.mjs",
+    "test:modeltrace": "node --test tools/modeltrace.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

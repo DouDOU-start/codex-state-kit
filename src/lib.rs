@@ -11,6 +11,7 @@ pub mod identity;
 pub mod latency;
 pub mod login;
 pub mod logs;
+pub mod modeltrace;
 pub mod mihomo;
 pub mod outbound;
 pub mod pricing;

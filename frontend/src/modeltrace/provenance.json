@@ -1,0 +1,16 @@
+{
+  "source": "ModelTrace unified fingerprint library",
+  "sourceUrl": "https://github.com/xqy2006/ModelTrace",
+  "license": "MIT",
+  "normalization": "UTF-8 with LF line endings",
+  "bankPath": "data/unified_bank.json",
+  "scorerPath": "static/fingerprint-core.js",
+  "bankSha256": "1c2cb74d372f9f0f30d0dabbb7b7a838660d2f769a88d0c8489e4c662e088c21",
+  "scorerSha256": "83fa5bd611e18f8339122582335123c8ea168ed242298bb31f4e363abeeb6e4a",
+  "bankBuiltAt": "2026-09-23T06:17:08.081468+00:00",
+  "modelCount": 16,
+  "sameContextCalibrated": false,
+  "multilingualCalibrated": false,
+  "sharedStylesPath": "static/styles.css",
+  "sharedStylesSha256": "f2fc3c41835f63249dde330e8841fdee95e9e7ff588ff2013a9b68e7ff385c85"
+}

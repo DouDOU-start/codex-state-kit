@@ -115,6 +115,13 @@ export function Select({
     menuRef.current?.querySelector<HTMLElement>(`[data-index="${active}"]`)?.scrollIntoView({ block: "nearest" });
   }, [open, active]);
 
+  // Close after a parent-controlled selection update as well as after the
+  // local option click. This covers WebView event ordering where the click
+  // callback can run after the controlled value has already changed.
+  useEffect(() => {
+    if (open && selected?.value === value) setOpen(false);
+  }, [value]);
+
   const onKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
     if (disabled) return;
     const key = event.key;
@@ -185,7 +192,9 @@ export function Select({
               ].filter(Boolean).join(" ")}
               onPointerEnter={() => !option.disabled && setActive(index)}
               onPointerDown={(event) => event.preventDefault()}
-              onClick={() => choose(index)}
+              // Use pointerup instead of click: WebView can suppress click
+              // after the menu prevents pointerdown's default focus action.
+              onPointerUp={() => choose(index)}
             >
               <span className="ui-select__check" aria-hidden="true">{option.value === value ? <Check size={13} /> : null}</span>
               <span className="ui-select__label">{option.label}</span>

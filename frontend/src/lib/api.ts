@@ -23,6 +23,8 @@ import type {
   ModelPriceRow,
   PricingView,
   SavedAccount,
+  ModelTraceAttempt,
+  ModelTraceChallenge,
 } from "@/types";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
@@ -176,6 +178,30 @@ function cloneStatus(): Status {
 
 export async function getStatus(): Promise<Status> {
   return isTauri ? invoke<Status>("get_status") : cloneStatus();
+}
+
+export async function runModelTraceProbe(
+  model: string,
+  reasoningEffort: string,
+  challenge: ModelTraceChallenge,
+): Promise<ModelTraceAttempt> {
+  if (isTauri) {
+    return invoke<ModelTraceAttempt>("run_modeltrace_probe", {
+      model,
+      reasoningEffort: reasoningEffort.trim() || null,
+      challenge,
+    });
+  }
+  const numbers = Array.from({ length: challenge.expectedCount }, (_, index) => ((index * 47 + 13) % 355) + 1);
+  return {
+    challengeId: challenge.id,
+    expectedCount: challenge.expectedCount,
+    status: "ok",
+    text: numbers.join(" "),
+    httpStatus: 200,
+    error: null,
+    sentModel: model,
+  };
 }
 
 export async function setConfig(settings: SettingsPatch): Promise<Status> {

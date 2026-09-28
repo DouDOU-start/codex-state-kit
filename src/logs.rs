@@ -284,6 +284,9 @@ pub struct NetworkLogDetails {
     pub in_progress: bool,
     pub stream_lifecycle: Option<Arc<StreamLifecycle>>,
     pub diag: Option<crate::diag::Request>,
+    /// Internal ModelTrace requests are deliberately excluded from normal
+    /// billing and the bounded business network log.
+    pub probe: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]

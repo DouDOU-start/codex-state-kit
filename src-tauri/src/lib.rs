@@ -67,6 +67,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::set_ui_language,
             commands::get_status,
+            commands::run_modeltrace_probe,
             commands::set_lan_access,
             commands::regenerate_lan_api_key,
             commands::get_billing_summary,

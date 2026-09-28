@@ -1,6 +1,7 @@
 use codex_state_kit::accounts::{self, AccountView};
 use codex_state_kit::billing::{BillingSummary, PricingRuleSpec, UsageFilter, UsageRecordsPage};
 use codex_state_kit::pricing::{CatalogInfo, ModelPriceRow};
+use codex_state_kit::modeltrace::{ModelTraceAttempt, ModelTraceChallenge};
 use codex_state_kit::{
     exchange_refresh_token, import_access_token as persist_access_token, inspect_codex_config,
     login_http_client_via, login_status, persist_refresh_token_import, poll_device_login,
@@ -156,6 +157,24 @@ pub async fn restart_after_update(
 #[tauri::command(async)]
 pub async fn get_status(state: State<'_, AppState>) -> CommandResult<Status> {
     Ok(state.proxy.managed_status().await)
+}
+
+/// Run one ModelTrace challenge through the current Codex account and route.
+/// The core proxy marks it as an internal probe, so it is excluded from
+/// normal billing and traffic metrics.
+#[tauri::command(async)]
+pub async fn run_modeltrace_probe(
+    state: State<'_, AppState>,
+    model: String,
+    reasoning_effort: Option<String>,
+    challenge: ModelTraceChallenge,
+) -> CommandResult<ModelTraceAttempt> {
+    command(
+        state
+            .proxy
+            .run_modeltrace_probe(model, reasoning_effort, challenge)
+            .await,
+    )
 }
 
 #[tauri::command(async)]

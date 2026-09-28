@@ -9,7 +9,6 @@ import Terminal from "lucide-react/dist/esm/icons/terminal.js";
 import Waypoints from "lucide-react/dist/esm/icons/waypoints.js";
 import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.js";
 import Settings2 from "lucide-react/dist/esm/icons/settings-2.js";
-import Users from "lucide-react/dist/esm/icons/users.js";
 import Link2 from "lucide-react/dist/esm/icons/link-2.js";
 import ScrollText from "lucide-react/dist/esm/icons/scroll-text.js";
 import BadgeDollarSign from "lucide-react/dist/esm/icons/badge-dollar-sign.js";
@@ -23,28 +22,20 @@ import { AccountsPanel, accountName } from "@/components/AccountsPanel";
 import { AddAccountDialog } from "@/components/AddAccountDialog";
 import { Select } from "@/components/Select";
 import { LatencyProbe } from "@/components/LatencyProbe";
+import { ModelTracePanel } from "@/components/ModelTracePanel";
 import { useNotice, useNotify } from "@/components/Notifier";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
 import { SHOW_SUSPECTED_DOWNGRADE_UI } from "@/lib/uiFlags";
 import type { DevicePlatform, SavedAccount, Status } from "@/types";
 
-function chipLabel(status: Status) {
-  if (status.attached) return t("已接入");
-  return status.proxyOk ? t("代理已开") : t("代理未开");
-}
-
-function chipClass(status: Status) {
-  if (status.attached) return "runtime-chip runtime-chip--accent";
-  return status.proxyOk ? "runtime-chip" : "runtime-chip runtime-chip--down";
-}
-
-type TabId = "overview" | "records" | "pricing" | "network" | "account" | "device";
+type TabId = "overview" | "records" | "pricing" | "modeltrace" | "network" | "account" | "device";
 
 const TABS: { id: TabId; label: string; Icon: typeof Activity }[] = [
   { id: "overview", label: "概览", Icon: LayoutDashboard },
   { id: "records", label: "使用记录", Icon: ScrollText },
   { id: "pricing", label: "模型价格", Icon: BadgeDollarSign },
+  { id: "modeltrace", label: "模型归因", Icon: Activity },
   { id: "network", label: "出站网络", Icon: Network },
   { id: "account", label: "Codex 接入", Icon: Terminal },
   { id: "device", label: "虚拟设备", Icon: Monitor },
@@ -251,6 +242,21 @@ export default function App() {
     setLanApiKeyCopyState("idle");
   }
 
+  async function switchOutboundMode(next: "manual" | "mihomo") {
+    if (!fwd.status || fwd.status.outboundMode === next || fwd.busy !== null) return;
+    const ok = await confirm({
+      title: t("切换出站线路？"),
+      message: t("切换手动代理和订阅节点会改变出口线路，线路变化可能触发上游风控。确认继续吗？"),
+      confirmText: t("确认切换"),
+    });
+    if (!ok) return;
+    if (next === "manual") {
+      await fwd.saveSettings(codexHome, outboundProxy, "manual");
+    } else {
+      await fwd.saveMihomo(mihomoSubscription, mihomoNode);
+    }
+  }
+
   return (
     <AppShell>
       <div className="dash-page">
@@ -273,30 +279,6 @@ export default function App() {
                 {tabAlert[id] ? <i className="page-tabs__alert" title={tabAlert[id]} aria-label={tabAlert[id]} /> : null}
               </button>
             ))}
-          </div>
-          <div className="page-actions">
-            {fwd.accounts.length > 1 ? (
-              <Select
-                variant="compact"
-                className="account-switcher"
-                ariaLabel={t("切换账号")}
-                placeholder={t("未使用已保存账号")}
-                icon={<Users size={13} />}
-                disabled={fwd.busy !== null || Boolean(fwd.device)}
-                value={fwd.accounts.find((account) => account.active)?.accountId ?? ""}
-                options={fwd.accounts.map((account) => ({
-                  value: account.accountId,
-                  label: accountName(account),
-                  hint: account.usable ? undefined : t("需重新授权"),
-                  disabled: !account.usable,
-                }))}
-                onChange={(accountId) => void fwd.switchToAccount(accountId)}
-              />
-            ) : null}
-            <span className={chipClass(fwd.status)}>
-              <i />
-              {chipLabel(fwd.status)}
-            </span>
           </div>
         </div>
 
@@ -346,14 +328,18 @@ export default function App() {
           <PricingPanel active={tab === "pricing"} />
         </section>
 
+        <section className="tab-panel" role="tabpanel" id="tabpanel-modeltrace" aria-labelledby="tab-modeltrace" hidden={tab !== "modeltrace"}>
+          <ModelTracePanel active={tab === "modeltrace"} status={fwd.status} />
+        </section>
+
         <section className="panel tab-panel" role="tabpanel" id="tabpanel-network" aria-labelledby="tab-network" hidden={tab !== "network"}>
           <header>
             <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>{t("出站网络")}</h2><p>{t("业务请求、登录和价格同步都走这一条出站线路")}</p></div></div>
           </header>
           {bindingNote}
           <div className="proxy-mode" role="group" aria-label={t("出站代理模式")}>
-            <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "manual")}><Network size={14} />{t("手动代理")}</button>
-            <button type="button" aria-pressed={fwd.status.outboundMode === "mihomo"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveMihomo(mihomoSubscription, mihomoNode)}><Waypoints size={14} />{t("订阅节点")}</button>
+            <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void switchOutboundMode("manual")}><Network size={14} />{t("手动代理")}</button>
+            <button type="button" aria-pressed={fwd.status.outboundMode === "mihomo"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void switchOutboundMode("mihomo")}><Waypoints size={14} />{t("订阅节点")}</button>
           </div>
           {fwd.status.outboundMode === "manual" ? <>
           <div className="field">
@@ -531,6 +517,7 @@ export default function App() {
                 { value: "medium", label: "medium" },
                 { value: "high", label: "high" },
                 { value: "xhigh", label: "xhigh" },
+                { value: "max", label: "max" },
               ]}
               onChange={(value) => {
                 setForcedReasoningEffort(value);
@@ -610,28 +597,7 @@ export default function App() {
           </div>}
           <div className="field">
             <span>{t("系统")}</span>
-            <div className="proxy-mode vm-platforms" role="group" aria-label={t("系统")}>
-              {PLATFORMS.map(({ id, label }) => (
-                <button
-                  key={id}
-                  type="button"
-                  aria-pressed={vmIdentity?.platform === id}
-                  disabled={fwd.busy !== null || !vmIdentity?.enabled}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={async () => {
-                    if (!vmIdentity || vmIdentity.platform === id) return;
-                    const ok = await confirm({
-                      title: t("把虚拟设备换成 {0}？", [label]),
-                      message: t("系统版本、架构和终端会一起换成该系统的参数。上游会看到这台设备的系统变了，没有必要时不要来回切换。"),
-                      confirmText: t("切换系统"),
-                    });
-                    if (ok) void fwd.saveVmIdentity({ platform: id });
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
+            <span>{PLATFORMS.find(({ id }) => id === vmIdentity?.platform)?.label ?? "—"} · {t("已绑定本机操作系统")}</span>
           </div>
           <dl className="vm-identity__grid">
             {([
@@ -677,7 +643,7 @@ export default function App() {
                 }} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} />
             </label>)}
           </div>}
-          <p className="panel__hint">{vmIdentity?.enabled ? t("系统版本、架构和终端跟随所选系统。登录授权使用系统浏览器和本机网络。") : t("当前为纯透传模式，下面保存的虚拟设备参数不会改写请求。")}</p>
+          <p className="panel__hint">{vmIdentity?.enabled ? t("系统类型自动绑定本机，系统版本、架构和终端使用对应预设。登录授权使用系统浏览器和本机网络。") : t("当前为纯透传模式，下面保存的虚拟设备参数不会改写请求。")}</p>
           <div className="vm-identity__actions">
             <button type="button" className="button button--ghost" disabled={fwd.busy !== null || !vmIdentity?.enabled} onClick={() => void fwd.detectVmVersion()}>{t("检测本机 CLI")}</button>
             <button

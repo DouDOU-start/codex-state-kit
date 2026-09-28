@@ -5,7 +5,7 @@
 //! 同账号继续共享设备身份。启用时探针、业务 HTTP 和上游 WebSocket 都用这一份设备身份；
 //! `VmIdentity::enabled` 关闭时则跳过设备与环境改写，保留客户端原始信息。
 //!
-//! 系统只能在 Mac / Windows / Linux 三个预设里选。系统版本、架构和终端跟着预设走，
+//! 系统绑定本机操作系统，不能手动跨系统切换。系统版本、架构和终端跟着对应预设走，
 //! 取值与官方 CLI 在对应系统上用 `os_info` 和终端检测得到的一致，避免拼出不存在的组合
 //! （例如 Windows 配 macOS 的版本号）。CLI 版本跟随本机安装的 codex，originator 固定。
 
@@ -34,10 +34,9 @@ fn enabled_by_default() -> bool {
 }
 
 /// The operating system the virtual device reports.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DevicePlatform {
-    #[default]
     Mac,
     Windows,
     Linux,
@@ -47,7 +46,18 @@ pub enum DevicePlatform {
 /// Mac: macOS 15.5 on Apple silicon. Windows: Windows 11 24H2 (os_info reports
 /// `10.0.<build>`) in Windows Terminal. Linux: Ubuntu 24.04, which os_info
 /// reports by distribution as `Ubuntu 24.4.0`.
+impl Default for DevicePlatform {
+    fn default() -> Self { Self::host() }
+}
+
 impl DevicePlatform {
+    /// The operating system running Kit, independent of saved profiles.
+    pub fn host() -> Self {
+        if cfg!(target_os = "windows") { Self::Windows }
+        else if cfg!(target_os = "macos") { Self::Mac }
+        else { Self::Linux }
+    }
+
     fn preset(self) -> (&'static str, &'static str, &'static str, &'static str) {
         match self {
             Self::Mac => ("Mac OS", "15.5.0", "arm64", "xterm-256color"),
@@ -122,6 +132,8 @@ pub struct VmIdentity {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmProfile {
+    /// Legacy input: the host determines the platform.
+    #[serde(default)]
     pub platform: DevicePlatform,
     pub environment: Option<VirtualEnvironment>,
     /// `None` keeps compatibility with older callers that only update the
@@ -266,9 +278,11 @@ impl VmIdentity {
         identity
     }
 
-    /// 测试和不落盘的临时身份：默认的 Mac 预设。
+    /// 测试和不落盘的临时身份：本机操作系统对应的预设。
     pub fn ephemeral() -> Self {
         let mut identity = Self::fresh();
+        // Keep unit-test fixtures deterministic; persisted identities use host().
+        identity.set_platform(DevicePlatform::Mac);
         identity.fill_runtime();
         identity
     }
@@ -450,7 +464,7 @@ impl VmIdentity {
         if let Some(enabled) = profile.enabled {
             self.enabled = enabled;
         }
-        self.set_platform(profile.platform);
+        self.set_platform(DevicePlatform::host());
         if let Some(terminal) = profile.terminal {
             self.terminal = sanitize_terminal_token(&terminal);
             self.terminal_override = !self.terminal.is_empty();
@@ -481,13 +495,13 @@ impl VmIdentity {
     }
 
     /// Brings a stored identity (possibly hand-edited by an older version)
-    /// back to its platform's preset.
+    /// back to the host platform's preset without changing its device id.
     fn normalize(&mut self) {
-        let terminal_override = self.terminal_override;
+        let terminal_override = self.terminal_override && self.platform() == DevicePlatform::host();
         let terminal = self.terminal.clone();
         let terminal_version = self.terminal_version.clone();
         let terminal_multiplexer = self.terminal_multiplexer.clone();
-        self.set_platform(self.platform());
+        self.set_platform(DevicePlatform::host());
         if terminal_override {
             self.terminal = terminal;
             self.terminal_version = terminal_version;
@@ -523,6 +537,7 @@ impl VmIdentity {
     pub fn renewed(&self) -> Self {
         let mut next = self.clone();
         next.installation_id = Uuid::new_v4().to_string();
+        next.normalize();
         next.fill_runtime();
         next
     }
@@ -566,7 +581,7 @@ impl VmIdentity {
             window_id: String::new(),
             thread_id: String::new(),
         };
-        identity.set_platform(DevicePlatform::Mac);
+        identity.set_platform(DevicePlatform::host());
         identity
     }
 

@@ -51,7 +51,7 @@ export function AccountsPanel({ accounts, busy, onSwitch, onRemove, onReauthoriz
           <span className="section-icon"><Users size={19} /></span>
           <div>
             <h2>{t("账号")}</h2>
-            <p>{accounts.length ? t("{0} 个账号 · 切换后立即生效，无需重启 Codex", [accounts.length]) : t("登录后账号会自动保存在这里")}</p>
+            <p>{accounts.length ? t("{0} 个账号 · 切换后请重启 GPT/Codex 使新账号生效", [accounts.length]) : t("登录后账号会自动保存在这里")}</p>
           </div>
         </div>
         <button className="billing-panel__refresh" type="button" disabled={busy} onClick={onAdd}>
