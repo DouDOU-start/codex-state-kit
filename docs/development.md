@@ -55,7 +55,7 @@ git push origin v0.0.4
 
 在 Actions 里手动跑工作流时，也可以在 `notes` 输入框填写说明。已经生成的 Release 仍可在 GitHub 上点 Edit 改说明。未写附注时才回落到默认文案。
 
-当前工作流生成未签名、未公证的 Mac 包。正式分发前，在仓库 Secrets 配置 Apple Developer 证书和公证凭据，并在工作流中接入 Tauri 的签名环境变量；否则 macOS 可能显示安全提示。
+macOS 打包配置在 `src-tauri/tauri.macos.conf.json` 中设置 `bundle.macOS.signingIdentity` 为 `"-"`，由 Tauri 在打包时执行临时签名（ad-hoc），无需申请证书。此签名不包含 Apple 开发者身份，也不提供公证，首次打开仍可能需要在系统「隐私与安全性」中允许应用运行。正式分发需要在仓库 Secrets 配置 Developer ID Application 证书和公证凭据，并在工作流中接入 Tauri 的签名环境变量，以真实签名身份替换临时签名。
 
 ## 版本与产物
 
